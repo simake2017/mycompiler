@@ -1,0 +1,37 @@
+[
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/lexer.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/lexer.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/lexer.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/parser.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/parser.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/parser.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/type.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/type.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/type.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/semantic_analyzer.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/semantic_analyzer.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/semantic_analyzer.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/template_instantiation.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/template_instantiation.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/template_instantiation.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/codegen.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/codegen.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/codegen.cpp"
+},
+{
+  "directory": "/Users/wangyang/cppproject/mycompiler/2",
+  "command": "/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -I../include -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -Wall -Wextra -pedantic -std=gnu++20 -o CMakeFiles/minicc.dir/src/main.cpp.o -c /Users/wangyang/cppproject/mycompiler/src/main.cpp",
+  "file": "/Users/wangyang/cppproject/mycompiler/src/main.cpp"
+}
+]

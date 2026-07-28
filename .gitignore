@@ -1,0 +1,12 @@
+# 构建产物
+build/
+cmake-build-debug/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE / 缓存
+.idea/
+.cache/
+.vscode/
