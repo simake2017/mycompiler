@@ -1,0 +1,15 @@
+# ninja log v7
+2	1040	1783297755870082438	CMakeFiles/minicc.dir/src/type.cpp.o	b288406712cc2eb5
+1	1250	1783297755869329609	CMakeFiles/minicc.dir/src/lexer.cpp.o	cbd1584568a06e65
+2	1469	1783297755870648435	CMakeFiles/minicc.dir/src/codegen.cpp.o	20c3d8bd233377f
+2	1545	1783297755870856142	CMakeFiles/minicc.dir/src/main.cpp.o	cc21b65f3627bd35
+1	1575	1783297755869896314	CMakeFiles/minicc.dir/src/parser.cpp.o	d0e7d6b1a30d0229
+2	1582	1783297755870433228	CMakeFiles/minicc.dir/src/template_instantiation.cpp.o	5f14989c7e8b365d
+2	1670	1783297755870252895	CMakeFiles/minicc.dir/src/semantic_analyzer.cpp.o	76de21b1f2d39cb1
+5	848	1783297831765327798	CMakeFiles/minicc.dir/src/type.cpp.o	b288406712cc2eb5
+4	1115	1783297831764304179	CMakeFiles/minicc.dir/src/lexer.cpp.o	cbd1584568a06e65
+6	1324	1783297831765957419	CMakeFiles/minicc.dir/src/codegen.cpp.o	20c3d8bd233377f
+7	1410	1783297831766608998	CMakeFiles/minicc.dir/src/main.cpp.o	cc21b65f3627bd35
+6	1430	1783297831765740504	CMakeFiles/minicc.dir/src/template_instantiation.cpp.o	5f14989c7e8b365d
+5	1434	1783297831765103466	CMakeFiles/minicc.dir/src/parser.cpp.o	d0e7d6b1a30d0229
+6	1524	1783297831765530588	CMakeFiles/minicc.dir/src/semantic_analyzer.cpp.o	76de21b1f2d39cb1

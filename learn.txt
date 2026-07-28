@@ -1,0 +1,24 @@
+
+
+1、
+cmake \
+    -DCMAKE_CXX_COMPILER=/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -G Ninja \
+    "/Users/wangyang/cppproject/mycompiler" 2>&1 | sed 's/^/  /'
+
+
+2、
+ninja -v 2>&1
+
+
+/opt/homebrew/Cellar/llvm/21.1.8/bin/clang++ -### \
+    -g -arch arm64 \
+    CMakeFiles/minicc.dir/src/lexer.cpp.o \
+    CMakeFiles/minicc.dir/src/parser.cpp.o \
+    CMakeFiles/minicc.dir/src/type.cpp.o \
+    CMakeFiles/minicc.dir/src/semantic_analyzer.cpp.o \
+    CMakeFiles/minicc.dir/src/template_instantiation.cpp.o \
+    CMakeFiles/minicc.dir/src/codegen.cpp.o \
+    CMakeFiles/minicc.dir/src/main.cpp.o \
+    -o minicc 2>&1 | grep "/usr/bin/ld" | tr ' ' '\n' | grep -A1 -E "syslibroot|^-lc\+\+$|^-L" | sed 's/^/  /'
