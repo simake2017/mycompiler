@@ -8,6 +8,54 @@
 //   表达式的解析按优先级从低到高层层嵌套：
 //     parseExpression → parseOrExpr → parseAndExpr → ... → parsePrimaryExpr
 //   低优先级函数调用高优先级函数来获取操作数，从而保证优先级正确。
+//
+// 【在编译管线中的位置】
+//   阶段0 Preprocessor → 阶段1 Lexer → ★ 阶段2 Parser ★ → 阶段3 SemanticAnalyzer
+//   → 阶段4 TemplateDeduction/Instantiation → 阶段5 CodeGen(.s)
+//   输入：std::vector<Token>（线性词法流）；输出：TranslationUnit（AST 根）。
+//   本阶段只做结构识别，不查符号表、不做类型检查（那是阶段3的职责）。
+//
+// 【理论背景】
+//   · 递归下降（Recursive Descent）：自顶向下解析的教科书实现。文法中每个
+//     非终结符对应一个函数；LL(1) 性质保证每步分支决策只需 1 个前瞻 Token。
+//   · 前瞻与回溯：遇到 LL(1) 无法单 Token 判定的歧义（如类体内"方法 vs
+//     字段"、语句中"类名变量声明 vs 表达式"、template-id vs 比较表达式），
+//     采用"保存游标 → 试探解析 → 失败回滚"的试探法（speculative parsing）。
+//   · EBNF 文法骨架：
+//       translation-unit := declaration*
+//       declaration      := template-decl | class-decl | ['virtual'] function-decl
+//       stmt             := '{' stmt* '}' | 'if' | 'while' | 'return' | var-decl | expr-stmt
+//       expr             := 优先级链 || > && > ==/!= > 比较 > +/- > */% > 一元 > 后缀 > primary
+//   · most-vexing-parse 简化：真 C++ 中 `T x(Foo());` 按 [stmt.dcl] 会被解析
+//     为函数声明（"最令人头疼的解析"）。本编译器不支持括号初始化，语句级
+//     变量声明仅识别 `类型 名字 [= expr];` 形式，类体内用"名字后是否跟 '('"
+//     区分方法/字段——用最简单的判据回避该歧义。
+//
+// 【对应 clang 模块】（参照源码 llvm-project/clang/lib/Parse/）
+//   Parser.cpp            → ParseTopLevelDecl / ParseStatement（对应本文件的
+//                           parseTranslationUnit / parseStatement 分派）
+//   ParseDecl.cpp         → ParseDeclOrFunctionDefInternal / ParseCXXClassMemberDecl
+//                           （对应 parseFunctionDecl / parseClassDecl）
+//   ParseTemplate.cpp     → ParseTemplateDeclaration / ParseTemplateParameters
+//                           （对应 parseTemplateDecl）
+//   ParseExpr.cpp         → ParseExpression / 优先级链（对应 parseExpression 系列）
+//   ParseExprCXX.cpp      → template-id 歧义消解（对应 parsePrimaryExpr 中 '<' 试探）
+//
+// 【调用关系总览（ASCII）】
+//   parseTranslationUnit
+//    └─ parseDeclaration ─┬─ parseTemplateDecl ─┬─ parseClassDecl
+//                         │                     └─ parseFunctionDecl
+//                         ├─ parseClassDecl ──┬─ parseMethodDecl → parseFunctionDecl
+//                         │                   └─ 字段（内联解析）
+//                         └─ parseFunctionDecl ─┬─ parseType
+//                                               ├─ parseParameterList
+//                                               └─ parseBlockStmt → parseStatement
+//   parseStatement ─┬─ parseBlockStmt / parseIfStmt / parseWhileStmt / parseReturnStmt
+//                   ├─ parseType + parseVarDeclStmt
+//                   └─ parseExprOrAssignStmt → parseExpression
+//   parseExpression → parseOrExpr → parseAndExpr → parseEqualityExpr
+//     → parseComparisonExpr → parseAdditiveExpr → parseMultiplicativeExpr
+//     → parseUnaryExpr → parsePostfixExpr → parsePrimaryExpr
 // =============================================================================
 
 #include "parser.h"
@@ -19,30 +67,43 @@ namespace minicc {
 // ─────────────────────────────────────────────────────────────────────────────
 // 构造
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：（无）—— 仅持有 Token 流，游标 m_pos 初始化为 0（指向第一个 Token）。
+// 入参 demo：tokens = [int][main][(][)][{][return][0][;][}][Eof]
+//           构造后 m_pos = 0 → current() = [int]
 Parser::Parser(std::vector<Token> tokens)
     : m_tokens(std::move(tokens)) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Token 流操作
 // ─────────────────────────────────────────────────────────────────────────────
+// ── 前瞻原语：返回游标所指 Token，不移动 m_pos。所有分支决策的信息来源。──
 const Token& Parser::current() const {
     return m_tokens[m_pos];
 }
 
+// ── peek 与 current 实现相同，保留两个名字是为了调用点语义清晰：
+//    current() = "我正要处理的 Token"，peek() = "只瞄一眼决定走哪条路"。──
 const Token& Parser::peek() const {
     return m_tokens[m_pos];
 }
 
+// ── 消费并推进游标。末尾哨兵 Eof 保证越界前必先 isAtEnd()，故不递增。──
+// 游标推进示意：m_pos=2 → advance() 返回 tok[2]，m_pos=3
+//     [int][main][(][)][{]...
+//                ^ m_pos 移动前        ^ 移动后
 const Token& Parser::advance() {
     const Token& tok = m_tokens[m_pos];
     if (!isAtEnd()) m_pos++;
     return tok;
 }
 
+// ── 前瞻判断（LL(1) 的核心动作）：只比较类型，不消费。──
 bool Parser::check(TokenType t) const {
     return current().type == t;
 }
 
+// ── "尝试消费"：命中则吃掉并返回 true；未命中不动游标、返回 false。
+//    用于文法中的可选项（如 `['else' stmt]`、`['=' expr]`）。──
 bool Parser::match(TokenType t) {
     if (check(t)) {
         advance();
@@ -51,6 +112,8 @@ bool Parser::match(TokenType t) {
     return false;
 }
 
+// ── "强制消费"：语法上此处必须是 t，否则报错（panic：抛异常中止编译单元）。
+//    与 match 的对比：match 容忍缺失（可选文法），expect 不容忍（必选文法）。──
 const Token& Parser::expect(TokenType t, const std::string& msg) {
     if (check(t)) {
         return advance();
@@ -59,6 +122,7 @@ const Token& Parser::expect(TokenType t, const std::string& msg) {
         msg, tokenTypeName(t), current().text));
 }
 
+// ── 流末尾判断：越过数组边界 或 撞到 Eof 哨兵（Lexer 保证末尾有 Eof）。──
 bool Parser::isAtEnd() const {
     return m_pos >= m_tokens.size() || current().is(TokenType::Eof);
 }
@@ -66,10 +130,15 @@ bool Parser::isAtEnd() const {
 // ─────────────────────────────────────────────────────────────────────────────
 // 错误处理
 // ─────────────────────────────────────────────────────────────────────────────
+// ── 错误报告（当前 Token 处出错）──
 [[noreturn]] void Parser::error(const std::string& msg) const {
     errorAt(current(), msg);
 }
 
+// ── 错误报告（指定 Token 处出错）。
+//    错误恢复策略：panic 模式 —— 抛 std::runtime_error 直接中止本编译单元，
+//    不做 Token 级跳过/同步恢复。调用方（main/驱动）捕获后打印信息并退出。
+//    教学取舍：换取实现极简与错误信息确定性（每处语法错误恰好一条报告）。──
 [[noreturn]] void Parser::errorAt(const Token& tok, const std::string& msg) const {
     throw std::runtime_error(
         std::format("[Parse Error] {} at '{}': {}",
@@ -88,6 +157,14 @@ bool Parser::isAtEnd() const {
 //   常量: const T
 //   组合: const T&, const T&&, T*&, const T*
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：type := ['const'] base-type ('*' | '&' | '&&')*
+// 对应 clang：ParseDeclSpec 的 DeclSpec 部分（类型说明符 + 派生类型 declarator
+//            的指针/引用后缀，clang 里拆在 ParseDeclarator 中，此处合并实现）。
+// 入参 demo：Token 流 [const][Vec][&]
+//   → base = class "Vec" → 后缀 & → const(class Vec) 的左值引用
+//   → 产出 ConstType(LValueReferenceType(ClassType "Vec"))
+//   注：const 按教学简化统一作用于整个类型（真 C++ 中 const T* 与 T* const
+//   的 const 归属不同，这里不区分顶层/底层 const）。
 TypePtr Parser::parseType() {
     // ── Step 1: 处理 const 前缀 ──
     bool isConst = false;
@@ -171,6 +248,10 @@ TypePtr Parser::parseType() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 编译单元
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：translation-unit := declaration*     （零个或多个顶层声明直到 Eof）
+// 对应 clang：ParseTopLevelDecl（Parser.cpp）—— 同样是循环调用声明解析。
+// 入参 demo：Token 流 [int][foo][(][)][{][...][}][class][C][{][...][}][;][Eof]
+//   → 产出 TranslationUnit{ declarations = [FunctionDecl "foo", ClassDecl "C"] }
 TranslationUnit Parser::parseTranslationUnit() {
     TranslationUnit unit;
     while (!isAtEnd()) {
@@ -182,6 +263,17 @@ TranslationUnit Parser::parseTranslationUnit() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 声明解析：根据 Token 类型分派到具体解析函数
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：declaration := template-decl | class-decl | ['virtual'] function-decl
+// 对应 clang：ParseDeclaration / ParseDeclOrFunctionDefInternal（ParseDecl.cpp）
+//
+// 分派决策树（全部基于 1 个前瞻 Token，LL(1)）：
+//   current() == 'template'  → parseTemplateDecl
+//   current() == 'class'     → parseClassDecl
+//   current() == 'virtual'   → 记 isVirtual=true，继续走函数声明
+//   其余（类型关键字/标识符） → parseFunctionDecl
+//
+// 入参 demo：Token 流 [virtual][void][draw][(][)][{][...][}]
+//   → isVirtual=true → parseFunctionDecl 产出 FunctionDecl("draw", void, virtual)
 DeclPtr Parser::parseDeclaration() {
     // template<typename T> ...
     if (check(TokenType::KwTemplate)) {
@@ -216,6 +308,20 @@ DeclPtr Parser::parseDeclaration() {
 //   template<typename T, typename U>  ← 多参数
 //   template<class T, class U>    ← 混合也可以
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：template-decl := 'template' '<' template-param (',' template-param)* '>'
+//                        ( class-decl | function-decl )
+//       template-param := ('typename' | 'class') IDENT
+// 对应 clang：ParseTemplateDeclaration / ParseTemplateParameters（ParseTemplate.cpp）
+//
+// 模板体分派（解析顺序的关键决策，前瞻 template<...> 之后的第一个 Token）：
+//   'class'                          → 类模板分支  parseClassDecl
+//   类型关键字 / 标识符（如 T、int） → 函数模板分支 parseFunctionDecl
+//                                      （返回类型可以是模板参数名 T）
+//   其他                             → 报错
+//
+// 入参 demo：Token 流 [template][<][typename][T][>][class][Box][{][...][}][;]
+//   → typeParams = ["T"]，classTemplate = ClassDecl("Box")
+//   → 产出 TemplateDecl 蓝图（暂不做语义分析，阶段4 实例化时才克隆替换）
 TemplateDeclPtr Parser::parseTemplateDecl() {
     auto decl = std::make_shared<TemplateDecl>();
     decl->location = current().location;
@@ -223,6 +329,7 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     std::cout << std::format("  [parse:template] ▶ template declaration at {}\n",
         current().location.toString());
 
+    // 强制消费 'template' 与 '<'（必选文法，用 expect 保证结构）
     expect(TokenType::KwTemplate, "Expected 'template'");
     expect(TokenType::Less, "Expected '<' after 'template'");
 
@@ -259,12 +366,27 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 
     expect(TokenType::Greater, "Expected '>' after template parameters");
 
-    // 解析模板类
-    std::cout << std::format("  [parse:template]   parsing class body for template...\n");
-    decl->classTemplate = parseClassDecl();
+    // 解析模板体：类模板 或 函数模板（S1+）
+    // 分派依据：template<...> 之后的第一个 Token
+    //   class                          → 类模板
+    //   类型关键字 / 标识符（如 T、int） → 函数模板（返回类型可以是模板参数名 T）
+    //   其他                           → 报错
+    if (check(TokenType::KwClass)) {
+        std::cout << std::format("  [parse:template]   parsing class body for template...\n");
+        decl->classTemplate = parseClassDecl();
+    }
+    else if (current().isTypeKeyword() || check(TokenType::Identifier)) {
+        std::cout << std::format("  [parse:template]   parsing function signature for template...\n");
+        decl->funcTemplate = parseFunctionDecl();
+    }
+    else {
+        errorAt(current(),
+            "Expected 'class' or a function signature after template parameter list");
+    }
 
-    std::cout << std::format("  [parse:template] ◀ template '{}' with {} parameter(s) stored as blueprint\n",
-        decl->classTemplate->name, decl->typeParams.size());
+    std::cout << std::format("  [parse:template] ◀ {} template '{}' with {} parameter(s) stored as blueprint\n",
+        decl->isClassTemplate() ? "class" : "function",
+        decl->templateName(), decl->typeParams.size());
 
     // 打印蓝图摘要
     std::cout << std::format("  [parse:template]   blueprint summary:\n");
@@ -273,7 +395,19 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
         if (i > 0) std::cout << ", ";
         std::cout << "typename " << decl->typeParams[i];
     }
-    std::cout << std::format("> class {} {{ ... }}\n", decl->classTemplate->name);
+    if (decl->isClassTemplate()) {
+        std::cout << std::format("> class {} {{ ... }}\n", decl->templateName());
+    } else {
+        std::cout << std::format("> {} {}(",
+            decl->funcTemplate->returnType ? decl->funcTemplate->returnType->toString() : "?",
+            decl->templateName());
+        for (size_t i = 0; i < decl->funcTemplate->parameters.size(); i++) {
+            if (i > 0) std::cout << ", ";
+            std::cout << decl->funcTemplate->parameters[i].type->toString() << " "
+                      << decl->funcTemplate->parameters[i].name;
+        }
+        std::cout << ") { ... }\n";
+    }
 
     return decl;
 }
@@ -281,6 +415,19 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 类声明：class Name [: public Base] { ... };
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：class-decl := 'class' IDENT [':' 'public' IDENT] '{' member* '}' ';'
+//       member    := access-spec | ['virtual'] ( method-decl | field-decl )
+//       field-decl := type IDENT ';'
+// 对应 clang：ParseCXXClassMemberDecl（ParseDecl.cpp）
+//
+// 入参 demo：Token 流 [class][Shape][:][public][Base][{][virtual][void][draw][(][)][;][}]
+//   → 产出 ClassDecl{ name="Shape", baseClassName="Base",
+//                     methods=[virtual FuncDecl "draw"] }
+//
+// 方法 vs 字段的判定（教学简化版的"most-vexing-parse 回避"）：
+//   单靠 1 个前瞻 Token 无法区分 `int x;`（字段）与 `int x();`（方法），
+//   故采用 保存游标 → 试探解析 `类型 名字` → 看下一个是否为 '(' → 恢复游标
+//   的试探法（详见函数体内 savedPos 注释）。
 ClassDeclPtr Parser::parseClassDecl() {
     auto decl = std::make_shared<ClassDecl>();
     decl->location = current().location;
@@ -333,6 +480,11 @@ ClassDeclPtr Parser::parseClassDecl() {
         // 尝试判断是方法还是字段
         // 向前看：如果看到 类型 名字 ( → 方法
         // 否则 → 字段
+        //
+        // 试探解析（speculative parsing）：先把游标存档，空跑一遍
+        // parseType + 名字，看其后是否跟 '('，再无条件回滚到 savedPos，
+        // 由真正的 parseMethodDecl / 字段分支重新正式解析一遍。
+        // 代价是同一串 Token 被读两次，收益是不需要真正的 LL(k) 分析。
         size_t savedPos = m_pos;
         bool isMethod = false;
 
@@ -389,6 +541,13 @@ ClassDeclPtr Parser::parseClassDecl() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 方法声明
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：method-decl := ['virtual'] function-decl
+//       （函数声明本体复用 parseFunctionDecl，此处只负责剥掉可选的 'virtual'
+//         前缀并把所属类名 ownerClass、虚函数标记缝进 AST 节点）
+// 对应 clang：ParseCXXClassMemberDecl 中对成员函数说明符的处理。
+// 入参 demo：类体内 Token 流 [virtual][int][area][(][)][{][...][}]
+//   ownerClass="Shape" → 消费 virtual → parseFunctionDecl("Shape")
+//   → 产出 FunctionDecl{ name="area", isVirtual=true, ownerClassName="Shape" }
 FuncDeclPtr Parser::parseMethodDecl(const std::string& ownerClass,
                                      AccessModifier access) {
     bool isVirtual = false;
@@ -411,6 +570,20 @@ FuncDeclPtr Parser::parseMethodDecl(const std::string& ownerClass,
 // ─────────────────────────────────────────────────────────────────────────────
 // 函数声明：返回类型 函数名 ( 参数列表 ) { 函数体 }
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：function-decl := type IDENT '(' parameter-list ')' ['override']
+//                        ( compound-stmt | ';' )
+// 对应 clang：ParseDeclOrFunctionDefInternal（ParseDecl.cpp）
+//   简化点：无存储类说明符、无尾置返回类型、无形参默认值、无函数重载区分
+//   （同名函数由后续语义阶段处理）；函数体只支持复合语句块。
+//
+// 入参 demo：Token 流 [int][add][(][int][a][,][int][b][)][{][return][a][+][b][;][}]
+//   → returnType=int, name="add", parameters=[(int,a),(int,b)]
+//   → body=BlockStmt[ ReturnStmt( a + b ) ]
+//   若函数体写成 ';'（仅前向声明），则 body 为空。
+//
+// 解析顺序（严格从左到右，单遍）：
+//   [virtual] → 返回类型 parseType → 函数名 → '(' 参数列表 ')'
+//   → [override] → '{' 函数体 ';' 二者择一
 FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerClass) {
     auto decl = std::make_shared<FunctionDecl>();
     decl->location = current().location;
@@ -452,6 +625,13 @@ FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerCl
 // ─────────────────────────────────────────────────────────────────────────────
 // 参数列表
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：parameter-list := [ parameter (',' parameter)* ]
+//       parameter     := type IDENT          （调用约定：调用处游标停在 '(' 之后）
+// 对应 clang：ParseParameterDeclarationList（ParseDecl.cpp）
+// 简化点：无默认实参、无省略号 varargs、无形参修饰符（如 const 形参由类型携带）。
+// 入参 demo：Token 流 [int][a][,][double][b]（外层 '(' ')' 由调用方消费）
+//   → 产出 [ (int, "a"), (double, "b") ]
+//   Token 流 [)]（紧跟右括号）→ 直接返回空列表
 std::vector<Parameter> Parser::parseParameterList() {
     std::vector<Parameter> params;
 
@@ -471,6 +651,20 @@ std::vector<Parameter> Parser::parseParameterList() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 语句解析
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：stmt := compound-stmt | if-stmt | while-stmt | return-stmt
+//             | var-decl-stmt | expr-or-assign-stmt
+// 对应 clang：ParseStatement（Parser.cpp），同样是按首 Token 分派。
+//
+// 分派表（前瞻决策）：
+//   '{'                        → 复合语句 parseBlockStmt
+//   'if' / 'while' / 'return'  → 对应关键字语句
+//   类型关键字(int/auto/…)      → 变量声明（类型先行解析，再交给 parseVarDeclStmt）
+//   标识符 + 前瞻是标识符/'*'   → 类名型变量声明（试探法，见下）
+//   其余                        → 表达式/赋值语句
+//
+// 入参 demo：Token 流 [int][x][=][42][;]
+//   → 类型关键字 int → parseType 得 int → parseVarDeclStmt
+//   → 产出 VarDeclStmt{ name="x", type=int, init=IntLiteral(42) }
 StmtPtr Parser::parseStatement() {
     if (check(TokenType::LBrace))    return parseBlockStmt();
     if (check(TokenType::KwIf))      return parseIfStmt();
@@ -484,6 +678,10 @@ StmtPtr Parser::parseStatement() {
     }
 
     // 类名开头的变量声明（需要向前看）
+    // 歧义：标识符开头既可能是 `MyClass obj;`（声明），也可能是
+    //       `foo(...);` / `a = 3;`（表达式）。LL(1) 单 Token 无法区分，
+    //       采用试探法：存档 → 跳过头个标识符和连续 '*' → 若下一个还是
+    //       标识符则判定为声明 → 回滚后重新正式解析；否则回滚走表达式分支。
     if (check(TokenType::Identifier)) {
         // 向前看：如果是 标识符 标识符 ; 或 标识符 标识符 = → 变量声明
         size_t savedPos = m_pos;
@@ -493,7 +691,7 @@ StmtPtr Parser::parseStatement() {
         while (match(TokenType::Star)) {} // 跳过指针标记
 
         if (check(TokenType::Identifier)) {
-            // 是变量声明
+            // 是变量声明：回滚到存档点，让 parseType 从头正式解析类型
             m_pos = savedPos;
             TypePtr type = parseType();
             return parseVarDeclStmt(type);
@@ -507,6 +705,10 @@ StmtPtr Parser::parseStatement() {
 }
 
 // ─── 代码块 ──────────────────────────────────────────────────────────────────
+// 文法：compound-stmt := '{' stmt* '}'
+// 对应 clang：ParseCompoundStatement（Parser.cpp）
+// 入参 demo：Token 流 [{][int][x][;][x][=][1][;][}]
+//   → 产出 BlockStmt{ statements = [VarDeclStmt x, AssignStmt x=1] }
 StmtPtr Parser::parseBlockStmt() {
     expect(TokenType::LBrace, "Expected '{'");
     std::vector<StmtPtr> stmts;
@@ -520,6 +722,14 @@ StmtPtr Parser::parseBlockStmt() {
 }
 
 // ─── 变量声明 ─────────────────────────────────────────────────────────────────
+// 文法：var-decl-stmt := IDENT ['=' expr] ';'
+//   注：类型由调用方（parseStatement）预先 parseType 后作为入参传入，
+//       这样"试探判定是不是声明"与"正式解析类型"可以解耦。
+//   简化点：不支持括号初始化 `T x(...)`、列表初始化 `T x{...}`、
+//           一条语句声明多个变量 —— 正是这些简化回避了 most-vexing-parse。
+// 对应 clang：ParseSimpleDeclaration（ParseDecl.cpp）
+// 入参 demo：入参 type=int；Token 流 [x][=][42][;]
+//   → 产出 VarDeclStmt{ name="x", type=int, init=IntLiteral(42) }
 StmtPtr Parser::parseVarDeclStmt(TypePtr type) {
     auto loc = current().location;
     const Token& nameToken = expect(TokenType::Identifier, "Expected variable name");
@@ -537,6 +747,12 @@ StmtPtr Parser::parseVarDeclStmt(TypePtr type) {
 }
 
 // ─── if 语句 ──────────────────────────────────────────────────────────────────
+// 文法：if-stmt := 'if' '(' expr ')' stmt ['else' stmt]
+//   'else' 是可选分支（match 容忍缺失）；then/else 均为单条 stmt，
+//   多条语句需写 { }（悬垂 else 按 C 惯例就近绑定，递归下降自然满足）。
+// 对应 clang：ParseIfStatement（ParseStmt.cpp）
+// 入参 demo：Token 流 [if][(][x][<][10][)][{][...][}][else][return][0][;]
+//   → 产出 IfStmt{ cond=(x<10), then=BlockStmt, else=ReturnStmt(0) }
 StmtPtr Parser::parseIfStmt() {
     auto loc = current().location;
     expect(TokenType::KwIf, "Expected 'if'");
@@ -559,6 +775,10 @@ StmtPtr Parser::parseIfStmt() {
 }
 
 // ─── while 语句 ───────────────────────────────────────────────────────────────
+// 文法：while-stmt := 'while' '(' expr ')' stmt
+// 对应 clang：ParseWhileStatement（ParseStmt.cpp）
+// 入参 demo：Token 流 [while][(][i][<][n][)][i][=][i][+][1][;]
+//   → 产出 WhileStmt{ cond=(i<n), body=AssignStmt(i = i+1) }
 StmtPtr Parser::parseWhileStmt() {
     auto loc = current().location;
     expect(TokenType::KwWhile, "Expected 'while'");
@@ -576,6 +796,11 @@ StmtPtr Parser::parseWhileStmt() {
 }
 
 // ─── return 语句 ──────────────────────────────────────────────────────────────
+// 文法：return-stmt := 'return' [expr] ';'
+//   返回值可选：前瞻到 ';' 即为裸 return（void 函数）。
+// 对应 clang：ParseReturnStatement（ParseStmt.cpp）
+// 入参 demo：Token 流 [return][a][+][b][;] → ReturnStmt{ value = BinaryExpr(a+b) }
+//           Token 流 [return][;]           → ReturnStmt{ value = nullptr }
 StmtPtr Parser::parseReturnStmt() {
     auto loc = current().location;
     expect(TokenType::KwReturn, "Expected 'return'");
@@ -593,6 +818,13 @@ StmtPtr Parser::parseReturnStmt() {
 }
 
 // ─── 表达式语句或赋值语句 ─────────────────────────────────────────────────────
+// 文法：expr-or-assign := expr ['=' expr] ';'
+//   决策：先把左侧完整解析为 expr，再前瞻是否跟 '='：
+//         跟了 → AssignStmt（赋值）；没跟 → ExprStmt（纯表达式语句）。
+//   简化点：不支持复合赋值 +=/-= 等，也不支持链式赋值 a=b=c。
+// 对应 clang：ParseExpressionStatement（ParseStmt.cpp）
+// 入参 demo：Token 流 [x][=][42][;]  → AssignStmt{ lhs=Var(x), rhs=IntLiteral(42) }
+//           Token 流 [foo][(][)][;] → ExprStmt{ expr=CallExpr(foo, []) }
 StmtPtr Parser::parseExprOrAssignStmt() {
     ExprPtr expr = parseExpression();
 
@@ -614,12 +846,35 @@ StmtPtr Parser::parseExprOrAssignStmt() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 表达式解析（优先级从低到高）
 // ─────────────────────────────────────────────────────────────────────────────
+// 方法：优先级分层递归下降（precedence climbing 的文法编码形式）。
+//   运算符优先级用文法嵌套表达：优先级越低的运算符出现在越外层的产生式，
+//   因此越晚绑定。每层统一模式：
+//       left := 下一层();                       // 先取更高优先级的操作数
+//       while (当前 Token 是本层运算符) {       // 左结合：循环向左折叠
+//           消费运算符; right := 下一层();
+//           left := BinaryExpr(op, left, right);
+//       }
+//
+//   优先级链（低 → 高）：
+//     || → && → ==/!= → <,>,<=,>= → +,- → *,/,% → 一元 -,! → 后缀 call/./-> → primary
+//
+//   demo：`1 + 2 * 3` 的解析形状
+//     parseAdditiveExpr: left = parseMultiplicativeExpr()   → Int(1)
+//       见到 '+', right = parseMultiplicativeExpr()         → Mul(2,3)  ← * 先绑定
+//       → Add(1, Mul(2,3)) ✓ 乘法成为加法的右孩子，优先级正确
+//
+// 对应 clang：ParseExpression / ParseRHSOfBinaryExpression（ParseExpr.cpp）
+//   clang 用一张运算符优先级表迭代处理，本实现用函数嵌套链，原理相同。
 
 ExprPtr Parser::parseExpression() {
     return parseOrExpr();
 }
 
 // ─── || ──────────────────────────────────────────────────────────────────────
+// 文法：or-expr := and-expr ('||' and-expr)*      最低优先级，左结合
+// 入参 demo：Token 流 [a][||][b][&&][c]
+//   left=Var(a)；见 '||'，right = parseAndExpr → And(b,c)
+//   → 产出 Or(a, And(b,c))   ← && 比 || 绑定更紧，成为其右孩子
 ExprPtr Parser::parseOrExpr() {
     ExprPtr left = parseAndExpr();
 
@@ -636,6 +891,9 @@ ExprPtr Parser::parseOrExpr() {
 }
 
 // ─── && ──────────────────────────────────────────────────────────────────────
+// 文法：and-expr := equality ('&&' equality)*     左结合
+// 入参 demo：Token 流 [x][&&][y] → And(Var(x), Var(y))
+// 注：此处只做结构解析；短路求值是语义/代码生成阶段的事。
 ExprPtr Parser::parseAndExpr() {
     ExprPtr left = parseEqualityExpr();
 
@@ -652,6 +910,9 @@ ExprPtr Parser::parseAndExpr() {
 }
 
 // ─── == != ───────────────────────────────────────────────────────────────────
+// 文法：equality := comparison (('==' | '!=') comparison)*   左结合
+// 入参 demo：Token 流 [a][==][b] → BinaryExpr(Eq, Var(a), Var(b))
+// 决策：前瞻 Token 在 EqualEqual / BangEqual 二者中映射到 Eq / Neq。
 ExprPtr Parser::parseEqualityExpr() {
     ExprPtr left = parseComparisonExpr();
 
@@ -670,6 +931,11 @@ ExprPtr Parser::parseEqualityExpr() {
 }
 
 // ─── < > <= >= ──────────────────────────────────────────────────────────────
+// 文法：comparison := additive (('<'|'>'|'<='|'>=') additive)*   左结合
+// 入参 demo：Token 流 [i][<][n] → BinaryExpr(Lt, Var(i), Var(n))
+// 注意：比较运算符 '<' 与模板实参列表的 '<' 是同一个 Token —— 模板 id 的
+//       歧义消解发生在 parsePrimaryExpr（标识符后试探 '<' 类型列表 '('），
+//       本层拿到的 '<' 一律按比较运算符处理。
 ExprPtr Parser::parseComparisonExpr() {
     ExprPtr left = parseAdditiveExpr();
 
@@ -695,6 +961,9 @@ ExprPtr Parser::parseComparisonExpr() {
 }
 
 // ─── + - ─────────────────────────────────────────────────────────────────────
+// 文法：additive := multiplicative (('+' | '-') multiplicative)*   左结合
+// 入参 demo：Token 流 [a][-][b][-][c]
+//   循环向左折叠：先 Sub(a,b)，再 Sub(Sub(a,b), c) → 左结合 ✓
 ExprPtr Parser::parseAdditiveExpr() {
     ExprPtr left = parseMultiplicativeExpr();
 
@@ -713,6 +982,10 @@ ExprPtr Parser::parseAdditiveExpr() {
 }
 
 // ─── * / % ───────────────────────────────────────────────────────────────────
+// 文法：multiplicative := unary (('*' | '/' | '%') unary)*   左结合
+// 入参 demo：Token 流 [2][*][3][%][4] → Mod(Mul(2,3), 4)
+// 注意：'*' 在类型上下文（parseType）里是指针后缀，在表达式上下文里是乘法——
+//       同一 Token 的含义由调用它的文法位置决定（上下文相关）。
 ExprPtr Parser::parseMultiplicativeExpr() {
     ExprPtr left = parseUnaryExpr();
 
@@ -737,6 +1010,12 @@ ExprPtr Parser::parseMultiplicativeExpr() {
 }
 
 // ─── 一元表达式：-x, !x ─────────────────────────────────────────────────────
+// 文法：unary := ('-' | '!') unary | postfix
+//   递归调用自身 → 支持一元运算符任意叠加（如 -!x、--x 在此文法下均合法，
+//   语义合法性由阶段3检查）。
+// 对应 clang：ParseCastExpression 中对一元前缀运算符的处理（ParseExpr.cpp）
+// 入参 demo：Token 流 [-][x] → UnaryExpr(Neg, Var(x))
+//           Token 流 [!][flag] → UnaryExpr(Not, Var(flag))
 ExprPtr Parser::parseUnaryExpr() {
     if (check(TokenType::Minus) || check(TokenType::Bang)) {
         auto loc = current().location;
@@ -753,6 +1032,13 @@ ExprPtr Parser::parseUnaryExpr() {
 }
 
 // ─── 后缀表达式：函数调用、成员访问 ─────────────────────────────────────────
+// 文法：postfix := primary ( call-args | ('.' | '->') IDENT )*
+//   while 循环 + 每次把结果包成新节点 → 天然左结合，支持任意长后缀链。
+// 对应 clang：ParsePostfixExpressionSuffix（ParseExpr.cpp）
+// 入参 demo：Token 流 [p][->][next][(][)]
+//   primary=Var(p) → 见 '->' 包成 MemberExpr(p.next, isArrow)
+//   → 见 '(' 包成 CallExpr(MemberExpr(p.next), [])
+//   → 产出 Call( Member(p, next), [] )   ← 后缀从左到右逐层外包
 ExprPtr Parser::parsePostfixExpr() {
     ExprPtr expr = parsePrimaryExpr();
 
@@ -784,6 +1070,23 @@ ExprPtr Parser::parsePostfixExpr() {
 }
 
 // ─── 基本表达式：字面量、变量、new、this、括号表达式 ────────────────────────
+// 文法：primary := INT | BOOL | STRING | 'nullptr' | 'this'
+//                | 'new' IDENT ['(' [expr (',' expr)*] ')']
+//                | IDENT ['<' type (',' type)* '>']      ← template-id（S3 显式模板实参）
+//                | '(' expr ')'
+// 优先级链的最内层（结合力最强），是递归下降的"叶子"层。
+// 对应 clang：ParsePrimaryExpression / ParsePrimaryExpressionOrUnaryExpression
+//            （ParseExpr.cpp、ParseExprCXX.cpp）
+//
+// 分派表（按前瞻 Token 逐个尝试，全部 LL(1)）：
+//   IntLiteral/StringLiteral/true/false/nullptr/this → 对应字面量节点
+//   标识符 "new"（词法上未单列关键字，按文本识别）   → NewExpr
+//   其他标识符                                        → VarExpr（+ 可选 template-id 试探）
+//   '('                                              → 括号表达式，递归回 parseExpression
+//
+// 入参 demo：Token 流 [new][Node][(][1][,][2][)]
+//   → 产出 NewExpr{ className="Node", constructorArgs=[Int(1), Int(2)] }
+//           Token 流 [(][a][+][b][)] → 递归 parseExpression → Add(a,b)
 ExprPtr Parser::parsePrimaryExpr() {
     auto loc = current().location;
 
@@ -853,11 +1156,48 @@ ExprPtr Parser::parsePrimaryExpr() {
         return expr;
     }
 
-    // 变量引用
+    // 变量引用（或 template-id：foo<int>(...) —— S3 显式模板实参）
     if (check(TokenType::Identifier)) {
         std::string name = advance().text;
         auto expr = std::make_shared<VarExpr>(name);
         expr->location = loc;
+
+        // 显式模板实参：name '<' 类型列表 '>'，且其后必须紧跟 '('
+        // 歧义消解（clang ParseImplicitTemplateId 的简化版）：
+        //   a < b > c 是比较表达式；foo<int>(x) 是 template-id。
+        //   判据：试探解析逗号分隔的类型列表，成功匹配 '>' 且下一个是 '(' 才算 template-id，
+        //   否则回滚，把 '<' 交还给比较表达式解析。
+        //
+        // 试探法三步曲（与类体内方法/字段判定同一模式）：
+        //   ① saved = m_pos 存档；② try 块内空跑"类型列表 + '>' + '(' 前瞻"，
+        //   parseType 中途报错说明 '<' 后不是类型（如 a<b），异常即失败信号；
+        //   ③ 失败则 m_pos = saved 回滚，外层 while 会把 '<' 当比较运算符继续。
+        if (check(TokenType::Less)) {
+            size_t saved = m_pos;
+            advance(); // '<'
+            std::vector<TypePtr> explicitArgs;
+            bool isTemplateId = true;
+            try {
+                if (!check(TokenType::Greater)) {
+                    do {
+                        explicitArgs.push_back(parseType());
+                    } while (match(TokenType::Comma));
+                }
+                if (!match(TokenType::Greater) || !check(TokenType::LParen)) {
+                    isTemplateId = false;
+                }
+            } catch (const std::exception&) {
+                isTemplateId = false;
+            }
+            if (isTemplateId) {
+                expr->explicitTemplateArgs = std::move(explicitArgs);
+                std::cout << std::format("  [parse] template-id: {}<{} explicit arg(s)>\n",
+                    name, expr->explicitTemplateArgs.size());
+            } else {
+                m_pos = saved; // 回滚：这是 'a < b' 比较
+            }
+        }
+
         return expr;
     }
 
@@ -874,6 +1214,11 @@ ExprPtr Parser::parsePrimaryExpr() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 参数列表（函数调用）
 // ─────────────────────────────────────────────────────────────────────────────
+// 文法：call-args := '(' [ expr (',' expr)* ] ')'
+//   与 parseParameterList（声明侧：类型+名字）不同，调用侧是纯表达式列表。
+// 对应 clang：ParseExpressionList（ParseExpr.cpp）
+// 入参 demo：Token 流 [(][x][,][f][(][)][)]
+//   → 产出 [ Var(x), Call(f, []) ]；Token 流 [(][)] → 空列表
 std::vector<ExprPtr> Parser::parseArgumentList() {
     expect(TokenType::LParen, "Expected '('");
     std::vector<ExprPtr> args;
@@ -891,6 +1236,9 @@ std::vector<ExprPtr> Parser::parseArgumentList() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 辅助：Token 类型转二元运算符
 // ─────────────────────────────────────────────────────────────────────────────
+// 纯查表映射（TokenType → BinaryOp），无副作用。各层优先级函数目前内联了
+// 自己的 switch，此表作为集中式对照备用；default 分支兜底返回 Add 仅为
+// 满足 return 语义（调用方保证只传入运算符 Token）。
 BinaryOp Parser::tokenToBinaryOp(TokenType t) const {
     switch (t) {
         case TokenType::Plus:         return BinaryOp::Add;

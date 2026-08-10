@@ -1,6 +1,13 @@
 // =============================================================================
 // 类型系统实现
 // =============================================================================
+// 实现 include/type.h 声明的 Type 成员：工厂方法、sizeInBytes、equals、
+// toString、stripReferences/stripConst。
+// 注意分工：
+//   · 引用折叠与类型替换（substituteType）在 src/template_instantiation.cpp；
+//   · 类型 → Itanium mangling 编码（encodeType）在 src/template_instantiation.cpp
+//     的 NameMangler 中。本文件的 toString 面向"人读"，encodeType 面向"链接器"。
+// =============================================================================
 
 #include "type.h"
 #include <format>
@@ -11,6 +18,7 @@ namespace minicc {
 // 工厂方法：创建各种类型实例
 // ─────────────────────────────────────────────────────────────────────────────
 
+// void 类型。无入参。demo：void f(); 的返回类型 → Type{kind=Void, name="void"}
 TypePtr Type::makeVoid() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Void;
@@ -18,6 +26,7 @@ TypePtr Type::makeVoid() {
     return t;
 }
 
+// bool 类型。无入参。demo：bool b; 的声明类型 → Type{kind=Bool, name="bool"}，encodeType→"b"
 TypePtr Type::makeBool() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Bool;
@@ -25,6 +34,7 @@ TypePtr Type::makeBool() {
     return t;
 }
 
+// int 类型。无入参。demo：int x; 的声明类型 → Type{kind=Int, name="int"}，encodeType→"i"
 TypePtr Type::makeInt() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Int;
@@ -32,6 +42,7 @@ TypePtr Type::makeInt() {
     return t;
 }
 
+// double 类型。无入参。demo：double d; → Type{kind=Double, name="double"}，encodeType→"d"
 TypePtr Type::makeDouble() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Double;
@@ -39,6 +50,9 @@ TypePtr Type::makeDouble() {
     return t;
 }
 
+// 指针类型 T*。入参 pointee = 被指向的内层类型。
+// demo：makePointer(Int) → Pointer(Int)，toString="int*"，encodeType→"Pi"
+//       makePointer(Pointer(Int)) → int**，encodeType→"PPi"
 TypePtr Type::makePointer(TypePtr pointee) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Pointer;
@@ -47,6 +61,9 @@ TypePtr Type::makePointer(TypePtr pointee) {
     return t;
 }
 
+// 左值引用 T&。入参 referenced = 被引用的内层类型。
+// demo：makeLValueReference(Int) → LValueReference(Int)，toString="int&"，encodeType→"Ri"
+// 注意：若 referenced 本身已是引用，则构成嵌套引用，实例化时由引用折叠处理。
 TypePtr Type::makeLValueReference(TypePtr referenced) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::LValueReference;
@@ -55,6 +72,9 @@ TypePtr Type::makeLValueReference(TypePtr referenced) {
     return t;
 }
 
+// 右值引用 T&&。入参 referenced = 被引用的内层类型。
+// demo：makeRValueReference(Int) → RValueReference(Int)，toString="int&&"，encodeType→"Oi"
+// 当 T 是模板参数时 T&& 是"万能引用"（[temp.deduct.call]）；折叠规则见 type.h。
 TypePtr Type::makeRValueReference(TypePtr referenced) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::RValueReference;
@@ -63,6 +83,10 @@ TypePtr Type::makeRValueReference(TypePtr referenced) {
     return t;
 }
 
+// const 限定 const T。入参 inner = 被限定的内层类型。
+// demo：makeConst(Int) → Const(Int)，toString="const int"，encodeType→"Ki"
+//       makeConst(LValueReference(Int)) → const int&，encodeType→"KRi"
+// 本项目 const 总包在最外层（见 type.h"组合规则"）。
 TypePtr Type::makeConst(TypePtr inner) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Const;
@@ -71,6 +95,9 @@ TypePtr Type::makeConst(TypePtr inner) {
     return t;
 }
 
+// 类类型。入参 name = 类名；同时初始化 classLayout.className。
+// demo：makeClass("Point") → Class{ name="Point", classLayout.className="Point" }
+// encodeType→"5Point"（长度5 + 名字）。字段偏移/vtable 由语义阶段填充。
 TypePtr Type::makeClass(const std::string& name) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Class;
@@ -79,6 +106,9 @@ TypePtr Type::makeClass(const std::string& name) {
     return t;
 }
 
+// 模板参数占位类型。入参 paramName = 模板参数名。
+// demo：makeTemplateParam("T") → TemplateParam{ templateParamName="T" }
+// 出现在模板蓝图中；实例化时被 substituteType 替换为实际类型。
 TypePtr Type::makeTemplateParam(const std::string& paramName) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::TemplateParam;
@@ -87,6 +117,8 @@ TypePtr Type::makeTemplateParam(const std::string& paramName) {
     return t;
 }
 
+// auto 占位类型。无入参。demo：auto x = ...; → Type{kind=Auto, name="auto"}
+// 语义阶段用初始化表达式类型回填后即被消除（阶段3之后不应再出现 auto）。
 TypePtr Type::makeAuto() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Auto;
@@ -126,6 +158,11 @@ uint32_t Type::sizeInBytes() const {
 // ─────────────────────────────────────────────────────────────────────────────
 // equals：类型比较
 // ─────────────────────────────────────────────────────────────────────────────
+// 结构化递归比较：kind 相同才继续，复合类型递归比较内层。
+// 用于语义检查（实参/形参匹配）与函数模板推导中"多处推导结果须一致"的判断
+// （合一算法 unify 成功后的类型等价检查，见 [temp.deduct]）。
+// demo：int  equals int  → true；int equals double → false（kind 不同）
+//       Pi   equals Pi   → true（递归比较 pointee）
 bool Type::equals(const TypePtr& other) const {
     if (!other) return false;
     if (kind != other->kind) return false;
@@ -165,6 +202,9 @@ bool Type::equals(const TypePtr& other) const {
 // ─────────────────────────────────────────────────────────────────────────────
 // toString：类型的可读字符串表示
 // ─────────────────────────────────────────────────────────────────────────────
+// 递归拼接，用于中文日志与报错信息。与 NameMangler::encodeType 的区别：
+// toString 面向"人读"，encodeType 面向"链接器"。
+// demo：Const(LValueReference(Int)).toString() → "const int&"
 std::string Type::toString() const {
     switch (kind) {
         case TypeKind::Void:   return "void";
@@ -189,6 +229,11 @@ std::string Type::toString() const {
 // ─────────────────────────────────────────────────────────────────────────────
 // stripReferences / stripConst：去除修饰，获取"裸类型"
 // ─────────────────────────────────────────────────────────────────────────────
+// 推导时常用：先剥掉实参/形参的引用与 const，再比较"裸类型"
+// （对应 [temp.deduct.call] 中对实参类型做的退化调整）。
+// demo：stripReferences(RValueReference(Int)) → Int；stripReferences(Int) → nullptr
+//       stripConst(Const(Int)) → Int；stripConst(Int) → nullptr
+// （返回 nullptr 表示"无可剥的修饰"，调用方据此回退到原类型。）
 TypePtr Type::stripReferences() const {
     if (isLValueReference() || isRValueReference()) {
         return referencedType ? referencedType : nullptr;

@@ -9,6 +9,36 @@
 //   2. 存储类的内存布局信息（字段偏移量、vtable 结构）
 //   3. 支持类型比较和推导
 // =============================================================================
+//
+// 【在管线中的位置】
+//   Preprocessor → Lexer → Parser → SemanticAnalyzer → TemplateDeduction/
+//   Instantiation → CodeGen
+//   type.h 横跨所有阶段，是语义信息的"通货"：
+//     · Parser              parseType() 构造 Type（见 src/parser.cpp:168）
+//     · SemanticAnalyzer    填充 Expression::resolvedType、计算 ClassLayout 偏移
+//     · TemplateInstantiator::substituteType 对 Type 做 T→实际类型 的结构化替换
+//                           （含引用折叠，见 src/template_instantiation.cpp:280）
+//     · NameMangler::encodeType 把 Type 编码为 Itanium mangling 字符
+//
+// 【对应 C++ 标准章节】
+//   [basic.type]          类型总览
+//   [basic.fundamental]   基础类型 void/bool/int/double
+//   [dcl.ptr]             指针 T*
+//   [dcl.ref]             引用 T& / T&&（引用折叠 [dcl.ref]/6）
+//   [dcl.type.cv]         const 限定
+//   [dcl.spec.auto]       auto 占位符
+//   [class] / [class.mem] / [class.virtual]   类、成员布局、虚函数/vtable
+//   [temp.param] / [temp.deduct]              模板参数类型与实参推导
+//
+// 【对应 clang 模块】
+//   include/clang/AST/Type.h        Type / BuiltinType / PointerType /
+//                                   LValueReferenceType / RValueReferenceType /
+//                                   RecordType / TemplateTypeParmType / AutoType
+//   include/clang/AST/Decl.h        FieldDecl（对应本文件 FieldInfo）
+//   include/clang/AST/RecordLayout.h ASTRecordLayout（对应本文件 ClassLayout）
+//   差异说明：clang 用 QualType + Qualifiers 承载 const（不单独建节点）；
+//             教学实现把 const 建成独立的 TypeKind::Const 节点，便于观察与讲解。
+// =============================================================================
 
 #include <cstdint>
 #include <memory>
@@ -40,6 +70,24 @@ enum class TypeKind : uint8_t {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TypeKind ↔ clang 类型类 ↔ Itanium mangling 编码 对照表
+// ─────────────────────────────────────────────────────────────────────────────
+//   TypeKind          clang 对应（include/clang/AST/Type.h）   encodeType 编码
+//   Void              BuiltinType::Void                        v
+//   Bool              BuiltinType::Bool                        b
+//   Int               BuiltinType::Int                         i
+//   Double            BuiltinType::Double                      d
+//   Pointer           PointerType                              P + 内层
+//   LValueReference   LValueReferenceType                      R + 内层
+//   RValueReference   RValueReferenceType                      O + 内层
+//   Const             （clang 用 Qualifier，非独立 Type 节点）  K + 内层
+//   Class             RecordType / CXXRecordDecl               <名字长度><名字>
+//   TemplateParam     TemplateTypeParmType                     参数名原样输出
+//   Auto              AutoType                                 （阶段3后应已消除）
+//   encodeType 的实现见 src/template_instantiation.cpp 的 NameMangler::encodeType。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AccessModifier：访问修饰符
 // ─────────────────────────────────────────────────────────────────────────────
 enum class AccessModifier : uint8_t {
@@ -51,6 +99,11 @@ enum class AccessModifier : uint8_t {
 // ─────────────────────────────────────────────────────────────────────────────
 // FieldInfo：类的字段信息（运行期看偏移量）
 // ─────────────────────────────────────────────────────────────────────────────
+// 对应 clang::FieldDecl（include/clang/AST/Decl.h）+ ASTRecordLayout 中的字段偏移。
+// demo：class Point { int x; int y; };
+//   fields = [ FieldInfo{name=x, type=int, offset=0, size=4},
+//              FieldInfo{name=y, type=int, offset=4, size=4} ]
+//   （int 按 4 字节对齐，x 在偏移 0，y 紧随其后在偏移 4）
 struct FieldInfo {
     std::string name;
     TypePtr     type;
@@ -62,6 +115,10 @@ struct FieldInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // VTableEntry：虚函数表中的一个槽位
 // ─────────────────────────────────────────────────────────────────────────────
+// 对应 clang 的 vtable 布局计算（clang/lib/CodeGen/VTables.cpp）。
+// 含虚函数的类，对象头部藏一个 vptr 指向 vtable；vtable 本质是函数指针数组。
+// demo：class Base { virtual void foo(); };
+//   vtableEntries = [ VTableEntry{mangledName="_ZN4Base3fooEv", index=0} ]
 struct VTableEntry {
     std::string mangledName;     // 经过 name mangling 的函数符号名
     uint32_t    index   = 0;     // 在 vtable 中的索引（0-based）
@@ -73,7 +130,18 @@ struct VTableEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 // 这是"运行期看偏移量"的核心数据结构。
 // 编译器在此计算好每个字段的绝对偏移量，后续代码生成直接使用这些数字。
-// ─────────────────────────────────────────────────────────────────────────────
+// 布局计算见 src/semantic_analyzer.cpp 的类注册路径（约 :226~:373）：
+//   先并入基类的 fields/vtableEntries，再累加本类字段偏移，最后分配 vtable 槽位。
+//
+// 对象内存示意（class Derived : Base，Base 有虚函数，Derived 新增 int d;）：
+//   偏移 0   ┌─────────────────────────┐
+//            │ vptr (8B) ─────────────►│ vtable 符号 _ZTV7Derived
+//   偏移 8   ├─────────────────────────┤   [-1] _ZTI7Derived（RTTI type_info）
+//            │ Base 继承来的字段 ...    │   [0]  Derived::foo（虚函数槽位 0）
+//   偏移 k   ├─────────────────────────┤
+//            │ int d (4B)              │
+//            └─────────────────────────┘
+//   totalSize = 按最大对齐数对齐后的对象总字节数
 struct ClassLayout {
     std::string              className;
     uint32_t                 totalSize   = 0;    // 整个对象的字节大小
@@ -93,6 +161,47 @@ struct ClassLayout {
         return nullptr;
     }
 };
+
+// =============================================================================
+// 【指针 / 引用 / const 的组合规则】
+// =============================================================================
+// 本项目的 Type 是"洋葱式"嵌套结构：每个修饰符都是独立的 Type 节点，
+// 通过 pointeeType / referencedType / innerType 三条链指向内层被修饰类型。
+//
+// 重要：本项目 Parser 的组合顺序（见 src/parser.cpp parseType :168）——
+//   1) const 作为"前缀"先被记下；2) 解析基础类型；3) 依次叠加后缀 * / & / &&；
+//   4) 最后才把 const 包在最外层。因此 const 总是最外层节点（教学简化）。
+//   注意这与真实 C++ 不同：真实 C++ 里 `const int*`（指向 const int 的指针）
+//   与 `int* const`（const 的、指向 int 的指针）是两种不同类型；本项目语法
+//   只允许 const 前缀，统一按"最外层 const"处理。
+//
+//   源码           Type 结构（外 → 内）                 encodeType
+//   int            Int                                  i
+//   int*           Pointer(Int)                         Pi
+//   int&           LValueReference(Int)                 Ri
+//   int&&          RValueReference(Int)                 Oi
+//   const int      Const(Int)                           Ki
+//   int**          Pointer(Pointer(Int))                PPi
+//   const int*     Const(Pointer(Int))                  KPi   ← const 在最外层
+//   const int&     Const(LValueReference(Int))          KRi   ← const 在最外层
+//
+//   ASCII：const int& 的嵌套（外 → 内）
+//        Const
+//         └─ innerType ──► LValueReference
+//                             └─ referencedType ──► Int
+//
+// 【引用折叠（Reference Collapsing）】 标准依据：[dcl.ref]/6；
+//   模板实参推导产生嵌套引用时见 [temp.deduct.call] / [temp.deduct.type]。
+//   普通 C++ 不允许写"引用的引用"，但 T&& 的模板替换会产生它。折叠规则：
+//        T&  &  → T&     T&  && → T&     T&& &  → T&     T&& && → T&&
+//   一句话：只要有一层是左值引用，结果就是左值引用（& 永远赢）。
+//   这是"万能引用/转发引用"的原理：
+//        template<typename T> void foo(T&& x);
+//        foo(42);   ⇒ T=int,   T&& = int&&           （右值引用）
+//        foo(var);  ⇒ T=int&,  T&& = int& && → int&   （折叠为左值引用）
+//   折叠不在本文件实现，由 TemplateInstantiator::substituteType 完成
+//   （src/template_instantiation.cpp:280），但被折叠的对象正是这里的 Type 节点。
+// =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type：类型的统一表示
@@ -117,6 +226,8 @@ struct Type {
     std::string templateParamName; // 模板参数名（如 "T"）
 
     // ── 工厂方法 ──
+    // 每个 make* 返回一个新构造的 Type 节点；组合规则见上方"洋葱式"说明。
+    // 各工厂函数的入参含义、产物形状与 encodeType 结果见 src/type.cpp 对应实现。
     static TypePtr makeVoid();
     static TypePtr makeBool();
     static TypePtr makeInt();

@@ -11,6 +11,17 @@
 //   4. 将蓝图中所有的 T 替换为 int
 //   5. 生成唯一符号名 _Z5MyPtrIiE
 //   6. 注册为一个新的真实类
+//
+// 管线位置：语义分析发现 MyPtr<int> 的使用（或推导出函数模板实参）后调用本模块；
+// 产出的具体类/函数注册进全局表，供后续语义检查与 CodeGen 使用。
+//
+// 对应 C++ 标准章节：
+//   [temp.inst]  隐式实例化的触发与语义（用到才实例化）
+//   [temp.subst] 模板实参替换（类型位置逐一替换，引用处折叠）
+//   [dcl.ref]    引用折叠（T& && → T& 等四条规则）
+// 对照 clang：
+//   lib/Sema/SemaTemplateInstantiate.cpp —— 声明/类型实例化（本文件 instantiate*）
+//   lib/Sema/TreeTransform.h             —— 表达式/语句递归重建（本文件 cloneExpr/cloneStmt）
 // =============================================================================
 
 #include "template_instantiation.h"
@@ -26,6 +37,10 @@ namespace minicc {
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型编码：将类型转为 mangling 字符串
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】把类型树编码为 Itanium ABI 的 mangling 片段（复合类型递归编码）
+// 【编码表】v=void b=bool i=int d=double P=指针 R=左值引用 O=右值引用 K=const
+//           类名 = <长度><名字>（如 7MyClass）；模板参数名原样输出（实例化后不应出现）
+// 【demo】int* → Pi；const int → Ki；MyClass → 7MyClass
 std::string NameMangler::encodeType(TypePtr type) {
     if (!type) return "v"; // void
 
@@ -56,6 +71,8 @@ std::string NameMangler::encodeType(TypePtr type) {
 // 模板实例化符号名
 // 格式: _Z + 模板名长度 + 模板名 + I + 参数编码... + E
 // 例: MyPtr<int> → _Z5MyPtrIiE
+// 【做什么】类模板与函数模板实例共用：twice<int> → _Z5twiceIiE；
+//           同一模板的不同实参实例符号互不相同，链接期不会冲突
 // ─────────────────────────────────────────────────────────────────────────────
 std::string NameMangler::mangleTemplateInstance(
     const std::string& templateName,
@@ -76,6 +93,8 @@ std::string NameMangler::mangleTemplateInstance(
 // 格式: _Z + [N + 类名长度 + 类名] + 函数名长度 + 函数名 + 参数编码... [+ E]
 // 例: MyClass::foo(int) → _ZN7MyClass3fooEi
 // ─────────────────────────────────────────────────────────────────────────────
+// 【demo】MyClass::foo(int)：_Z + N + 7MyClass + 3foo + i + E → _ZN7MyClass3fooEi
+//         自由函数 twice(int)：_Z + 5twice + i → _Z5twicei
 std::string NameMangler::mangleFunction(
     const std::string& funcName,
     const std::string& className,
@@ -104,6 +123,8 @@ std::string NameMangler::mangleFunction(
 // ─────────────────────────────────────────────────────────────────────────────
 // RTTI 符号名
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】type_info 对象的符号名（RTTI，[class.rtti]），格式 _ZTI + 类名
+// 【demo】MyClass → _ZTI7MyClass
 std::string NameMangler::mangleRTTI(const std::string& className) {
     return std::format("_ZTI{}{}", className.size(), className);
 }
@@ -111,6 +132,8 @@ std::string NameMangler::mangleRTTI(const std::string& className) {
 // ─────────────────────────────────────────────────────────────────────────────
 // vtable 符号名
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】虚函数表（vtable）的符号名，格式 _ZTV + 类名（有虚函数的类才生成）
+// 【demo】MyClass → _ZTV7MyClass
 std::string NameMangler::mangleVTable(const std::string& className) {
     return std::format("_ZTV{}{}", className.size(), className);
 }
@@ -122,6 +145,10 @@ std::string NameMangler::mangleVTable(const std::string& className) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 模板实例化：将蓝图克隆并替换
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】类模板实例化 [temp.inst]：MyPtr<int> 的完整流程对应函数体内编号步骤
+// 【理论】实例化 = 结构化替换 [temp.subst]：深拷贝蓝图 AST，把每个类型位置的 T 换成 int；
+//         不是文本替换——复合类型（T*/T&/const T）由 substituteType 递归处理，
+//         字段/方法/方法体同步重写（见文件头 ASCII 图）
 ClassDeclPtr TemplateInstantiator::instantiate(
     TemplateDeclPtr templateDecl,
     const std::vector<TypePtr>& typeArgs) {
@@ -162,6 +189,7 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     newClass->location = templateDecl->location;
 
     // 4. 克隆字段（替换类型中的模板参数）
+    //    demo: T* data → int* data（substituteType 递归处理复合类型）
     std::cout << "  ║ ── Field Substitution ──\n";
     for (auto& field : templateDecl->classTemplate->fields) {
         std::cout << std::format("  ║   field '{}' : {} → ",
@@ -172,6 +200,7 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     }
 
     // 5. 克隆方法（替换类型和函数体中的模板参数）
+    //    返回类型/形参/体内局部变量声明中的 T 全部替换，表达式经 cloneExpr 深拷贝
     std::cout << "  ║ ── Method Substitution ──\n";
     for (auto& method : templateDecl->classTemplate->methods) {
         std::cout << std::format("  ║   method '{}' : ", method->name);
@@ -202,6 +231,57 @@ ClassDeclPtr TemplateInstantiator::instantiate(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 函数模板实例化（S5）
+// ─────────────────────────────────────────────────────────────────────────────
+// 推导引擎（S2~S4）给出 typeArgs 后：
+//   1. 构建替换表 { T → int, ... }
+//   2. 复用方法克隆引擎深拷贝蓝图函数（返回类型/参数/函数体全部替换）
+//   3. 生成 mangled 符号（_Z5twiceIiE 风格）——与普通函数符号区分
+//   克隆出的函数交回语义分析器：注册 + 用具体类型分析函数体（两阶段查找的第二阶段）。
+// demo：twice(3) → 推导得 T := int → 本函数产出 twice<int>：
+//   void twice(T x){...} 中每个 T 换成 int，符号 _Z5twiceIiE，注册进 m_instantiatedFunctions
+// ─────────────────────────────────────────────────────────────────────────────
+FuncDeclPtr TemplateInstantiator::instantiateFunction(
+    TemplateDeclPtr templateDecl,
+    const std::vector<TypePtr>& typeArgs) {
+
+    TypeSubstitution subst;
+    for (size_t i = 0; i < templateDecl->typeParams.size()
+         && i < typeArgs.size(); i++) {
+        subst[templateDecl->typeParams[i]] = typeArgs[i];
+    }
+
+    auto& blueprint = templateDecl->funcTemplate;
+    std::string mangled =
+        NameMangler::mangleTemplateInstance(blueprint->name, typeArgs);
+
+    std::cout << std::format("\n  ╔══ Function Template Instantiation (S5) ═══════╗\n");
+    std::cout << std::format("  ║ Blueprint: {} <{}>\n",
+        blueprint->name,
+        [&]() { std::string s;
+            for (size_t i = 0; i < templateDecl->typeParams.size(); i++) {
+                if (i > 0) s += ", ";
+                s += templateDecl->typeParams[i];
+            }
+            return s.empty() ? "?" : s; }());
+    std::cout << "  ║ Substitution: { ";
+    for (auto& [p, t] : subst) {
+        std::cout << std::format("{} → {}, ", p, t->toString());
+    }
+    std::cout << "}\n";
+
+    // 复用方法克隆（ownerClassName = "" 表示自由函数）
+    FuncDeclPtr instance = cloneMethod(blueprint, subst, "");
+    instance->mangledName = mangled;
+
+    std::cout << std::format("  ║ Symbol: {} → {}\n", blueprint->name, mangled);
+    std::cout << std::format("  ╚═══════════════════════════════════════════════╝\n");
+
+    m_instantiatedFunctions.push_back(instance);
+    return instance;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 类型替换：将模板参数替换为实际类型
 // ─────────────────────────────────────────────────────────────────────────────
 // 这是模板实例化的核心操作：
@@ -228,12 +308,16 @@ ClassDeclPtr TemplateInstantiator::instantiate(
 //     foo(42);      → T = int,    T&& = int&&    (右值引用)
 //     foo(var);     → T = int&,   T&& = int& && → int&  (折叠为左值引用)
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】[temp.subst] 的类型替换：深度优先遍历类型树，
+//           模板参数叶节点按 subst 换为对应实参，复合节点递归重建；
+//           引用节点重建时执行引用折叠（[dcl.ref]，规则见上方注释块）
 TypePtr TemplateInstantiator::substituteType(
     TypePtr type, const TypeSubstitution& subst) {
 
     if (!type) return nullptr;
 
     // ── Case 1: 模板参数 → 直接替换 ──
+    // demo：substituteType(T, {T := int}) → int；不在表中则原样保留（如外层模板的参数）
     if (type->isTemplateParam()) {
         auto it = subst.find(type->templateParamName);
         if (it != subst.end()) {
@@ -247,6 +331,7 @@ TypePtr TemplateInstantiator::substituteType(
     }
 
     // ── Case 2: 指针类型 T* → 递归替换内部类型 ──
+    // demo：T* 配 {T := int} → int*；pointee 无变化则复用原节点（结构共享，省一次拷贝）
     if (type->isPointer() && type->pointeeType) {
         std::cout << std::format("    [subst] Pointer({}*) → recursing into pointee...\n",
             type->pointeeType->toString());
@@ -260,6 +345,7 @@ TypePtr TemplateInstantiator::substituteType(
     }
 
     // ── Case 3: 左值引用 T& → 递归替换 + 引用折叠 ──
+    // demo：T& 配 {T := int} → int&；配 {T := int&} → int& & 折叠为 int&
     if (type->isLValueReference() && type->referencedType) {
         std::cout << std::format("    [subst] LValueRef({}&) → recursing into referenced type...\n",
             type->referencedType->toString());
@@ -282,6 +368,7 @@ TypePtr TemplateInstantiator::substituteType(
     }
 
     // ── Case 4: 右值引用 T&& → 递归替换 + 引用折叠 ──
+    // demo：万能引用落地——T&& 配 {T := int&} → int& && 折叠为 int&（左值引用赢）
     // ★ 这是"万能引用"(Forwarding Reference)的关键路径 ★
     // 当 T 是模板参数时，T&& 是万能引用：
     //   T = int   → int&&   (右值引用)
@@ -316,6 +403,7 @@ TypePtr TemplateInstantiator::substituteType(
     }
 
     // ── Case 5: const T → 递归替换内部类型 ──
+    // demo：const T 配 {T := int} → const int
     if (type->isConst() && type->innerType) {
         std::cout << std::format("    [subst] Const(const {}) → recursing into inner type...\n",
             type->innerType->toString());
@@ -329,6 +417,7 @@ TypePtr TemplateInstantiator::substituteType(
     }
 
     // ── Case 6: 类类型中的模板参数名（简化处理）──
+    // demo：Class("T") 配 {T := int} → int（parseType 把裸 T 建成了 Class 节点的兜底路径）
     // 因为 Parser 在解析类型 T 时创建的是 Class("T") 而非 TemplateParam("T")
     // 所以这里也需要检查类名是否在替换表中
     if (type->isClass()) {
@@ -346,6 +435,8 @@ TypePtr TemplateInstantiator::substituteType(
 // ─────────────────────────────────────────────────────────────────────────────
 // 克隆字段
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】结构化替换落到字段层：类型过一遍 substituteType，其余元信息原样复制
+// 【demo】MyPtr<int> 的字段 "data : T*" → "data : int*"
 FieldInfo TemplateInstantiator::cloneField(
     const FieldInfo& field, const TypeSubstitution& subst) {
 
@@ -361,6 +452,10 @@ FieldInfo TemplateInstantiator::cloneField(
 // ─────────────────────────────────────────────────────────────────────────────
 // 克隆方法（深拷贝函数声明和函数体）
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】方法级结构化替换：返回类型、形参类型、函数体三处的 T 全部替换；
+//           ownerClassName 指向实例类名（自由函数传 ""，见 instantiateFunction）
+// 【理论】对应 clang TreeTransform 的声明重建；克隆不携带旧的语义分析结果，
+//           实例方法将交回语义分析器用具体类型重新检查（两阶段查找的第二阶段）
 FuncDeclPtr TemplateInstantiator::cloneMethod(
     FuncDeclPtr method, const TypeSubstitution& subst,
     const std::string& newClassName) {
@@ -405,6 +500,9 @@ FuncDeclPtr TemplateInstantiator::cloneMethod(
 // ─────────────────────────────────────────────────────────────────────────────
 // 克隆表达式（深拷贝并替换类型）
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】逐表达式节点深拷贝（对应 clang TreeTransform::TransformExpr）；
+//           本项目表达式节点不存类型注解，实例的类型在语义分析中重新推出，
+//           所以这里只需递归克隆结构（变量名恰与模板参数同名的边角情况留了钩子）
 ExprPtr TemplateInstantiator::cloneExpr(
     ExprPtr expr, const TypeSubstitution& subst) {
 
@@ -509,12 +607,16 @@ ExprPtr TemplateInstantiator::cloneExpr(
 // ─────────────────────────────────────────────────────────────────────────────
 // 克隆语句（深拷贝并替换类型）
 // ─────────────────────────────────────────────────────────────────────────────
+// 【做什么】逐语句节点深拷贝（对应 clang TreeTransform::TransformStmt）；
+//           直接碰类型的唯一位置是 VarDeclStmt 的声明类型（T x → int x），
+//           其余语句经 cloneExpr 间接完成替换
 StmtPtr TemplateInstantiator::cloneStmt(
     StmtPtr stmt, const TypeSubstitution& subst) {
 
     if (!stmt) return nullptr;
 
     // 变量声明
+    // demo：蓝图体中 "T item = x;" 配 {T := int} → "int item = x;"（声明类型过 substituteType）
     if (auto s = std::dynamic_pointer_cast<VarDeclStmt>(stmt)) {
         auto cloned = std::make_shared<VarDeclStmt>(
             s->name,

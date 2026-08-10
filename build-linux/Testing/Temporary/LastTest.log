@@ -1,0 +1,666 @@
+Start testing: Aug 05 09:42 CST
+----------------------------------------------------------
+1/19 Testing: ProcessText.LineSplicing
+1/19 Test: ProcessText.LineSplicing
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.LineSplicing" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.LineSplicing" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.LineSplicing
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.LineSplicing
+  [pp] <test>:1 #define N = 10
+  [pp] <test>:2 expand N → 10
+── 行拼接：跨行 #define
+   输入: [#define N \
+10
+int a = N;
+]
+   输出:
+
+int a = 10;
+[       OK ] ProcessText.LineSplicing (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.LineSplicing" end time: Aug 05 09:42 CST
+"ProcessText.LineSplicing" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/19 Testing: ProcessText.ChainedRescan
+2/19 Test: ProcessText.ChainedRescan
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.ChainedRescan" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.ChainedRescan" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.ChainedRescan
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.ChainedRescan
+  [pp] <test>:1 #define N = 10
+  [pp] <test>:2 #define SIZE = N*2
+  [pp] <test>:3 expand SIZE → N*2
+  [pp] <test>:3 expand N → 10
+── 链式重扫描 SIZE→N*2→10*2
+   输入: [#define N 10
+#define SIZE N*2
+int a = SIZE;
+]
+   输出:
+
+
+int a = 10*2;
+[       OK ] ProcessText.ChainedRescan (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.ChainedRescan" end time: Aug 05 09:42 CST
+"ProcessText.ChainedRescan" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/19 Testing: ProcessText.FunctionLikeMacro
+3/19 Test: ProcessText.FunctionLikeMacro
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.FunctionLikeMacro" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.FunctionLikeMacro" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.FunctionLikeMacro
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.FunctionLikeMacro
+  [pp] <test>:1 #define MAX(a, b) = ((a)>(b)?(a):(b))
+  [pp] <test>:2 expand MAX(x, y+1)
+── 函数宏 MAX(x, y+1)
+   输入: [#define MAX(a,b) ((a)>(b)?(a):(b))
+int m = MAX(x, y+1);
+]
+   输出:
+
+int m = ((x)>(y+1)?(x):(y+1));
+[       OK ] ProcessText.FunctionLikeMacro (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.FunctionLikeMacro" end time: Aug 05 09:42 CST
+"ProcessText.FunctionLikeMacro" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/19 Testing: ProcessText.SelfReferencePaintedBlue
+4/19 Test: ProcessText.SelfReferencePaintedBlue
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.SelfReferencePaintedBlue" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.SelfReferencePaintedBlue" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.SelfReferencePaintedBlue
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.SelfReferencePaintedBlue
+  [pp] <test>:1 #define A = A+1
+  [pp] <test>:2 expand A → A+1
+── 自引用涂蓝：A 展开一次即停
+   输入: [#define A A+1
+int a = A;
+]
+   输出:
+
+int a = A+1;
+[       OK ] ProcessText.SelfReferencePaintedBlue (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.SelfReferencePaintedBlue" end time: Aug 05 09:42 CST
+"ProcessText.SelfReferencePaintedBlue" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/19 Testing: ProcessText.ConditionalCompilation
+5/19 Test: ProcessText.ConditionalCompilation
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.ConditionalCompilation" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.ConditionalCompilation" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.ConditionalCompilation
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.ConditionalCompilation
+  [pp] <test>:1 #define DEBUG = 1
+  [pp] <test>:2 #if defined(DEBUG) → branch taken
+  [pp] <test>:5 #ifdef NOPE → branch skipped
+  [pp] <test>:10 #ifndef NOPE → branch taken
+── 条件编译三分支
+   输入:
+#define DEBUG 1
+#if defined(DEBUG)
+int a = 1;
+#endif
+#ifdef NOPE
+int b = 1;
+#else
+int b = 0;
+#endif
+#ifndef NOPE
+int c = 1;
+#endif
+
+   输出:
+
+
+int a = 1;
+
+
+
+
+int b = 0;
+
+
+int c = 1;
+
+[       OK ] ProcessText.ConditionalCompilation (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.ConditionalCompilation" end time: Aug 05 09:42 CST
+"ProcessText.ConditionalCompilation" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/19 Testing: ProcessText.UndefStopsExpansion
+6/19 Test: ProcessText.UndefStopsExpansion
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.UndefStopsExpansion" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.UndefStopsExpansion" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.UndefStopsExpansion
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.UndefStopsExpansion
+  [pp] <test>:1 #define N = 10
+  [pp] line 2 #undef N
+── #undef 后 N 原样保留
+   输入: [#define N 10
+#undef N
+int a = N;
+]
+   输出:
+
+
+int a = N;
+[       OK ] ProcessText.UndefStopsExpansion (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.UndefStopsExpansion" end time: Aug 05 09:42 CST
+"ProcessText.UndefStopsExpansion" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/19 Testing: ProcessText.NoExpansionInsideStringLiteral
+7/19 Test: ProcessText.NoExpansionInsideStringLiteral
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.NoExpansionInsideStringLiteral" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.NoExpansionInsideStringLiteral" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.NoExpansionInsideStringLiteral
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.NoExpansionInsideStringLiteral
+  [pp] <test>:1 #define N = 10
+── 串内 N 不展开
+   输入: [#define N 10
+put("N and N");
+]
+   输出:
+
+put("N and N");
+[       OK ] ProcessText.NoExpansionInsideStringLiteral (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.NoExpansionInsideStringLiteral" end time: Aug 05 09:42 CST
+"ProcessText.NoExpansionInsideStringLiteral" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/19 Testing: ProcessText.BuiltinLineAndFile
+8/19 Test: ProcessText.BuiltinLineAndFile
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=ProcessText.BuiltinLineAndFile" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"ProcessText.BuiltinLineAndFile" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = ProcessText.BuiltinLineAndFile
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from ProcessText
+[ RUN      ] ProcessText.BuiltinLineAndFile
+── 内建宏 __LINE__/__FILE__
+   输入:
+int a = __LINE__;
+int b = __LINE__;
+const char* f = __FILE__;
+
+   输出:
+int a = 1;
+int b = 2;
+const char* f = "<test>";
+[       OK ] ProcessText.BuiltinLineAndFile (0 ms)
+[----------] 1 test from ProcessText (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"ProcessText.BuiltinLineAndFile" end time: Aug 05 09:42 CST
+"ProcessText.BuiltinLineAndFile" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/19 Testing: Expand.ObjectMacro
+9/19 Test: Expand.ObjectMacro
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=Expand.ObjectMacro" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"Expand.ObjectMacro" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Expand.ObjectMacro
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Expand
+[ RUN      ] Expand.ObjectMacro
+  [pp] <test>:1 #define N = 10
+  [pp] <test>:1 expand N → 10
+── expand 单级：对象宏
+   输入: [arr[N]]
+   展开: [arr[10]]
+[       OK ] Expand.ObjectMacro (0 ms)
+[----------] 1 test from Expand (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"Expand.ObjectMacro" end time: Aug 05 09:42 CST
+"Expand.ObjectMacro" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/19 Testing: Expand.HideSetBlocksExpansion
+10/19 Test: Expand.HideSetBlocksExpansion
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=Expand.HideSetBlocksExpansion" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"Expand.HideSetBlocksExpansion" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Expand.HideSetBlocksExpansion
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Expand
+[ RUN      ] Expand.HideSetBlocksExpansion
+  [pp] <test>:1 #define N = 10
+  [pp] <test>:1 expand N → 10
+── expand：hide 为空
+   输入: [N]
+   展开: [10]
+── expand：hide={N} 涂蓝
+   输入: [N]
+   展开: [N]
+[       OK ] Expand.HideSetBlocksExpansion (0 ms)
+[----------] 1 test from Expand (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"Expand.HideSetBlocksExpansion" end time: Aug 05 09:42 CST
+"Expand.HideSetBlocksExpansion" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/19 Testing: SubstituteParams.WordBoundary
+11/19 Test: SubstituteParams.WordBoundary
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=SubstituteParams.WordBoundary" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"SubstituteParams.WordBoundary" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = SubstituteParams.WordBoundary
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from SubstituteParams
+[ RUN      ] SubstituteParams.WordBoundary
+── 词边界替换 a→x
+   输入: [body=[ab abc ab], args=[x]]
+   展开: [x abc x]
+[       OK ] SubstituteParams.WordBoundary (0 ms)
+[----------] 1 test from SubstituteParams (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"SubstituteParams.WordBoundary" end time: Aug 05 09:42 CST
+"SubstituteParams.WordBoundary" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/19 Testing: SubstituteParams.SkipInsideStringLiteral
+12/19 Test: SubstituteParams.SkipInsideStringLiteral
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=SubstituteParams.SkipInsideStringLiteral" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"SubstituteParams.SkipInsideStringLiteral" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = SubstituteParams.SkipInsideStringLiteral
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from SubstituteParams
+[ RUN      ] SubstituteParams.SkipInsideStringLiteral
+── 串内参数名保留
+   输入: [body=["ab" ab], args=[x]]
+   展开: ["ab" x]
+[       OK ] SubstituteParams.SkipInsideStringLiteral (0 ms)
+[----------] 1 test from SubstituteParams (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"SubstituteParams.SkipInsideStringLiteral" end time: Aug 05 09:42 CST
+"SubstituteParams.SkipInsideStringLiteral" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/19 Testing: EvalConstantExpr.LogicAndCompare
+13/19 Test: EvalConstantExpr.LogicAndCompare
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=EvalConstantExpr.LogicAndCompare" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"EvalConstantExpr.LogicAndCompare" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = EvalConstantExpr.LogicAndCompare
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from EvalConstantExpr
+[ RUN      ] EvalConstantExpr.LogicAndCompare
+── #if 求值
+   输入: [1 && 2 > 1]
+   结果: 1
+[       OK ] EvalConstantExpr.LogicAndCompare (0 ms)
+[----------] 1 test from EvalConstantExpr (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"EvalConstantExpr.LogicAndCompare" end time: Aug 05 09:42 CST
+"EvalConstantExpr.LogicAndCompare" time elapsed: 00:00:00
+----------------------------------------------------------
+
+14/19 Testing: EvalConstantExpr.ArithmeticPrecedence
+14/19 Test: EvalConstantExpr.ArithmeticPrecedence
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=EvalConstantExpr.ArithmeticPrecedence" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"EvalConstantExpr.ArithmeticPrecedence" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = EvalConstantExpr.ArithmeticPrecedence
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from EvalConstantExpr
+[ RUN      ] EvalConstantExpr.ArithmeticPrecedence
+── #if 求值
+   输入: [2*3+4]
+   结果: 10
+[       OK ] EvalConstantExpr.ArithmeticPrecedence (0 ms)
+[----------] 1 test from EvalConstantExpr (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"EvalConstantExpr.ArithmeticPrecedence" end time: Aug 05 09:42 CST
+"EvalConstantExpr.ArithmeticPrecedence" time elapsed: 00:00:00
+----------------------------------------------------------
+
+15/19 Testing: EvalConstantExpr.LogicalNot
+15/19 Test: EvalConstantExpr.LogicalNot
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=EvalConstantExpr.LogicalNot" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"EvalConstantExpr.LogicalNot" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = EvalConstantExpr.LogicalNot
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from EvalConstantExpr
+[ RUN      ] EvalConstantExpr.LogicalNot
+── #if 求值
+   输入: [!0]
+   结果: 1
+[       OK ] EvalConstantExpr.LogicalNot (0 ms)
+[----------] 1 test from EvalConstantExpr (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"EvalConstantExpr.LogicalNot" end time: Aug 05 09:42 CST
+"EvalConstantExpr.LogicalNot" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/19 Testing: EvalConstantExpr.DefinedOperator
+16/19 Test: EvalConstantExpr.DefinedOperator
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=EvalConstantExpr.DefinedOperator" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"EvalConstantExpr.DefinedOperator" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = EvalConstantExpr.DefinedOperator
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from EvalConstantExpr
+[ RUN      ] EvalConstantExpr.DefinedOperator
+── #if 求值
+   输入: [defined(NOSUCH)]
+   结果: 0
+  [pp] <test>:1 #define YES = 1
+   输入: [defined(YES)]（已 #define YES）
+   结果: 1
+[       OK ] EvalConstantExpr.DefinedOperator (0 ms)
+[----------] 1 test from EvalConstantExpr (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"EvalConstantExpr.DefinedOperator" end time: Aug 05 09:42 CST
+"EvalConstantExpr.DefinedOperator" time elapsed: 00:00:00
+----------------------------------------------------------
+
+17/19 Testing: LexUtils.ReadWord
+17/19 Test: LexUtils.ReadWord
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=LexUtils.ReadWord" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"LexUtils.ReadWord" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = LexUtils.ReadWord
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from LexUtils
+[ RUN      ] LexUtils.ReadWord
+── readWord("MAX(a,b)", 0)
+   读出: [MAX]  停在: 3
+[       OK ] LexUtils.ReadWord (0 ms)
+[----------] 1 test from LexUtils (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"LexUtils.ReadWord" end time: Aug 05 09:42 CST
+"LexUtils.ReadWord" time elapsed: 00:00:00
+----------------------------------------------------------
+
+18/19 Testing: LexUtils.StripComment
+18/19 Test: LexUtils.StripComment
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=LexUtils.StripComment" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"LexUtils.StripComment" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = LexUtils.StripComment
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from LexUtils
+[ RUN      ] LexUtils.StripComment
+── 行注释
+   输入: [int a; // 行注释]
+   展开: [int a; ]
+── 块注释→空格
+   输入: [/* 块 */ int b;]
+   展开: [  int b;]
+── 串内 // 保留
+   输入: [x = "// in str"; // 真注释]
+   展开: [x = "// in str"; ]
+[       OK ] LexUtils.StripComment (0 ms)
+[----------] 1 test from LexUtils (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"LexUtils.StripComment" end time: Aug 05 09:42 CST
+"LexUtils.StripComment" time elapsed: 00:00:00
+----------------------------------------------------------
+
+19/19 Testing: LexUtils.Trim
+19/19 Test: LexUtils.Trim
+Command: "/home/magene/runtime/cppproject/mycompiler/build-linux/unit_tests" "--gtest_filter=LexUtils.Trim" "--gtest_also_run_disabled_tests"
+Directory: /home/magene/runtime/cppproject/mycompiler/build-linux
+"LexUtils.Trim" start time: Aug 05 09:42 CST
+Output:
+----------------------------------------------------------
+Running main() from /home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = LexUtils.Trim
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from LexUtils
+[ RUN      ] LexUtils.Trim
+── trim
+   输入: [  x  ]
+   展开: [x]
+[       OK ] LexUtils.Trim (0 ms)
+[----------] 1 test from LexUtils (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"LexUtils.Trim" end time: Aug 05 09:42 CST
+"LexUtils.Trim" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Aug 05 09:42 CST

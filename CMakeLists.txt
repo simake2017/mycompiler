@@ -24,13 +24,21 @@ if(APPLE)
 
 endif()
 
+# Linux + Clang: 系统 libstdc++ (GCC 10) 无 <format>，改用 libc++
+if(UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_compile_options(-stdlib=libc++)
+    add_link_options(-stdlib=libc++)
+endif()
+
 # ─── 源文件 ────────────────────────────────────────────
 set(SOURCES
+    src/preprocessor.cpp
     src/lexer.cpp
     src/parser.cpp
     src/type.cpp
     src/semantic_analyzer.cpp
     src/template_instantiation.cpp
+    src/template_deduction.cpp
     src/codegen.cpp
     src/main.cpp
 )
@@ -40,4 +48,26 @@ target_include_directories(minicc PRIVATE include) ## 添加include文件件
 
 # 编译选项
 target_compile_options(minicc PRIVATE -Wall -Wextra -pedantic)
+
+# ─── 单元测试（GoogleTest，CLion gutter 可点击单测）─────────────────────
+# CLion 用法：Reload CMake 后 tests/unit/*.cpp 里每个 TEST() 左侧出现绿色三角，
+# 点击即单跑该用例；底部 Test 面板树状查看全部结果。
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+add_executable(unit_tests
+    tests/unit/test_preprocessor.cpp
+    src/preprocessor.cpp
+)
+target_include_directories(unit_tests PRIVATE include)
+target_compile_options(unit_tests PRIVATE -Wall -Wextra)
+target_link_libraries(unit_tests GTest::gtest GTest::gtest_main)
+
+include(GoogleTest)
+gtest_discover_tests(unit_tests)
 
