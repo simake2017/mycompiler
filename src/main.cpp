@@ -15,10 +15,57 @@
 // 用法：
 //   ./minicc <source.cpp> [-o output.s] [--dump-tokens] [--dump-ast]
 // =============================================================================
+//
+// ─── 命令行参数详解（本文件 main() 解析）─────────────────────────────────
+//   minicc <source.cpp> [-o output.s] [-I dir] [-E] [--dump-tokens] [--dump-ast]
+//
+//   <source.cpp>    输入源文件（必填）
+//   -o output.s     输出路径：正常模式写汇编；-E 模式写预处理文本。
+//                   缺省时正常模式取 <source>.s，-E 模式直接打印到 stdout。
+//   -I dir          头文件搜索目录，可重复（-I include -I third_party），
+//                   出现顺序即搜索优先级，原样传给预处理器。
+//   -E              只执行阶段 0（预处理）并输出结果，等价 gcc -E，
+//                   用于调试宏/include/条件编译问题。
+//   --dump-tokens   阶段 1 后打印完整 Token 流（调试）
+//   --dump-ast      阶段 2 后打印 AST 顶层声明（调试）
+//
+// 示例：
+//   ./minicc tests/test_tmpl_01.cpp                 # 全管线 → test_tmpl_01.s
+//   ./minicc tests/pp/main.cpp -I tests/pp -E       # 只看预处理结果
+//
+// ─── 编译驱动全景图（阶段 ↔ 实现文件 ↔ 本文件调用点）────────────────────
+//
+//   source.cpp
+//     │ 阶段0 预处理     preprocessor.cpp            processFile()
+//     │        行拼接→include并合→条件编译→宏展开     [cpp]/[lex.phases]1~4
+//     ▼
+//   展开后纯文本（宏已替换、头文件已并合、条件分支已裁决）
+//     │ 阶段1 词法分析   lexer.cpp                   tokenizeAll()
+//     ▼
+//   Token 流
+//     │ 阶段2 语法分析   parser.cpp                  parseTranslationUnit()
+//     ▼
+//   AST（抽象语法树，TranslationUnit）
+//     │ 阶段3 语义分析   semantic_analyzer.cpp       analyze()
+//     │        类型检查 / auto 推导 / 内存布局 / vtable
+//     ▼
+//   带类型信息的 AST + 类布局表
+//     │ 阶段4 模板实例化 template_instantiation.cpp  instantiate()
+//     │        类模板=结构化替换；函数模板=调用点推导驱动
+//     ▼
+//   展开后的实例
+//     │ 阶段5 代码生成   codegen.cpp                 generate()
+//     ▼
+//   output.s（x86-64 AT&T 汇编）
+//     │ 阶段6 链接（简化）：交给系统工具链
+//     ▼
+//   gcc -o output output.s -lstdc++
+// ─────────────────────────────────────────────────────────────────────────
 
 #include "lexer.h"
 #include "parser.h"
 #include "semantic_analyzer.h"
+#include "preprocessor.h"
 #include "template_instantiation.h"
 #include "codegen.h"
 
@@ -27,6 +74,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+
 #include <format>
 
 using namespace minicc;
@@ -36,6 +84,8 @@ using namespace minicc;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // 读取整个文件到字符串
+// （通用辅助；注意当前驱动实际未使用——阶段 0 的 Preprocessor 自带
+// readFileContents，由它负责读入源码）
 std::string readFile(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -56,6 +106,8 @@ void writeFile(const std::string& path, const std::string& content) {
 }
 
 // 打印分隔线
+// 全阶段中文日志的一部分：每个阶段开始前先打一条醒目横幅，
+// 方便在滚动日志里快速定位"现在跑到哪一步了"。
 void printPhase(const std::string& phase) {
     std::cout << "\n";
     std::cout << "════════════════════════════════════════════════════════════\n";
@@ -64,6 +116,9 @@ void printPhase(const std::string& phase) {
 }
 
 // 打印 Token 流（调试用）
+// 由 --dump-tokens 触发。格式：行:列 类型 文本。demo：
+//      1:1   INT             'int'
+//      1:5   IDENTIFIER      'main'
 void dumpTokens(const std::vector<Token>& tokens) {
     for (auto& tok : tokens) {
         std::cout << std::format("  {:4}:{:<3} {:<15} '{}'\n",
@@ -73,6 +128,8 @@ void dumpTokens(const std::vector<Token>& tokens) {
 }
 
 // 打印 AST（简化版）
+// 由 --dump-ast 触发：只展开顶层声明——类（含基类/字段/方法）、
+// 函数、模板（类模板递归打印其蓝图体，函数模板打印参数个数与返回类型）。
 void dumpAST(const TranslationUnit& unit, int indent = 0) {
     auto printIndent = [&](int level) {
         for (int i = 0; i < level; i++) std::cout << "  ";
@@ -107,7 +164,8 @@ void dumpAST(const TranslationUnit& unit, int indent = 0) {
         }
         else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
             printIndent(indent);
-            std::cout << std::format("TemplateDecl: <");
+            std::cout << std::format("TemplateDecl({}): <",
+                tmpl->isClassTemplate() ? "class" : "function");
             for (size_t i = 0; i < tmpl->typeParams.size(); i++) {
                 if (i > 0) std::cout << ", ";
                 std::cout << tmpl->typeParams[i];
@@ -116,6 +174,14 @@ void dumpAST(const TranslationUnit& unit, int indent = 0) {
             if (tmpl->classTemplate) {
                 dumpAST({{tmpl->classTemplate}}, indent + 1);
             }
+            if (tmpl->funcTemplate) {
+                printIndent(indent + 1);
+                std::cout << std::format("FunctionTemplate: {}({} params) → {}\n",
+                    tmpl->funcTemplate->name,
+                    tmpl->funcTemplate->parameters.size(),
+                    tmpl->funcTemplate->returnType ?
+                        tmpl->funcTemplate->returnType->toString() : "void");
+            }
         }
     }
 }
@@ -123,9 +189,12 @@ void dumpAST(const TranslationUnit& unit, int indent = 0) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 主函数：编译器驱动
 // ─────────────────────────────────────────────────────────────────────────────
+// 编译器驱动：解析命令行 → 依次跑阶段 0~6 → 写出汇编。
+// 用法：minicc <src.cpp> [-o out.s] [-I dir] [-E] [--dump-tokens] [--dump-ast]
 int main(int argc, char* argv[]) {
+    // 缺少输入文件 → 打印用法并以非零码退出
     if (argc < 2) {
-        std::cerr << "Usage: minicc <source.cpp> [-o output.s] "
+        std::cerr << "Usage: minicc <source.cpp> [-o output.s] [-I dir] [-E] "
                      "[--dump-tokens] [--dump-ast]\n";
         return 1;
     }
@@ -134,12 +203,20 @@ int main(int argc, char* argv[]) {
     std::string outputFile;
     bool dumpTokensFlag = false;
     bool dumpAstFlag = false;
+    bool emitPreprocessed = false;          // -E：只输出预处理结果（同 gcc -E）
+    std::vector<std::string> includeDirs;   // -I 搜索目录（可多次）
 
     // 解析命令行参数
+    // 单破折号短选项；-o/-I 吃掉紧随其后的值；-I 可多次出现，
+    // 顺序即搜索优先级；-E 让驱动在阶段 0 结束后立即返回。
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) {
             outputFile = argv[++i];
+        } else if (arg == "-I" && i + 1 < argc) {
+            includeDirs.push_back(argv[++i]);
+        } else if (arg == "-E") {
+            emitPreprocessed = true;
         } else if (arg == "--dump-tokens") {
             dumpTokensFlag = true;
         } else if (arg == "--dump-ast") {
@@ -147,19 +224,51 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 默认输出文件名
-    if (outputFile.empty()) {
+    // 默认输出文件名（-E 模式不需要）
+    if (outputFile.empty() && !emitPreprocessed) {
         outputFile = std::filesystem::path(inputFile)
             .replace_extension(".s").string();
     }
 
+    // 六个阶段串联执行；任何阶段抛出的异常（预处理错/语法错/类型错...）
+    // 都由函数末尾的 catch 统一打印 [ERROR] 并以非零码退出。
     try {
         // ═══════════════════════════════════════════════════════════════
         // 阶段 1：词法分析 (Lexical Analysis)
         // ═══════════════════════════════════════════════════════════════
+        // ── 阶段 0：预处理（[cpp.phase] 翻译阶段 2~4）──
+        // 行拼接 → #include 并合 → 条件编译 → 宏展开，
+        // 之后词法分析工作在"展开后的纯文本"上（与 clang 的 token 级
+        // 预处理不同，教学版是文本级，见 docs/learn/07）。
+        printPhase("Phase 0: Preprocessing (预处理)");
+
+        // 把命令行的 -I 目录交给预处理器（搜索顺序 = 出现顺序）
+        PreprocessorOptions ppOpts;
+        ppOpts.includePaths = includeDirs;
+        Preprocessor preprocessor(ppOpts); // 预处理器
+        // 一次调用完成全部阶段 0 工作：行拼接 → #include 并合 → 条件编译 → 宏展开
+        std::string preprocessed = preprocessor.processFile(inputFile);
+
+        std::cout << std::format("  {} file(s) included, {} macro(s) defined\n",
+            preprocessor.includeCount(), preprocessor.macros().size());
+
+        // -E 模式到此为止：预处理文本写到 -o 指定的文件；
+        // 未指定 -o 时直接打印到 stdout（同 gcc -E 的行为）。
+        if (emitPreprocessed) {
+            if (outputFile.empty()) {
+                std::cout << preprocessed;
+            } else {
+                writeFile(outputFile, preprocessed);
+                std::cout << std::format("  Preprocessed output written to: {}\n", outputFile);
+            }
+            return 0;
+        }
+
         printPhase("Phase 1: Lexical Analysis (词法分析)");
 
-        std::string source = readFile(inputFile);
+        // Lexer 的输入是预处理后的文本而非原始文件：此时已没有任何 '#' 指令，
+        // 宏已就地替换、头文件已并合（[lex.phases]：分词属于阶段 5，在预处理之后）。
+        std::string source = preprocessed;   // 词法分析作用于预处理后的文本
         Lexer lexer(source);
         std::vector<Token> tokens = lexer.tokenizeAll();
 
@@ -175,6 +284,8 @@ int main(int argc, char* argv[]) {
         // ═══════════════════════════════════════════════════════════════
         printPhase("Phase 2: Syntax Analysis (语法分析)");
 
+        // 递归下降解析（对照标准 [gram] 文法的子集），
+        // 产出 TranslationUnit = 顶层声明列表（函数/类/模板）。
         Parser parser(tokens);
         TranslationUnit unit = parser.parseTranslationUnit();
 
@@ -192,6 +303,8 @@ int main(int argc, char* argv[]) {
         printPhase("Phase 3: Semantic Analysis (语义分析)");
         std::cout << "  Type checking & auto deduction...\n";
 
+        // 类型检查 + auto 推导 + 类内存布局（字段偏移/对齐、vtable、RTTI）。
+        // 布局结果供两处消费：下方打印（可观测性）与阶段 5 CodeGen（访存偏移）。
         SemanticAnalyzer semaAnalyzer;
         semaAnalyzer.analyze(unit);
 
@@ -229,6 +342,9 @@ int main(int argc, char* argv[]) {
         // ═══════════════════════════════════════════════════════════════
         printPhase("Phase 4: Template Instantiation (模板实例化)");
 
+        // 模板实例化 = 结构化替换（[temp.inst]）：用具体类型实参替换模板参数。
+        // 类模板：此处用 int/double/int*/int&/int&&/const int& 六种实参演示；
+        // 函数模板：蓝图只存储，实例化由调用点实参推导驱动（[temp.deduct]，S2+）。
         TemplateInstantiator instantiator;
         auto& templates = semaAnalyzer.getTemplates();
 
@@ -237,14 +353,23 @@ int main(int argc, char* argv[]) {
 
             for (auto& tmpl : templates) {
                 std::cout << std::format("  Template blueprint: {} <",
-                    tmpl->classTemplate->name);
+                    tmpl->templateName());
                 for (size_t i = 0; i < tmpl->typeParams.size(); i++) {
                     if (i > 0) std::cout << ", ";
                     std::cout << tmpl->typeParams[i];
                 }
                 std::cout << ">\n";
 
-                // ★ 多种实例化演示 ★
+                // 函数模板（S1）：蓝图存储即可，实例化由调用点实参推导驱动（S2+）
+                if (tmpl->isFunctionTemplate()) {
+                    std::cout << std::format(
+                        "  (function template '{}': blueprint stored; instantiation is "
+                        "call-site driven — see S2 deduction / S5 instantiation)\n",
+                        tmpl->templateName());
+                    continue;
+                }
+
+                // ★ 多种实例化演示（仅类模板）★
                 if (tmpl->typeParams.size() == 1) {
                     // 实例化 1: T = int
                     std::cout << std::format("\n  ─── Instantiation 1: {}<int> ───\n",
@@ -315,6 +440,8 @@ int main(int argc, char* argv[]) {
         printPhase("Phase 5: Code Generation (代码生成)");
         std::cout << "  Generating x86-64 assembly...\n";
 
+        // 遍历带类型信息的 AST，生成 x86-64 AT&T 语法汇编
+        // （含 vtable/RTTI 数据段、GCC 风格 mangling 的符号名）。
         CodeGen codegen;
         std::string assembly = codegen.generate(unit, classTypes, functions);
 
@@ -325,6 +452,7 @@ int main(int argc, char* argv[]) {
         // ═══════════════════════════════════════════════════════════════
         // 阶段 6：链接（简化：输出提示信息）
         // ═══════════════════════════════════════════════════════════════
+        // 教学版到此为止：汇编落盘后把链接委托给系统工具链（后续计划：自动链接）
         printPhase("Phase 6: Linking (链接)");
         std::cout << "  Assembly file ready for system assembler/linker.\n";
         std::cout << std::format("  To assemble and link:\n");
@@ -337,6 +465,7 @@ int main(int argc, char* argv[]) {
         return 0;
 
     } catch (const std::exception& e) {
+        // 统一错误出口：各阶段（含预处理器的 ppError）抛出的异常都在这里收口
         std::cerr << std::format("\n[ERROR] {}\n", e.what());
         return 1;
     }

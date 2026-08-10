@@ -10,3 +10,5 @@ cmake-build-debug/
 .idea/
 .cache/
 .vscode/
+
+compile_commands.json

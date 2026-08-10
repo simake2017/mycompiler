@@ -589,6 +589,14 @@ MyClass::foo(int)   → _ZN7MyClass3fooEi (类方法)
 - [x] 算术/逻辑/比较运算符
 - [x] 成员访问（. 和 ->）
 - [x] Name Mangling（GCC ABI 风格）
+- [x] 函数模板声明解析：`template<typename T> T f(T x)`（S1：解析 + 蓝图注册 + 候选集，文档 docs/learn/01）
+- [x] 函数模板实参推导：逐对 P/A 合一，T / T& / T&&（万能引用折叠）/ const T& / T* 形态，多次绑定一致性检查（S2，文档 docs/learn/02）
+- [x] 显式模板实参：`mix<int>(1, 2)` 前缀规则 + template-id 歧义消解（S3，文档 docs/learn/03）
+- [x] 不可推导上下文诊断：T 只在返回类型等位置时报错并建议显式指定（S4，文档 docs/learn/04）
+- [x] 函数模板隐式实例化：调用点驱动、mangled 符号（_Z5twiceIiE）、实例缓存、实例体二次语义分析（S5，文档 docs/learn/05）
+- [x] 重载决议：非模板优先 + deduction-based 偏序选最特化（S6，文档 docs/learn/06）
+- [x] 隐式转换：左值到右值（引用剥除，[conv.lval]）、int→double 提升（[conv.promo]）
+- [x] 预处理器：`#include "..."`/`<...>` 搜索路径、`#define` 对象宏/函数宏（递归展开+涂蓝）、`#ifdef/#if/#elif/#else/#endif`、`#pragma once`、`__LINE__/__FILE__`、`-E` 选项（P0，文档 docs/learn/07）
 
 ---
 
