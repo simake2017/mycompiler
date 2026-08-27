@@ -223,6 +223,11 @@ public:
         return m_functions;
     }
 
+    // 获取所有全局变量（供代码生成阶段使用）
+    const std::vector<GlobalVarDeclPtr>& getGlobalVars() const {
+        return m_globalVars;
+    }
+
     // 获取模板声明（供模板实例化阶段使用）
     const std::vector<TemplateDeclPtr>& getTemplates() const {
         return m_templates;
@@ -268,6 +273,8 @@ private:
     // S6 偏序：a 是否至少与 b 同样特化（deduction-based，[temp.func.order] 简化）
     bool isAtLeastAsSpecialized(TemplateDeclPtr a, TemplateDeclPtr b);
     std::unordered_map<std::string, ClassDeclPtr>  m_classDecls;    // 类名 → 声明
+    std::unordered_map<std::string, EnumDeclPtr>   m_enumDecls;     // 枚举名 → 声明
+    std::vector<GlobalVarDeclPtr>                  m_globalVars;    // 全局变量声明列表
 
     // ── 栈帧管理 ──
     int m_stackOffset = 0;  // 当前栈帧偏移量
@@ -279,8 +286,15 @@ private:
     // 顶层声明分发（按 Decl 动态类型派发到下面的具体处理器）
     void processDecl(DeclPtr decl);
     // 类注册：合并继承字段/vtable → 收集成员 → 布局 → 入符号表
-    //（demo：Dog:Animal 继承时 vtable 槽位复用，见 cpp 实现处）
     void processClassDecl(ClassDeclPtr decl);
+    // 全局变量声明处理
+    void processGlobalVarDecl(GlobalVarDeclPtr decl);
+    // 枚举声明处理
+    void processEnumDecl(EnumDeclPtr decl);
+    // 命名空间声明处理
+    void processNamespaceDecl(NamespaceDeclPtr decl);
+    // 类型别名声明处理
+    void processTypeAliasDecl(TypeAliasDeclPtr decl);
     // Pass 2：函数名 → 符号表 + mangled 名（先注册以支持递归/前向引用）
     void registerFunction(FuncDeclPtr decl);
     // Pass 3：进入函数作用域，注册参数/this，逐语句分析函数体
@@ -293,6 +307,8 @@ private:
     void processStmt(StmtPtr stmt);
     // { } 块 → 新建块作用域 [basic.scope.block]
     void processBlockStmt(std::shared_ptr<BlockStmt> block);
+    // delete 语句处理
+    void processDeleteStmt(std::shared_ptr<DeleteStmt> stmt);
     // 变量声明：auto 推导/类型检查/分配栈槽/入符号表
     void processVarDecl(std::shared_ptr<VarDeclStmt> decl);
     // if：条件须 bool|int（语境转换简化），分支各建作用域
@@ -305,6 +321,9 @@ private:
     void processAssignStmt(std::shared_ptr<AssignStmt> stmt);
     // 表达式语句：推导类型、丢弃值（副作用语句，如函数调用）
     void processExprStmt(std::shared_ptr<ExprStmt> stmt);
+
+    // ── 类型与别名解析 ──
+    TypePtr resolveType(TypePtr type);
 
     // ── 表达式类型推导 ──
     // 总入口：按节点动态类型分派到 inferXxx，结果写回 expr->resolvedType

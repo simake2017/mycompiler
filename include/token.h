@@ -64,22 +64,29 @@ enum class TokenType : uint8_t {
     KwBool,           // bool
     KwClass,          // class
     KwConst,          // const
+    KwDelete,         // delete
     KwDouble,         // double
     KwElse,           // else
+    KwEnum,           // enum
     KwFalse,          // false
     KwFor,            // for
     KwIf,             // if
     KwInt,            // int
+    KwNamespace,      // namespace
+    KwNew,            // new
     KwNullptr,        // nullptr
     KwOverride,       // override
     KwPublic,         // public
     KwPrivate,        // private
     KwProtected,      // protected
     KwReturn,         // return
+    KwStruct,         // struct
     KwTemplate,       // template
     KwThis,           // this
     KwTrue,           // true
+    KwTypedef,        // typedef
     KwTypename,       // typename
+    KwUsing,          // using
     KwVirtual,        // virtual
     KwVoid,           // void
     KwWhile,          // while
@@ -139,22 +146,29 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"bool",      TokenType::KwBool},
     {"class",     TokenType::KwClass},
     {"const",     TokenType::KwConst},
+    {"delete",    TokenType::KwDelete},
     {"double",    TokenType::KwDouble},
     {"else",      TokenType::KwElse},
+    {"enum",      TokenType::KwEnum},
     {"false",     TokenType::KwFalse},
     {"for",       TokenType::KwFor},
     {"if",        TokenType::KwIf},
     {"int",       TokenType::KwInt},
+    {"namespace", TokenType::KwNamespace},
+    {"new",       TokenType::KwNew},
     {"nullptr",   TokenType::KwNullptr},
     {"override",  TokenType::KwOverride},
     {"public",    TokenType::KwPublic},
     {"private",   TokenType::KwPrivate},
     {"protected", TokenType::KwProtected},
     {"return",    TokenType::KwReturn},
+    {"struct",    TokenType::KwStruct},
     {"template",  TokenType::KwTemplate},
     {"this",      TokenType::KwThis},
     {"true",      TokenType::KwTrue},
+    {"typedef",   TokenType::KwTypedef},
     {"typename",  TokenType::KwTypename},
+    {"using",     TokenType::KwUsing},
     {"virtual",   TokenType::KwVirtual},
     {"void",      TokenType::KwVoid},
     {"while",     TokenType::KwWhile},

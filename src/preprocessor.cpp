@@ -141,10 +141,11 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
     spliced.reserve(src.size());
     for (size_t i = 0; i < src.size(); i++) {
         // wangyang 这里 \ 后面必须立刻就是换行，不能有空格
-        if (src[i] == '\\' && i + 1 < src.size() && src[i + 1] == '\n') { i++; continue; }
+        if (src[i] == '\\' && i + 1 < src.size() && src[i + 1] == '\n') { i++; continue; } // 这里i++,上面又i++,相当于i+2
         spliced += src[i];
     }
 
+    // std::cout << "test====>" << spliced << std::endl;
 
     // 条件编译栈（[cpp.cond]）——每进入一层 #if/#ifdef/#ifndef 压入一个 Cond。
     // 状态机语义：
@@ -179,6 +180,12 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
         if (!line.empty() && line.back() == '\r') line.pop_back();
         std::string clean = stripComment(line);
         std::string t = trim(clean);
+
+        // wangyang 调试：每行源文本单独打一个 [src-line] 块标记，
+        // 让测试里的 dumpWithExplanation 把它当作"分块锚点"插 === 分隔。
+        // 用特殊分隔符 <SRC>...</SRC> 包裹原文，避免原文中的方括号干扰切串。
+        std::cout << std::format("  [pp] {}:{} [src-line] <SRC>{}</SRC>\n",
+            fileName, lineNo, line);
 
         // ── 指令行 ──
         // 翻译阶段 3（[lex.phases]）：trim 后以 '#' 开头即预处理指令。
@@ -474,6 +481,15 @@ void Preprocessor::handlePragma(const std::string& rest, const std::string& file
 std::string Preprocessor::expand(const std::string& text,
                                  const std::unordered_set<std::string>& hide,
                                  const std::string& fileName, int line) {
+    // wangyang 调试：递归深度 + 缩进，让 trace 视觉上分层。
+    int d = m_expandDepth++;
+    std::string indent(d * 2, ' ');
+    std::string enterArrow = (d == 0 ? "┌─" : "├─");
+    std::string exitArrow  = (d == 0 ? "└─" : "┴─");
+    { std::string hs; for (auto& h : hide) { if (!hs.empty()) hs += ","; hs += h; }
+      std::cout << std::format("  [pp] {}:{} {}{} d={} enter  text=[{}]  hide={{{}}}\n",
+        fileName, line, indent, enterArrow, d, text, hs); }
+
     std::string out;
     size_t i = 0;
     while (i < text.size()) {
@@ -481,6 +497,8 @@ std::string Preprocessor::expand(const std::string& text,
 
         // 字符串字面量原样穿过（串内不展开）
         if (c == '"') {
+            std::cout << std::format("  [pp] {}:{} {}│  str-literal pass-through\n",
+                fileName, line, indent);
             out += c; i++;
             while (i < text.size()) {
                 out += text[i];
@@ -491,31 +509,49 @@ std::string Preprocessor::expand(const std::string& text,
             continue;
         }
 
-        if (!isWordStart(c)) { out += c; i++; continue; } // wangyang如果不是字母，那么原样接受
+        if (!isWordStart(c)) { out += c; i++; continue; } // 非字母原样接受
 
         std::string word;
         size_t after = readWord(text, i, word);
 
         // 内建动态宏（[cpp.predefined]）：值取决于展开发生的位置（文件/行号），
         // 不能存进宏表，每次遇到就地生成。
-        if (word == "__LINE__") { out += std::to_string(line); i = after; continue; }
-        if (word == "__FILE__") { out += std::format("\"{}\"", fileName); i = after; continue; }
+        if (word == "__LINE__") {
+            std::cout << std::format("  [pp] {}:{} {}│  builtin __LINE__ → {}\n",
+                fileName, line, indent, line);
+            out += std::to_string(line); i = after; continue;
+        }
+        if (word == "__FILE__") {
+            std::cout << std::format("  [pp] {}:{} {}│  builtin __FILE__ → \"{}\"\n",
+                fileName, line, indent, fileName);
+            out += std::format("\"{}\"", fileName); i = after; continue;
+        }
 
         // 查宏表：未定义的词原样输出；hide 中"涂蓝"的词也原样输出——
         // 后者是递归展开的刹车（[cpp.rescan] 的自引用保护）。
         auto it = m_macros.find(word);
-        if (it == m_macros.end() || hide.count(word)) {
-            out += word; i = after;   // 涂蓝的宏不再展开 → 避免自引用死循环
-            continue;
+        if (it == m_macros.end()) {
+            std::cout << std::format("  [pp] {}:{} {}│  ident [{}] not a macro → keep\n",
+                fileName, line, indent, word);
+            out += word; i = after; continue;
+        }
+        if (hide.count(word)) {
+            std::cout << std::format("  [pp] {}:{} {}│  ident [{}] in hide-set → keep (no re-expand)\n",
+                fileName, line, indent, word);
+            out += word; i = after; continue;
         }
 
         const MacroDef& m = it->second;
         // 对象宏：宏名 → 宏体；宏名自身进 hide 后对宏体递归展开（重扫描）。
         if (!m.functionLike) {
-            std::cout << std::format("  [pp] {}:{} expand {} → {}\n", fileName, line, word, m.body);
+            std::cout << std::format("  [pp] {}:{} {}│  object-macro {} → body=[{}]\n",
+                fileName, line, indent, word, m.body);
             auto hide2 = hide;
             hide2.insert(word);
-            out += expand(m.body, hide2, fileName, line);
+            std::string sub = expand(m.body, hide2, fileName, line);
+            std::cout << std::format("  [pp] {}:{} {}│  object-macro {} resolved → [{}]\n",
+                fileName, line, indent, word, sub);
+            out += sub;
             i = after;
             continue;
         }
@@ -523,7 +559,11 @@ std::string Preprocessor::expand(const std::string& text,
         // 函数宏：'(' 不跟随则按普通标识符输出（[cpp.replace]）
         size_t j = after;
         while (j < text.size() && std::isspace((unsigned char)text[j])) j++;
-        if (j >= text.size() || text[j] != '(') { out += word; i = after; continue; }
+        if (j >= text.size() || text[j] != '(') {
+            std::cout << std::format("  [pp] {}:{} {}│  [{}] is function-like but no '(' follows → keep as ident\n",
+                fileName, line, indent, word);
+            out += word; i = after; continue;
+        }
 
         // 收集实参：括号配平，顶层逗号切分
         // demo："MAX(f(1,2), y)" → f(1,2) 内的逗号处于 depth=1 层，不切分
@@ -534,14 +574,14 @@ std::string Preprocessor::expand(const std::string& text,
         size_t k = j + 1;
         bool sawAny = false;
         for (; k < text.size(); k++) {
-            char d = text[k];
-            if (d == '(') { depth++; cur += d; }
-            else if (d == ')') {
+            char dch = text[k];
+            if (dch == '(') { depth++; cur += dch; }
+            else if (dch == ')') {
                 if (depth == 0) break;
-                depth--; cur += d;
+                depth--; cur += dch;
             }
-            else if (d == ',' && depth == 0) { args.push_back(trim(cur)); cur.clear(); sawAny = true; }
-            else { cur += d; sawAny = true; }
+            else if (dch == ',' && depth == 0) { args.push_back(trim(cur)); cur.clear(); sawAny = true; }
+            else { cur += dch; sawAny = true; }
         }
         if (k >= text.size())
             ppError(std::format("unterminated argument list invoking macro '{}'", word),
@@ -557,22 +597,40 @@ std::string Preprocessor::expand(const std::string& text,
             ppError(std::format("macro '{}' expects {} argument(s), got {}",
                 word, m.params.size(), args.size()), fileName, line);
 
-        std::cout << std::format("  [pp] {}:{} expand {}({})\n",
-            fileName, line, word, trim(text.substr(j + 1, k - j - 1)));
+        // 打印实参收集结果（展开前）
+        { std::string as; for (auto& a : args) { if (!as.empty()) as += " | "; as += a; }
+          std::cout << std::format("  [pp] {}:{} {}│  func-macro {}({})  args(raw)=[{}]\n",
+            fileName, line, indent, word, trim(text.substr(j + 1, k - j - 1)), as); }
 
         // 实参先展开（[cpp.subst]），再按词边界替换参数名，最后整体重扫描
         // demo：#define N 10 时调用 MAX(N, x)
         //       → 实参 "N" 先展开为 "10" → 替换得 "((10)>(x)?(10):(x))"。
         std::vector<std::string> expandedArgs;
         for (auto& a : args)
-            expandedArgs.push_back(expand(a, hide, fileName, line));
+            expandedArgs.push_back(expand(a, hide, fileName, line)); //wangyang **这里在参数解构的时候，直接就解开，语义更
 
+        // 打印实参展开后结果
+        { std::string as; for (auto& a : expandedArgs) { if (!as.empty()) as += " | "; as += a; }
+          std::cout << std::format("  [pp] {}:{} {}│  func-macro {} args(expanded)=[{}]\n",
+            fileName, line, indent, word, as); }
+
+        std::string body_before = m.body;
         std::string body2 = substituteParams(m, expandedArgs);
+        std::cout << std::format("  [pp] {}:{} {}│  func-macro {} body before=[{}] → after=[{}]\n",
+            fileName, line, indent, word, body_before, body2);
+
         auto hide2 = hide;
         hide2.insert(word);
-        out += expand(body2, hide2, fileName, line);
+        std::string sub = expand(body2, hide2, fileName, line);
+        std::cout << std::format("  [pp] {}:{} {}│  func-macro {} final-substitution → [{}]\n",
+            fileName, line, indent, word, sub);
+        out += sub;
         i = k + 1;
     }
+    // 返回前打印本次 expand 的最终 body（hide 含自涂蓝的宏名）
+    std::cout << std::format("  [pp] {}:{} {}{} d={} return body=[{}]\n",
+        fileName, line, indent, exitArrow, d, out);
+    m_expandDepth--;
     return out;
 }
 

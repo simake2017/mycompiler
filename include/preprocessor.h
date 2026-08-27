@@ -92,6 +92,8 @@ private:
     std::unordered_set<std::string> m_pragmaOnce;   // 已 pragma once 的 canonical 路径
     std::vector<std::string> m_includeStack;        // 循环 include 检测
     int m_includeCount = 0;
+    // wangyang 调试：expand 递归深度（仅用于日志缩进，不影响逻辑）
+    int m_expandDepth = 0;
 
     // 处理一段源文本（主文件或某个被包含文件）
     // 三步：① 行拼接（删除 '\' + 换行，[lex.phases] 翻译阶段 2）

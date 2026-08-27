@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/magene/runtime/cppproject/mycompiler/build-linux/_deps/googletest-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

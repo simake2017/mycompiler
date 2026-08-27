@@ -162,6 +162,28 @@ void dumpAST(const TranslationUnit& unit, int indent = 0) {
                 func->name,
                 func->returnType ? func->returnType->toString() : "?");
         }
+        else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+            printIndent(indent);
+            std::cout << std::format("GlobalVarDecl: {} : {}\n",
+                gvar->name,
+                gvar->declaredType ? gvar->declaredType->toString() : "auto");
+        }
+        else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(decl)) {
+            printIndent(indent);
+            std::cout << std::format("EnumDecl: {} ({} items)\n",
+                enm->name, enm->items.size());
+        }
+        else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
+            printIndent(indent);
+            std::cout << std::format("NamespaceDecl: {}\n", ns->name);
+            dumpAST({ns->declarations}, indent + 1);
+        }
+        else if (auto ta = std::dynamic_pointer_cast<TypeAliasDecl>(decl)) {
+            printIndent(indent);
+            std::cout << std::format("TypeAliasDecl: {} = {}\n",
+                ta->aliasName,
+                ta->underlyingType ? ta->underlyingType->toString() : "?");
+        }
         else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
             printIndent(indent);
             std::cout << std::format("TemplateDecl({}): <",

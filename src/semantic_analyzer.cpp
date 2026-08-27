@@ -197,6 +197,35 @@ void SymbolTable::dumpCurrentScope() const {
 //       typeCompatible(int, const int) = true（剥顶层 const）
 //       typeCompatible(double, int)  = true  （int → double，[conv.promo]）
 //       typeCompatible(int, bool)    = false （无此隐式转换规则 → 报错）
+TypePtr SemanticAnalyzer::resolveType(TypePtr type) {
+    if (!type) return nullptr;
+    if (type->isClass()) {
+        Symbol* sym = m_symbolTable.lookup(type->name);
+        if (sym && sym->kind == SymbolKind::Type && sym->type) {
+            if (sym->type->name != type->name || sym->type->kind != type->kind) {
+                return resolveType(sym->type);
+            }
+        }
+    }
+    if (type->isPointer()) {
+        auto base = resolveType(type->pointeeType);
+        if (base != type->pointeeType) return Type::makePointer(base);
+    }
+    if (type->isReference()) {
+        auto base = resolveType(type->referencedType);
+        if (base != type->referencedType) return Type::makeLValueReference(base);
+    }
+    if (type->isRValueReference()) {
+        auto base = resolveType(type->referencedType);
+        if (base != type->referencedType) return Type::makeRValueReference(base);
+    }
+    if (type->isConst()) {
+        auto base = resolveType(type->innerType);
+        if (base != type->innerType) return Type::makeConst(base);
+    }
+    return type;
+}
+
 static bool typeCompatible(const TypePtr& expected, const TypePtr& got) {
     if (!expected || !got) return false;
     TypePtr e = expected, g = got;
@@ -232,15 +261,27 @@ std::string SemanticAnalyzer::inferIndent() const {
 // 函数体延迟到 ActOnTopLevelDecl/完整定义后再逐一分析。
 // 限制：Pass 1 单遍处理继承，基类必须先于派生类出现在源码中
 //      （不支持前向声明，[class] 教学级简化）。
+void SemanticAnalyzer::processDecl(DeclPtr decl) {
+    if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
+        processClassDecl(cls);
+    } else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
+        processTemplateDecl(tmpl);
+    } else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+        processGlobalVarDecl(gvar);
+    } else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(decl)) {
+        processEnumDecl(enm);
+    } else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
+        processNamespaceDecl(ns);
+    } else if (auto ta = std::dynamic_pointer_cast<TypeAliasDecl>(decl)) {
+        processTypeAliasDecl(ta);
+    }
+}
+
 void SemanticAnalyzer::analyze(TranslationUnit& unit) {
 
-    std::cout << "\n  ┌──── Pass 1: 注册类与模板 ────────────────────────\n";
+    std::cout << "\n  ┌──── Pass 1: 注册类、模板、全局变量与命名空间 ────\n";
     for (auto& decl : unit.declarations) {
-        if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-            processClassDecl(cls);
-        } else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
-            processTemplateDecl(tmpl);
-        }
+        processDecl(decl);
     }
 
     std::cout << "\n  ┌──── Pass 2: 注册所有函数（支持递归）──────────────\n";
@@ -248,8 +289,6 @@ void SemanticAnalyzer::analyze(TranslationUnit& unit) {
         if (auto func = std::dynamic_pointer_cast<FunctionDecl>(decl)) {
             registerFunction(func);
         } else if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-            // 类方法同样注册为函数（fullName = 类名::方法名），
-            // 供方法调用解析与 CodeGen 输出。
             for (auto& method : cls->methods) {
                 registerFunction(method);
             }
@@ -269,6 +308,94 @@ void SemanticAnalyzer::analyze(TranslationUnit& unit) {
             }
         }
     }
+}
+
+void SemanticAnalyzer::processGlobalVarDecl(GlobalVarDeclPtr decl) {
+    decl->declaredType = resolveType(decl->declaredType);
+    if (decl->initializer) {
+        TypePtr initType = inferType(decl->initializer);
+        if (decl->declaredType->isAuto()) {
+            decl->declaredType = initType;
+        } else if (!typeCompatible(decl->declaredType, initType)) {
+            error(std::format("Cannot initialize global variable '{}' of type '{}' with value of type '{}'",
+                decl->name, decl->declaredType->toString(), initType->toString()), decl->location);
+        }
+    }
+    m_globalVars.push_back(decl);
+
+    Symbol sym;
+    sym.name = decl->name;
+    sym.type = decl->declaredType;
+    sym.kind = SymbolKind::Variable;
+    sym.isLocal = false;
+    sym.definedAt = decl->location;
+    m_symbolTable.globalScope()->define(decl->name, sym);
+
+    std::cout << std::format("  [register] global variable '{}' : {}\n",
+        decl->name, decl->declaredType ? decl->declaredType->toString() : "auto");
+}
+
+void SemanticAnalyzer::processEnumDecl(EnumDeclPtr decl) {
+    m_enumDecls[decl->name] = decl;
+    TypePtr enumType = decl->underlyingType ? decl->underlyingType : Type::makeInt();
+
+    for (auto& item : decl->items) {
+        if (item.valueExpr) {
+            inferType(item.valueExpr);
+        }
+        if (!decl->isScoped) {
+            Symbol sym;
+            sym.name = item.name;
+            sym.type = enumType;
+            sym.kind = SymbolKind::Variable;
+            sym.isLocal = false;
+            sym.definedAt = item.location;
+            m_symbolTable.globalScope()->define(item.name, sym);
+        }
+        if (!decl->name.empty()) {
+            Symbol scopedSym;
+            scopedSym.name = decl->name + "::" + item.name;
+            scopedSym.type = enumType;
+            scopedSym.kind = SymbolKind::Variable;
+            scopedSym.isLocal = false;
+            scopedSym.definedAt = item.location;
+            m_symbolTable.globalScope()->define(scopedSym.name, scopedSym);
+        }
+    }
+    std::cout << std::format("  [register] enum '{}' ({} items)\n", decl->name, decl->items.size());
+}
+
+void SemanticAnalyzer::processNamespaceDecl(NamespaceDeclPtr decl) {
+    std::cout << std::format("  [namespace] enter namespace '{}'\n", decl->name);
+    for (auto& innerDecl : decl->declarations) {
+        if (auto func = std::dynamic_pointer_cast<FunctionDecl>(innerDecl)) {
+            func->name = decl->name + "::" + func->name;
+            registerFunction(func);
+        } else if (auto cls = std::dynamic_pointer_cast<ClassDecl>(innerDecl)) {
+            cls->name = decl->name + "::" + cls->name;
+            processClassDecl(cls);
+        } else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(innerDecl)) {
+            gvar->name = decl->name + "::" + gvar->name;
+            processGlobalVarDecl(gvar);
+        } else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(innerDecl)) {
+            enm->name = decl->name + "::" + enm->name;
+            processEnumDecl(enm);
+        } else {
+            processDecl(innerDecl);
+        }
+    }
+}
+
+void SemanticAnalyzer::processTypeAliasDecl(TypeAliasDeclPtr decl) {
+    Symbol sym;
+    sym.name = decl->aliasName;
+    sym.type = decl->underlyingType;
+    sym.kind = SymbolKind::Type;
+    sym.isLocal = false;
+    sym.definedAt = decl->location;
+    m_symbolTable.globalScope()->define(decl->aliasName, sym);
+    std::cout << std::format("  [register] type alias '{}' = {}\n",
+        decl->aliasName, decl->underlyingType ? decl->underlyingType->toString() : "?");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -354,9 +481,61 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             field.name, field.type ? field.type->toString() : "?");
     }
 
+    // ── 合成默认构造与析构（若未显式提供）──
+    bool hasExplicitCtor = false;
+    bool hasExplicitDtor = false;
+    for (auto& method : decl->methods) {
+        if (std::dynamic_pointer_cast<ConstructorDecl>(method) || method->name == decl->name) {
+            hasExplicitCtor = true;
+        }
+        if (std::dynamic_pointer_cast<DestructorDecl>(method) || method->name == "~" + decl->name) {
+            hasExplicitDtor = true;
+        }
+    }
+
+    if (!hasExplicitCtor) {
+        auto defaultCtor = std::make_shared<ConstructorDecl>();
+        defaultCtor->name = decl->name;
+        defaultCtor->ownerClassName = decl->name;
+        defaultCtor->returnType = Type::makeVoid();
+        defaultCtor->isDefaultCtor = true;
+        defaultCtor->body = std::make_shared<BlockStmt>();
+        decl->methods.push_back(defaultCtor);
+    }
+    if (!hasExplicitDtor) {
+        auto defaultDtor = std::make_shared<DestructorDecl>();
+        defaultDtor->name = "~" + decl->name;
+        defaultDtor->ownerClassName = decl->name;
+        defaultDtor->returnType = Type::makeVoid();
+        defaultDtor->isDefaultDtor = true;
+        defaultDtor->body = std::make_shared<BlockStmt>();
+        decl->methods.push_back(defaultDtor);
+    }
+
+    // ── 校验构造函数初始化列表 ──
+    for (auto& method : decl->methods) {
+        if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method)) {
+            for (auto& init : ctor->initList) {
+                bool found = (init.memberName == decl->baseClassName);
+                for (auto& f : decl->fields) {
+                    if (f.name == init.memberName) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    error(std::format("Member '{}' not found in class '{}' during initializer list",
+                        init.memberName, decl->name), init.location);
+                }
+            }
+        }
+    }
+
     // ── 注册方法，检查虚函数 ──
     for (auto& method : decl->methods) {
         method->ownerClassName = decl->name;
+
+        std::string methodNameInVTable = method->name.starts_with("~") ? "dtor" : method->name;
 
         std::cout << std::format("    method: {}() → {}{}\n",
             method->name,
@@ -367,15 +546,11 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
         if (method->isVirtual) {
             classType->classLayout.hasVTable = true;
 
-            // override 检测（[class.virtual]，教学简化：用 mangled 名子串
-            // 匹配同名虚函数；标准按签名+const 限定精确比对）：
-            // 命中基类槽位 → 原位改写 mangledName，索引保持不变 ——
-            // 这正是动态分派的关键：调用方统一按槽位索引间接跳转，
-            // 基类指针也能落到派生类实现。
+            // override 检测
             bool overridden = false;
             for (auto& entry : classType->classLayout.vtableEntries) {
-                if (entry.mangledName.find(method->name) != std::string::npos) {
-                    entry.mangledName = decl->name + "_" + method->name;
+                if (entry.mangledName.find(methodNameInVTable) != std::string::npos) {
+                    entry.mangledName = decl->name + "_" + methodNameInVTable;
                     entry.isOverridden = true;
                     overridden = true;
                     break;
@@ -383,10 +558,8 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             }
 
             if (!overridden) {
-                // 非 override → 本类新声明的虚函数：追加到 vtable 末尾，
-                // 索引 = 当前表长（之后 injectVTableAndRTTI 会统一重排）。
                 VTableEntry entry;
-                entry.mangledName = decl->name + "_" + method->name;
+                entry.mangledName = decl->name + "_" + methodNameInVTable;
                 entry.index = static_cast<uint32_t>(
                     classType->classLayout.vtableEntries.size());
                 classType->classLayout.vtableEntries.push_back(entry);
@@ -525,6 +698,11 @@ uint32_t SemanticAnalyzer::alignTo(uint32_t offset, uint32_t alignment) {
 // 示例：Animal::speak(int) → mangledName="Animal_speak"，符号表条目
 //       { name="speak", kind=Function, type=int, ownerClass="Animal" }
 void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
+    decl->returnType = resolveType(decl->returnType);
+    for (auto& param : decl->parameters) {
+        param.type = resolveType(param.type);
+    }
+
     std::string fullName = decl->ownerClassName.empty()
         ? decl->name
         : decl->ownerClassName + "::" + decl->name;
@@ -537,7 +715,11 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
     if (decl->ownerClassName.empty()) {
         decl->mangledName = decl->name;
     } else {
-        decl->mangledName = decl->ownerClassName + "_" + decl->name;
+        if (decl->name.starts_with("~")) {
+            decl->mangledName = decl->ownerClassName + "_dtor";
+        } else {
+            decl->mangledName = decl->ownerClassName + "_" + decl->name;
+        }
     }
 
     // 注册到符号表
@@ -723,6 +905,17 @@ void SemanticAnalyzer::processStmt(StmtPtr stmt) {
         processAssignStmt(assign);
     else if (auto expr = std::dynamic_pointer_cast<ExprStmt>(stmt))
         processExprStmt(expr);
+    else if (auto del = std::dynamic_pointer_cast<DeleteStmt>(stmt))
+        processDeleteStmt(del);
+}
+
+void SemanticAnalyzer::processDeleteStmt(std::shared_ptr<DeleteStmt> stmt) {
+    TypePtr ptrType = inferType(stmt->pointerExpr);
+    if (!ptrType || !ptrType->isPointer()) {
+        error("delete operand must be a pointer", stmt->location);
+    }
+    std::cout << std::format("  [delete] delete {}{}\n",
+        stmt->isArray ? "[] " : "", ptrType->toString());
 }
 
 // 复合语句 `{ … }` → 新建块作用域（[basic.scope.block]）：
@@ -757,6 +950,7 @@ void SemanticAnalyzer::processBlockStmt(std::shared_ptr<BlockStmt> block) {
 //   `int x = 3.14;`        → 无兼容规则 → 报 Type mismatch
 // ═════════════════════════════════════════════════════════════════════════════
 void SemanticAnalyzer::processVarDecl(std::shared_ptr<VarDeclStmt> decl) {
+    decl->declaredType = resolveType(decl->declaredType);
     TypePtr type = decl->declaredType;
 
     if (decl->initializer) {
@@ -896,11 +1090,12 @@ void SemanticAnalyzer::processReturnStmt(std::shared_ptr<ReturnStmt> stmt) {
             m_currentReturnType ? m_currentReturnType->toString() : "?");
 
         // 类型检查（含 [conv.lval] 引用剥除 / 数值提升）
-        if (retType && m_currentReturnType
-            && !typeCompatible(m_currentReturnType, retType)) {
+        TypePtr expType = resolveType(m_currentReturnType);
+        if (retType && expType
+            && !typeCompatible(expType, retType)) {
             error(std::format(
                 "Return type mismatch: expected '{}', got '{}'",
-                m_currentReturnType->toString(), retType->toString()),
+                expType->toString(), retType->toString()),
                 stmt->location);
         }
     } else {
@@ -980,6 +1175,10 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
         type = inferNew(e);
     else if (auto e = std::dynamic_pointer_cast<ThisExpr>(expr))
         type = inferThis(e);
+    else if (auto e = std::dynamic_pointer_cast<DeleteExpr>(expr)) {
+        inferType(e->pointerExpr);
+        type = Type::makeVoid();
+    }
 
     expr->resolvedType = type;
     return type;
@@ -1484,9 +1683,44 @@ TypePtr SemanticAnalyzer::inferNew(std::shared_ptr<NewExpr> expr) {
         error(std::format("Unknown class '{}'", expr->className), expr->location);
     }
 
-    std::cout << std::format("{}[new] {} → {}*    (size={} bytes)\n",
+    // 推导构造函数实参类型
+    std::vector<TypePtr> argTypes;
+    for (auto& arg : expr->constructorArgs) {
+        argTypes.push_back(inferType(arg));
+    }
+
+    // 查找匹配的构造函数
+    auto classIt = m_classDecls.find(expr->className);
+    if (classIt != m_classDecls.end()) {
+        bool foundMatch = false;
+        for (auto& method : classIt->second->methods) {
+            auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method);
+            if (!ctor && method->name != expr->className) continue;
+            if (method->parameters.size() == argTypes.size()) {
+                bool match = true;
+                for (size_t i = 0; i < argTypes.size(); ++i) {
+                    if (!typeCompatible(method->parameters[i].type, argTypes[i])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    foundMatch = true;
+                    break;
+                }
+            }
+        }
+        if (!foundMatch && (!argTypes.empty() || !classIt->second->methods.empty())) {
+            if (!argTypes.empty()) {
+                error(std::format("No matching constructor for class '{}' with {} arguments",
+                    expr->className, argTypes.size()), expr->location);
+            }
+        }
+    }
+
+    std::cout << std::format("{}[new] {} → {}*    (size={} bytes, args={})\n",
         inferIndent(), expr->className, expr->className,
-        it->second->classLayout.totalSize);
+        it->second->classLayout.totalSize, argTypes.size());
 
     return Type::makePointer(it->second);
 }
