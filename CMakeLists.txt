@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 project(MiniCppCompiler LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -62,7 +65,19 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 add_executable(unit_tests
     tests/unit/test_preprocessor.cpp
+    tests/unit/test_template_deduction.cpp
+    tests/unit/test_decl_and_ctor.cpp
+    tests/unit/test_expr_parser.cpp
+    tests/unit/test_expressions.cpp
+    tests/unit/test_ast_nodes.cpp
     src/preprocessor.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/semantic_analyzer.cpp
+    src/codegen.cpp
+    src/template_deduction.cpp
+    src/template_instantiation.cpp
+    src/type.cpp
 )
 target_include_directories(unit_tests PRIVATE include)
 target_compile_options(unit_tests PRIVATE -Wall -Wextra)

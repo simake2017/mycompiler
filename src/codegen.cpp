@@ -141,6 +141,32 @@ std::string CodeGen::generate(
         }
     }
 
+    // 为全局变量生成数据段
+    std::function<void(const std::vector<DeclPtr>&)> emitGlobalVars = [&](const std::vector<DeclPtr>& decls) {
+        for (auto& decl : decls) {
+            if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+                emitData(std::format("    .globl {}", gvar->name));
+                emitData("    .align 8");
+                emitData(std::format("{}:", gvar->name));
+                if (gvar->initializer) {
+                    if (auto lit = std::dynamic_pointer_cast<IntLiteralExpr>(gvar->initializer)) {
+                        emitData(std::format("    .quad {}", lit->value));
+                    } else if (auto b = std::dynamic_pointer_cast<BoolLiteralExpr>(gvar->initializer)) {
+                        emitData(std::format("    .quad {}", b->value ? 1 : 0));
+                    } else {
+                        emitData("    .quad 0");
+                    }
+                } else {
+                    emitData("    .quad 0");
+                }
+                emitData("");
+            } else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
+                emitGlobalVars(ns->declarations);
+            }
+        }
+    };
+    emitGlobalVars(unit.declarations);
+
     // ── 生成代码段：所有函数 ──
     for (auto& func : functions) {
         if (func->body) {
@@ -388,6 +414,27 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     // 栈分配指针接到形参区末尾，之后的局部变量从这里继续向低地址分配
     m_currentStackOffset = paramOffset;
 
+    // 构造函数：如果是构造函数，安装 vptr，并执行初始化列表
+    if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(func)) {
+        if (m_currentClassType && m_currentClassType->classLayout.hasVTable) {
+            std::string vtableLabel = NameMangler::mangleVTable(m_currentClassName);
+            emit("movq -8(%rbp), %rax    # this");
+            emit(std::format("leaq {}(%rip), %rcx    # vtable pointer", vtableLabel));
+            emit("addq $16, %rcx    # skip top+rtti to vtable[0]");
+            emit("movq %rcx, (%rax)    # install _vptr");
+        }
+        for (auto& init : ctor->initList) {
+            if (m_currentClassType) {
+                const FieldInfo* field = m_currentClassType->classLayout.findField(init.memberName);
+                if (field && !init.arguments.empty()) {
+                    emitExpr(init.arguments[0]);
+                    emit("movq -8(%rbp), %rcx    # load this");
+                    emit(std::format("movq %rax, {}(%rcx)    # init field {}", field->offset, field->name));
+                }
+            }
+        }
+    }
+
     // 生成函数体
     if (func->body) {
         for (auto& stmt : func->body->statements) {
@@ -396,11 +443,9 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     }
 
     // 如果函数没有显式 return，添加默认返回
-    // void 函数补一个确定的 rax 值，避免调用方读到不确定的旧值。
-    // 注意：若函数体已经用 return 结束（自带 leave/ret），这里再补的
-    // leave/ret 就是不可达的死代码——教学实现不做控制流分析来消除它，
-    // 汇编器与 CPU 都不介意（.s 里能看到连续的 leave/ret leave/ret）。
-    if (func->returnType->isVoid()) {
+    if (std::dynamic_pointer_cast<ConstructorDecl>(func)) {
+        emit("movq -8(%rbp), %rax    # return this from constructor");
+    } else if (func->returnType && func->returnType->isVoid()) {
         emit("movq $0, %rax");
     }
 
@@ -428,6 +473,8 @@ void CodeGen::emitStmt(StmtPtr stmt) {
         emitAssign(s);
     else if (auto s = std::dynamic_pointer_cast<ReturnStmt>(stmt))
         emitReturn(s);
+    else if (auto s = std::dynamic_pointer_cast<DeleteStmt>(stmt))
+        emitDelete(s);
     else if (auto s = std::dynamic_pointer_cast<IfStmt>(stmt))
         emitIf(s);
     else if (auto s = std::dynamic_pointer_cast<WhileStmt>(stmt))
@@ -505,6 +552,10 @@ void CodeGen::emitAssign(std::shared_ptr<AssignStmt> stmt) {
         if (it != m_localVars.end()) {
             emit(std::format("movq %rax, {}(%rbp)    # {} = ...",
                 it->second, var->name));
+        } else {
+            // 全局变量赋值
+            emit(std::format("movq %rax, {}(%rip)    # global {} = ...",
+                var->name, var->name));
         }
     }
     else if (auto mem = std::dynamic_pointer_cast<MemberExpr>(stmt->target)) {
@@ -564,6 +615,45 @@ void CodeGen::emitReturn(std::shared_ptr<ReturnStmt> stmt) {
     }
     emit("leave");
     emit("ret");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// delete 语句
+// ─────────────────────────────────────────────────────────────────────────────
+void CodeGen::emitDelete(std::shared_ptr<DeleteStmt> stmt) {
+    emitComment("delete pointer");
+    emitExpr(stmt->pointerExpr);
+    emit("movq %rax, %rdi               # pointer to delete");
+    emit("pushq %rdi                    # save pointer");
+
+    // 检查是否需要调用析构函数
+    TypePtr ptrType = stmt->pointerExpr->resolvedType;
+    if (ptrType && ptrType->isPointer() && ptrType->pointeeType && ptrType->pointeeType->isClass()) {
+        std::string className = ptrType->pointeeType->name;
+        if (m_classTypes) {
+            auto it = m_classTypes->find(className);
+            if (it != m_classTypes->end()) {
+                auto& layout = it->second->classLayout;
+                bool hasVirtualDtor = false;
+                uint32_t dtorIndex = 0;
+                for (auto& entry : layout.vtableEntries) {
+                    if (entry.mangledName.find("dtor") != std::string::npos) {
+                        hasVirtualDtor = true;
+                        dtorIndex = entry.index;
+                        break;
+                    }
+                }
+                if (hasVirtualDtor) {
+                    emitVirtualCall(className, "dtor", {}, dtorIndex);
+                } else {
+                    emit(std::format("callq {}_dtor         # call destructor", className));
+                }
+            }
+        }
+    }
+
+    emit("popq %rdi                     # restore pointer for free");
+    emit("callq free                    # free memory");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -755,8 +845,8 @@ void CodeGen::emitVar(std::shared_ptr<VarExpr> expr) {
         }
     }
 
-    emit(std::format("# WARNING: undefined variable '{}'", expr->name));
-    emit("xorq %rax, %rax");
+    // 查全局变量或常量符号（RIP 寻址）
+    emit(std::format("movq {}(%rip), %rax    # load global {}", expr->name, expr->name));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1196,19 +1286,37 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
     }
 
     // 调用 malloc
-    // System V 下 malloc(size) 的参数走 rdi，返回的指针在 rax ——
-    // 调用约定在"编译器生成的代码"与"库函数"之间同样生效
     emit(std::format("movq ${}, %rdi             # malloc size", size));
     emit("callq malloc                  # allocate memory");
+    emit("pushq %rax                    # save allocated objPtr");
 
     if (hasVTable) {
         // 设置 _vptr：对象偏移量 0 处 = vtable 地址 + 16
-        // （跳过 offset-to-top 和 RTTI 指针）
         emit(std::format("leaq {}(%rip), %rcx    # vtable address", vtableLabel));
         emit("addq $16, %rcx              # skip to vtable[0]");
+        emit("movq (%rsp), %rax           # load objPtr");
         emit("movq %rcx, (%rax)           # obj._vptr = vtable");
     }
 
+    // 调用构造函数
+    // 先计算参数（实参最多 5 个，this 占用 rdi）
+    for (size_t i = 0; i < expr->constructorArgs.size() && i < 5; i++) {
+        emitExpr(expr->constructorArgs[i]);
+        emit("pushq %rax");
+    }
+
+    // 恢复参数到 rsi, rdx, rcx, r8, r9
+    for (int i = static_cast<int>(expr->constructorArgs.size()) - 1; i >= 0 && i < 5; i--) {
+        static const char* regs[] = {"rsi", "rdx", "rcx", "r8", "r9"};
+        emit(std::format("popq %{}", regs[i]));
+    }
+
+    // 从栈顶取回 objPtr 传给 rdi
+    emit("movq (%rsp), %rdi             # this pointer");
+    std::string ctorName = expr->className + "_" + expr->className;
+    emit(std::format("callq {}              # call constructor", ctorName));
+
+    emit("popq %rax                     # return objPtr");
     emitComment(std::format("end new {}()", expr->className));
 }
 

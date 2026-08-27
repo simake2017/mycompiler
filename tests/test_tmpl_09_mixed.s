@@ -28,6 +28,29 @@
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)    # param: a
     movq -16(%rbp), %rax    # load a
+    movq %rax, age(%rip)    # global age = ...
+    movq $0, %rax
+    leave
+    ret
+    
+        .globl Animal_Animal
+    Animal_Animal:
+    # Function: Animal (params: 0)
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $64, %rsp
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax    # return this from constructor
+    leave
+    ret
+    
+        .globl Animal_dtor
+    Animal_dtor:
+    # Function: ~Animal (params: 0)
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $64, %rsp
+    movq %rdi, -8(%rbp)
     movq $0, %rax
     leave
     ret

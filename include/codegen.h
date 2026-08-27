@@ -129,6 +129,8 @@ private:
     void emitAssign(std::shared_ptr<AssignStmt> stmt);
     // return：结果算进 rax 后直接 leave/ret 撤销栈帧
     void emitReturn(std::shared_ptr<ReturnStmt> stmt);
+    // delete 语句
+    void emitDelete(std::shared_ptr<DeleteStmt> stmt);
     // if/else：testq + je 条件跳转的结构化降级
     void emitIf(std::shared_ptr<IfStmt> stmt);
     // while：条件跳出 + 回边 jmp 的循环降级

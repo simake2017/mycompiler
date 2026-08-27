@@ -86,21 +86,22 @@ private:
     TypePtr parseType();
 
     // ── 声明解析 ──
-    // declaration := template-decl | class-decl | ['virtual'] function-decl
-    // 分派依据：第一个前瞻 Token（'template' / 'class' / ['virtual'] + 类型名）
-    DeclPtr         parseDeclaration();
-    // template-decl := 'template' '<' ( ('typename'|'class') IDENT (',' ...)* ) '>'
-    //                  ( class-decl | function-decl )
-    TemplateDeclPtr parseTemplateDecl();
-    // class-decl := 'class' IDENT [':' 'public' IDENT] '{' member* '}' ';'
-    ClassDeclPtr    parseClassDecl();
-    // function-decl := type IDENT '(' parameter-list ')' ['override']
-    //                  ( compound-stmt | ';' )
-    FuncDeclPtr     parseFunctionDecl(bool isVirtual = false,
-                                      const std::string& ownerClass = "");
-    // method-decl := ['virtual'] function-decl   （类体内成员，带所属类名）
-    FuncDeclPtr     parseMethodDecl(const std::string& ownerClass,
-                                    AccessModifier access);
+    // declaration := template-decl | class-decl | enum-decl | namespace-decl
+    //              | type-alias-decl | global-var-decl | ['virtual'] function-decl
+    DeclPtr            parseDeclaration();
+    TemplateDeclPtr    parseTemplateDecl();
+    ClassDeclPtr       parseClassDecl();
+    EnumDeclPtr        parseEnumDecl();
+    NamespaceDeclPtr   parseNamespaceDecl();
+    TypeAliasDeclPtr   parseTypeAliasDecl();
+    GlobalVarDeclPtr   parseGlobalVarDecl();
+    FuncDeclPtr        parseFunctionDecl(bool isVirtual = false,
+                                         const std::string& ownerClass = "");
+    FuncDeclPtr        parseMethodDecl(const std::string& ownerClass,
+                                       AccessModifier access);
+    CtorDeclPtr        parseConstructorDecl(const std::string& ownerClass);
+    DtorDeclPtr        parseDestructorDecl(const std::string& ownerClass, bool isVirtual = false);
+    std::vector<CtorInitializer> parseCtorInitializerList();
 
     // ── 语句解析 ──
     // stmt := compound-stmt | if-stmt | while-stmt | return-stmt
@@ -117,6 +118,8 @@ private:
     StmtPtr parseWhileStmt();
     // return-stmt := 'return' [expr] ';'
     StmtPtr parseReturnStmt();
+    // delete-stmt := 'delete' ['[' ']'] expr ';'
+    StmtPtr parseDeleteStmt();
     // expr-or-assign := expr ['=' expr] ';'
     StmtPtr parseExprOrAssignStmt();
 

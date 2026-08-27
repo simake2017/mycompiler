@@ -160,13 +160,33 @@ bool Parser::isAtEnd() const {
 // 文法：type := ['const'] base-type ('*' | '&' | '&&')*
 // 对应 clang：ParseDeclSpec 的 DeclSpec 部分（类型说明符 + 派生类型 declarator
 //            的指针/引用后缀，clang 里拆在 ParseDeclarator 中，此处合并实现）。
-// 入参 demo：Token 流 [const][Vec][&]
-//   → base = class "Vec" → 后缀 & → const(class Vec) 的左值引用
-//   → 产出 ConstType(LValueReferenceType(ClassType "Vec"))
-//   注：const 按教学简化统一作用于整个类型（真 C++ 中 const T* 与 T* const
-//   的 const 归属不同，这里不区分顶层/底层 const）。
+//
+// ─── parseType 支持的典型类型样例表 ──────────────────────────────────────────
+// ┌──────────────────────────┬─────────────────────────────┬────────────────────────────────────────────────────────┐
+// │ 输入类型样例 (C++ 代码)  │ 对应 Token 流序列           │ 生成的 AST 类型节点结构                                │
+// ├──────────────────────────┼─────────────────────────────┼────────────────────────────────────────────────────────┤
+// │ int                      │ [int]                       │ PrimitiveType(Int)                                     │
+// │ double                   │ [double]                    │ PrimitiveType(Double)                                  │
+// │ bool                     │ [bool]                      │ PrimitiveType(Bool)                                    │
+// │ void                     │ [void]                      │ PrimitiveType(Void)                                    │
+// │ auto                     │ [auto]                      │ AutoType                                               │
+// │ MyClass                  │ [MyClass]                   │ ClassType("MyClass")                                   │
+// │ T                        │ [T]                         │ ClassType("T") (模板形参占位类型)                      │
+// │ std::string              │ [std][::][string]           │ ClassType("std::string") (作用域限定类型)              │
+// │ int*                     │ [int][*]                    │ PointerType(int)                                       │
+// │ int**                    │ [int][*][*]                 │ PointerType(PointerType(int)) (多级指针)               │
+// │ int&                     │ [int][&]                    │ LValueReferenceType(int) (左值引用)                    │
+// │ int&&                    │ [int][&&]                   │ RValueReferenceType(int) (右值引用)                    │
+// │ T&&                      │ [T][&&]                     │ RValueReferenceType(T) (通用引用/右值引用占位)         │
+// │ int*&                    │ [int][*][&]                 │ LValueReferenceType(PointerType(int)) (指针的引用)     │
+// │ const int                │ [const][int]                │ ConstType(int)                                         │
+// │ const MyClass&           │ [const][MyClass][&]         │ ConstType(LValueReferenceType(MyClass))                │
+// │ const int*               │ [const][int][*]             │ ConstType(PointerType(int))                            │
+// └──────────────────────────┴─────────────────────────────┴────────────────────────────────────────────────────────┘
+// 注：const 按教学简化统一作用于整个类型（真 C++ 中 const T* 与 T* const
+// 的 const 归属不同，这里不区分顶层/底层 const）。
 TypePtr Parser::parseType() {
-    // ── Step 1: 处理 const 前缀 ──
+    // ── Step 1: 处理 const 前缀（例如 const int, const Vec&）──
     bool isConst = false;
     if (check(TokenType::KwConst)) {
         isConst = true;
@@ -174,32 +194,36 @@ TypePtr Parser::parseType() {
         std::cout << std::format("  [parse:type] ✦ const prefix detected\n");
     }
 
-    // ── Step 2: 解析基础类型 ──
+    // ── Step 2: 解析基础类型（基本类型 / 标识符 / 命名空间限定类型）──
     TypePtr base;
 
     if (match(TokenType::KwInt)) {
-        base = Type::makeInt();
+        base = Type::makeInt();          // 样例: int
         std::cout << std::format("  [parse:type] base = int\n");
     }
     else if (match(TokenType::KwDouble)) {
-        base = Type::makeDouble();
+        base = Type::makeDouble();       // 样例: double
         std::cout << std::format("  [parse:type] base = double\n");
     }
     else if (match(TokenType::KwBool)) {
-        base = Type::makeBool();
+        base = Type::makeBool();         // 样例: bool
         std::cout << std::format("  [parse:type] base = bool\n");
     }
     else if (match(TokenType::KwVoid)) {
-        base = Type::makeVoid();
+        base = Type::makeVoid();         // 样例: void
         std::cout << std::format("  [parse:type] base = void\n");
     }
     else if (match(TokenType::KwAuto)) {
-        base = Type::makeAuto();
+        base = Type::makeAuto();         // 样例: auto
         std::cout << std::format("  [parse:type] base = auto\n");
     }
     else if (check(TokenType::Identifier)) {
-        // 类名或模板参数名
+        // 样例: "MyClass", 模板形参 "T", 命名空间限定名 "std::string" 或 "A::B::Type"
         std::string name = advance().text;
+        while (check(TokenType::ColonColon)) {
+            advance();
+            name += "::" + expect(TokenType::Identifier, "Expected type name after '::'").text;
+        }
         base = Type::makeClass(name);
         std::cout << std::format("  [parse:type] base = {} (class/tparam)\n", name);
     }
@@ -207,8 +231,8 @@ TypePtr Parser::parseType() {
         error("Expected type name");
     }
 
-    // ── Step 3: 处理后缀修饰符（*, &, &&）──
-    // 注意：后缀可以连续出现，如 T*&, const T**
+    // ── Step 3: 处理后缀修饰符（*, &, &&），支持链式组合 ──
+    // 样例: int* (单指针), int** (二级指针), int& (左值引用), T&& (右值引用), int*& (指针的引用)
     while (true) {
         if (match(TokenType::Star)) {
             // 指针: T*
@@ -236,6 +260,7 @@ TypePtr Parser::parseType() {
     }
 
     // ── Step 4: 应用 const 限定 ──
+    // 样例: const int, const MyClass&, const double*
     if (isConst) {
         base = Type::makeConst(base);
         std::cout << std::format("  [parse:type] const applied → {}\n", base->toString());
@@ -272,27 +297,157 @@ TranslationUnit Parser::parseTranslationUnit() {
 //   current() == 'virtual'   → 记 isVirtual=true，继续走函数声明
 //   其余（类型关键字/标识符） → parseFunctionDecl
 //
+// TODO(minicc): 目前顶层声明只实现了 Class、Function、Template 三个最小核心子集。
+// 真正的 C++ 在此还应支持 Namespace、Enum、全局变量（VarDecl）、Typedef/Using 等。
+// 如果在此处解析到 `int a = 1;` 这种全局变量，当前会由于 fallback 到 `parseFunctionDecl`
+// 并期待 `(` 而报错。这将在后续 Roadmap（数组/enum/namespace等特性）中扩展。
+//
 // 入参 demo：Token 流 [virtual][void][draw][(][)][{][...][}]
 //   → isVirtual=true → parseFunctionDecl 产出 FunctionDecl("draw", void, virtual)
 DeclPtr Parser::parseDeclaration() {
     // template<typename T> ...
-    if (check(TokenType::KwTemplate)) {
+    if (check(TokenType::KwTemplate)) { //wangyang 模板
         return parseTemplateDecl();
     }
 
-    // class ...
-    if (check(TokenType::KwClass)) {
+    // class ... / struct ... //wangyang 触发方式为 class 或者struct
+    if (check(TokenType::KwClass) || check(TokenType::KwStruct)) {
         return parseClassDecl();
     }
 
-    // 函数声明（可能是 virtual）
+    // enum ...
+    if (check(TokenType::KwEnum)) {
+        return parseEnumDecl();
+    }
+
+    // namespace ...
+    if (check(TokenType::KwNamespace)) {
+        return parseNamespaceDecl();
+    }
+
+    // using ... / typedef ...
+    if (check(TokenType::KwUsing) || check(TokenType::KwTypedef)) {
+        return parseTypeAliasDecl();
+    }
+
+    // 函数声明或全局变量声明
     bool isVirtual = false;
     if (check(TokenType::KwVirtual)) {
         isVirtual = true;
     }
 
-    // 尝试解析函数声明：类型 名字 ( 参数列表 ) { ... }
-    return parseFunctionDecl(isVirtual);
+    // 区分函数声明与全局变量声明
+    // 采用试探性前瞻（Tentative Lookahead）：存档 -> 试探跳过类型 -> 检查后续是否为 Identifier + '(' -> 回滚
+    size_t savedPos = m_pos;
+    if (isVirtual) {
+        advance();
+    }
+    parseType(); // 试探性解析：仅用于前进 token 流以观察后续符号，返回值不保留
+    bool isFunc = false;
+    if (check(TokenType::Identifier)) {
+        advance();
+        if (check(TokenType::LParen)) {
+            isFunc = true;
+        }
+    }
+    m_pos = savedPos; // 回滚到初始位置，后续统一在分支函数内部正式 parseType 并构建 AST
+
+    if (isFunc) {
+        return parseFunctionDecl(isVirtual);
+    } else {
+        return parseGlobalVarDecl();
+    }
+}
+
+// ─── 全局变量声明 ─────────────────────────────────────────────────────────────
+GlobalVarDeclPtr Parser::parseGlobalVarDecl() {
+    auto decl = std::make_shared<GlobalVarDecl>();
+    decl->location = current().location;
+    decl->declaredType = parseType();
+    const Token& nameTok = expect(TokenType::Identifier, "Expected global variable name");
+    decl->name = nameTok.text;
+    if (match(TokenType::Assign)) {
+        decl->initializer = parseExpression();
+    }
+    expect(TokenType::Semicolon, "Expected ';' after global variable declaration");
+    return decl;
+}
+
+// ─── 枚举声明 ─────────────────────────────────────────────────────────────────
+EnumDeclPtr Parser::parseEnumDecl() {
+    auto decl = std::make_shared<EnumDecl>();
+    decl->location = current().location;
+    expect(TokenType::KwEnum, "Expected 'enum'");
+    if (match(TokenType::KwClass) || match(TokenType::KwStruct)) {
+        decl->isScoped = true;
+    }
+    if (check(TokenType::Identifier)) {
+        decl->name = advance().text;
+    }
+    if (match(TokenType::Colon)) {
+        decl->underlyingType = parseType();
+    } else {
+        decl->underlyingType = Type::makeInt();
+    }
+    expect(TokenType::LBrace, "Expected '{' in enum declaration");
+    int64_t nextVal = 0;
+    while (!check(TokenType::RBrace) && !isAtEnd()) {
+        EnumItem item;
+        item.location = current().location;
+        const Token& nameTok = expect(TokenType::Identifier, "Expected enum item name");
+        item.name = nameTok.text;
+        if (match(TokenType::Assign)) {
+            item.hasCustomValue = true;
+            item.valueExpr = parseExpression();
+            if (auto lit = std::dynamic_pointer_cast<IntLiteralExpr>(item.valueExpr)) {
+                item.value = lit->value;
+                nextVal = lit->value + 1;
+            }
+        } else {
+            item.value = nextVal++;
+        }
+        decl->items.push_back(std::move(item));
+        if (!match(TokenType::Comma)) {
+            break;
+        }
+    }
+    expect(TokenType::RBrace, "Expected '}' after enum items");
+    expect(TokenType::Semicolon, "Expected ';' after enum declaration");
+    return decl;
+}
+
+// ─── 命名空间声明 ─────────────────────────────────────────────────────────────
+NamespaceDeclPtr Parser::parseNamespaceDecl() {
+    auto decl = std::make_shared<NamespaceDecl>();
+    decl->location = current().location;
+    expect(TokenType::KwNamespace, "Expected 'namespace'");
+    const Token& nameTok = expect(TokenType::Identifier, "Expected namespace name");
+    decl->name = nameTok.text;
+    expect(TokenType::LBrace, "Expected '{' in namespace declaration");
+    while (!check(TokenType::RBrace) && !isAtEnd()) {
+        decl->declarations.push_back(parseDeclaration());
+    }
+    expect(TokenType::RBrace, "Expected '}' after namespace declaration");
+    return decl;
+}
+
+// ─── 类型别名声明 ─────────────────────────────────────────────────────────────
+TypeAliasDeclPtr Parser::parseTypeAliasDecl() {
+    auto decl = std::make_shared<TypeAliasDecl>();
+    decl->location = current().location;
+    if (match(TokenType::KwUsing)) {
+        const Token& aliasTok = expect(TokenType::Identifier, "Expected alias name in using declaration");
+        decl->aliasName = aliasTok.text;
+        expect(TokenType::Assign, "Expected '=' in using declaration");
+        decl->underlyingType = parseType();
+        expect(TokenType::Semicolon, "Expected ';' after using declaration");
+    } else if (match(TokenType::KwTypedef)) {
+        decl->underlyingType = parseType();
+        const Token& aliasTok = expect(TokenType::Identifier, "Expected alias name in typedef declaration");
+        decl->aliasName = aliasTok.text;
+        expect(TokenType::Semicolon, "Expected ';' after typedef declaration");
+    }
+    return decl;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -329,36 +484,56 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     std::cout << std::format("  [parse:template] ▶ template declaration at {}\n",
         current().location.toString());
 
-    // 强制消费 'template' 与 '<'（必选文法，用 expect 保证结构）
+    // 强制消费 'template' 与 '<'（必选文法，用 expect 保证结构） //wangyang expect 会往前推进
     expect(TokenType::KwTemplate, "Expected 'template'");
     expect(TokenType::Less, "Expected '<' after 'template'");
 
     std::cout << "  [parse:template]   parsing parameter list <";
 
-    // 解析模板参数列表
+    // 解析模板参数列表（支持类型参数 typename/class T 与非类型参数 int N 等 NTTP）
     do {
-        // ★ 同时支持 typename 和 class 关键字 ★
-        // C++ 标准中 template<class T> 和 template<typename T> 完全等价
+        TemplateParam param;
+        param.location = current().location;
+
+        /**
+         *wangyang 验证参数
+         */
         if (check(TokenType::KwTypename)) {
             advance();
             std::cout << "typename ";
+            param.kind = TemplateParamKind::Type;
+            const Token& paramName = expect(TokenType::Identifier, "Expected parameter name");
+            param.name = paramName.text;
+            decl->typeParams.push_back(param.name);
+            decl->templateParams.push_back(param);
+            std::cout << std::format("{}", param.name);
+            std::cout << std::format("\n  [parse:template]   ★ type parameter registered: '{}'\n",
+                param.name);
         }
         else if (check(TokenType::KwClass)) {
             advance();
             std::cout << "class ";
+            param.kind = TemplateParamKind::Type;
+            const Token& paramName = expect(TokenType::Identifier, "Expected parameter name");
+            param.name = paramName.text;
+            decl->typeParams.push_back(param.name);
+            decl->templateParams.push_back(param);
+            std::cout << std::format("{}", param.name);
+            std::cout << std::format("\n  [parse:template]   ★ type parameter registered: '{}'\n",
+                param.name);
         }
         else {
-            errorAt(current(),
-                std::format("Expected 'typename' or 'class' in template parameter, got '{}'",
-                    current().text));
+            // ★ 非类型模板参数 (NTTP)：如 int N, bool Flag 等 ★
+            param.kind = TemplateParamKind::NonType;
+            param.nonType = parseType();
+            const Token& paramName = expect(TokenType::Identifier, "Expected parameter name after type in template parameter");
+            param.name = paramName.text;
+            decl->typeParams.push_back(param.name);
+            decl->templateParams.push_back(param);
+            std::cout << std::format("{} {}", param.nonType->toString(), param.name);
+            std::cout << std::format("\n  [parse:template]   ★ non-type parameter registered: {} '{}'\n",
+                param.nonType->toString(), param.name);
         }
-
-        const Token& paramName = expect(TokenType::Identifier, "Expected parameter name");
-        decl->typeParams.push_back(paramName.text);
-        std::cout << std::format("{}", paramName.text);
-
-        std::cout << std::format("\n  [parse:template]   ★ type parameter registered: '{}'\n",
-            paramName.text);
 
     } while (match(TokenType::Comma) && (std::cout << ", ", true));
 
@@ -373,11 +548,11 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     //   其他                           → 报错
     if (check(TokenType::KwClass)) {
         std::cout << std::format("  [parse:template]   parsing class body for template...\n");
-        decl->classTemplate = parseClassDecl();
+        decl->classTemplate = parseClassDecl(); // wangyang** class tempalte
     }
     else if (current().isTypeKeyword() || check(TokenType::Identifier)) {
         std::cout << std::format("  [parse:template]   parsing function signature for template...\n");
-        decl->funcTemplate = parseFunctionDecl();
+        decl->funcTemplate = parseFunctionDecl(); // wangyang** function template
     }
     else {
         errorAt(current(),
@@ -428,11 +603,88 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 //   单靠 1 个前瞻 Token 无法区分 `int x;`（字段）与 `int x();`（方法），
 //   故采用 保存游标 → 试探解析 `类型 名字` → 看下一个是否为 '(' → 恢复游标
 //   的试探法（详见函数体内 savedPos 注释）。
+// ─── 构造函数初始化列表 ───────────────────────────────────────────────────────
+std::vector<CtorInitializer> Parser::parseCtorInitializerList() {
+    std::vector<CtorInitializer> list;
+    expect(TokenType::Colon, "Expected ':' to start constructor initializer list");
+    do {
+        CtorInitializer init;
+        init.location = current().location;
+        const Token& memberTok = expect(TokenType::Identifier, "Expected member or base name in initializer");
+        init.memberName = memberTok.text;
+        expect(TokenType::LParen, "Expected '(' after member name in initializer");
+        if (!check(TokenType::RParen)) {
+            do {
+                init.arguments.push_back(parseExpression());
+            } while (match(TokenType::Comma));
+        }
+        expect(TokenType::RParen, "Expected ')' in member initializer");
+        list.push_back(std::move(init));
+    } while (match(TokenType::Comma));
+    return list;
+}
+
+// ─── 构造函数声明 ─────────────────────────────────────────────────────────────
+CtorDeclPtr Parser::parseConstructorDecl(const std::string& ownerClass) {
+    auto ctor = std::make_shared<ConstructorDecl>();
+    ctor->location = current().location;
+    ctor->ownerClassName = ownerClass;
+    const Token& nameTok = expect(TokenType::Identifier, "Expected constructor name");
+    ctor->name = nameTok.text;
+    expect(TokenType::LParen, "Expected '(' in constructor parameter list");
+    ctor->parameters = parseParameterList();
+    expect(TokenType::RParen, "Expected ')' after constructor parameters");
+
+    if (check(TokenType::Colon)) {
+        ctor->initList = parseCtorInitializerList();
+    }
+
+    if (check(TokenType::LBrace)) {
+        ctor->body = std::dynamic_pointer_cast<BlockStmt>(parseBlockStmt());
+    } else {
+        expect(TokenType::Semicolon, "Expected '{' or ';' after constructor declaration");
+    }
+    return ctor;
+}
+
+// ─── 析构函数声明 ─────────────────────────────────────────────────────────────
+DtorDeclPtr Parser::parseDestructorDecl(const std::string& ownerClass, bool isVirtual) {
+    auto dtor = std::make_shared<DestructorDecl>();
+    dtor->location = current().location;
+    dtor->ownerClassName = ownerClass;
+    dtor->isVirtual = isVirtual;
+    expect(TokenType::Tilde, "Expected '~' in destructor declaration");
+    const Token& nameTok = expect(TokenType::Identifier, "Expected destructor name");
+    dtor->name = "~" + nameTok.text;
+    expect(TokenType::LParen, "Expected '(' in destructor parameter list");
+    expect(TokenType::RParen, "Expected ')' in destructor parameter list");
+
+    if (check(TokenType::LBrace)) {
+        dtor->body = std::dynamic_pointer_cast<BlockStmt>(parseBlockStmt());
+    } else {
+        expect(TokenType::Semicolon, "Expected '{' or ';' after destructor declaration");
+    }
+    return dtor;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 类声明：class Name [: public Base] { ... };
+// ─────────────────────────────────────────────────────────────────────────────
+// 文法：class-decl := ('class' | 'struct') IDENT [':' 'public' IDENT] '{' member* '}' ';'
 ClassDeclPtr Parser::parseClassDecl() {
     auto decl = std::make_shared<ClassDecl>();
     decl->location = current().location;
 
-    expect(TokenType::KwClass, "Expected 'class'");
+    bool isStruct = false;
+    if (match(TokenType::KwStruct)) {
+        isStruct = true;
+        decl->currentAccess = AccessModifier::Public;
+    } else {
+        expect(TokenType::KwClass, "Expected 'class' or 'struct'");
+        decl->currentAccess = AccessModifier::Private;
+    }
+    (void)isStruct;
+
     const Token& nameToken = expect(TokenType::Identifier, "Expected class name");
     decl->name = nameToken.text;
 
@@ -440,16 +692,16 @@ ClassDeclPtr Parser::parseClassDecl() {
     if (match(TokenType::Colon)) {
         match(TokenType::KwPublic); // 简化：只支持 public 继承
         const Token& baseName = expect(TokenType::Identifier, "Expected base class name");
-        decl->baseClassName = baseName.text;
+        decl->baseClassName = baseName.text; //wangyang 这里是class decl 的基础类名称
     }
 
-    expect(TokenType::LBrace, "Expected '{' after class name");
+    expect(TokenType::LBrace, "Expected '{' after class name"); // wangyang 左括号
 
     // 解析类成员
     while (!check(TokenType::RBrace) && !isAtEnd()) {
         // 访问修饰符
         AccessModifier access = decl->currentAccess;
-        if (check(TokenType::KwPublic)) {
+        if (check(TokenType::KwPublic)) { // 判断成员的访问级别是 public 还是priviate
             advance();
             expect(TokenType::Colon, "Expected ':' after 'public'");
             decl->currentAccess = AccessModifier::Public;
@@ -471,55 +723,59 @@ ClassDeclPtr Parser::parseClassDecl() {
             continue;
         }
 
-        // 虚函数
+        // 虚函数标记
         bool isVirtual = false;
         if (check(TokenType::KwVirtual)) {
             isVirtual = true;
-        }
-
-        // 尝试判断是方法还是字段
-        // 向前看：如果看到 类型 名字 ( → 方法
-        // 否则 → 字段
-        //
-        // 试探解析（speculative parsing）：先把游标存档，空跑一遍
-        // parseType + 名字，看其后是否跟 '('，再无条件回滚到 savedPos，
-        // 由真正的 parseMethodDecl / 字段分支重新正式解析一遍。
-        // 代价是同一串 Token 被读两次，收益是不需要真正的 LL(k) 分析。
-        size_t savedPos = m_pos;
-        bool isMethod = false;
-
-        // 跳过 virtual
-        if (isVirtual) {
             advance();
         }
 
-        // 跳过类型
-        parseType();
+        // 1. 析构函数：[virtual] ~ClassName()
+        if (check(TokenType::Tilde)) {
+            auto dtor = parseDestructorDecl(decl->name, isVirtual);
+            decl->methods.push_back(dtor);
+            continue;
+        }
 
-        // 名字
+        // 2. 构造函数：ClassName(...) [: init-list]
+        // 歧义前瞻说明：
+        //   当行首标识符等于类名 (current().text == decl->name) 时，有两种可能：
+        //   a) 构造函数：Node(...) -> 类名后紧跟 '('
+        //   b) 以自身类作为类型的成员：如 Node* next; / Node& ref; / Node clone(); -> 类名后跟 '*', '&', 标识符等
+        //   注：C++ 标准禁止成员变量与类名同名。因此若类名后跟 '(' 则判定为构造函数；
+        //       否则回滚，进入步骤 3 将类名作为类型 (parseType) 解析字段或成员方法。
+        if (!isVirtual && check(TokenType::Identifier) && current().text == decl->name) {
+            size_t saved = m_pos;
+            advance();
+            if (check(TokenType::LParen)) { // 构造方法
+                m_pos = saved;
+                auto ctor = parseConstructorDecl(decl->name);
+                decl->methods.push_back(ctor);
+                continue;
+            }
+            m_pos = saved;
+        }
+
+        // 3. 尝试判断是普通方法还是字段
+        // 采用试探性前瞻：存档 -> 试探跳过类型 -> 检查是否为 Identifier + '(' (方法) -> 回滚
+        size_t savedPos = m_pos;
+        bool isMethod = false;
+
+        parseType(); // 试探性解析：仅用于前进 token 流以观察后续符号
         if (check(TokenType::Identifier)) {
             advance();
             if (check(TokenType::LParen)) {
                 isMethod = true;
             }
         }
-
-        // 恢复位置
-        m_pos = savedPos;
+        m_pos = savedPos; // 回滚到初始位置，后续在分支内部正式解析类型并创建 AST 节点
 
         if (isMethod) {
             auto method = parseMethodDecl(decl->name, access);
             method->isVirtual = isVirtual;
-            if (isVirtual) {
-                // 消费 virtual 关键字（parseMethodDecl 不会消费它）
-                // 实际上 parseMethodDecl 从 parseFunctionDecl 调用
-                // 我们需要在 parseFunctionDecl 之前消费 virtual
-            }
             decl->methods.push_back(method);
         } else {
             // 字段声明
-            if (isVirtual) advance(); // 消费 virtual（不应该出现在字段上，但容错）
-
             TypePtr fieldType = parseType();
             const Token& fieldName = expect(TokenType::Identifier, "Expected field name");
             expect(TokenType::Semicolon, "Expected ';' after field declaration");
@@ -549,7 +805,7 @@ ClassDeclPtr Parser::parseClassDecl() {
 //   ownerClass="Shape" → 消费 virtual → parseFunctionDecl("Shape")
 //   → 产出 FunctionDecl{ name="area", isVirtual=true, ownerClassName="Shape" }
 FuncDeclPtr Parser::parseMethodDecl(const std::string& ownerClass,
-                                     AccessModifier access) {
+                                     AccessModifier /*access*/) {
     bool isVirtual = false;
     if (check(TokenType::KwVirtual)) {
         advance();
@@ -584,7 +840,7 @@ FuncDeclPtr Parser::parseMethodDecl(const std::string& ownerClass,
 // 解析顺序（严格从左到右，单遍）：
 //   [virtual] → 返回类型 parseType → 函数名 → '(' 参数列表 ')'
 //   → [override] → '{' 函数体 ';' 二者择一
-FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerClass) {
+FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerClass) { // wangyang 这里在头文件上默认声明了 这两个变量
     auto decl = std::make_shared<FunctionDecl>();
     decl->location = current().location;
     decl->isVirtual = isVirtual;
@@ -596,7 +852,7 @@ FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerCl
     }
 
     // 返回类型
-    decl->returnType = parseType();
+    decl->returnType = parseType(); // wangyang 解析出返回类型
 
     // 函数名
     const Token& nameToken = expect(TokenType::Identifier, "Expected function name");
@@ -612,7 +868,7 @@ FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerCl
         decl->isOverride = true;
     }
 
-    // 函数体或分号
+    //函数体或分号
     if (check(TokenType::LBrace)) {
         decl->body = std::static_pointer_cast<BlockStmt>(parseBlockStmt());
     } else {
@@ -670,6 +926,7 @@ StmtPtr Parser::parseStatement() {
     if (check(TokenType::KwIf))      return parseIfStmt();
     if (check(TokenType::KwWhile))   return parseWhileStmt();
     if (check(TokenType::KwReturn))  return parseReturnStmt();
+    if (check(TokenType::KwDelete))  return parseDeleteStmt();
 
     // 变量声明：以类型关键字开头
     if (current().isTypeKeyword()) {
@@ -692,7 +949,7 @@ StmtPtr Parser::parseStatement() {
 
         if (check(TokenType::Identifier)) {
             // 是变量声明：回滚到存档点，让 parseType 从头正式解析类型
-            m_pos = savedPos;
+            m_pos = savedPos; // wangyang 说明 这里是MyObj value 这样的类型
             TypePtr type = parseType();
             return parseVarDeclStmt(type);
         }
@@ -701,7 +958,7 @@ StmtPtr Parser::parseStatement() {
         m_pos = savedPos;
     }
 
-    return parseExprOrAssignStmt();
+    return parseExprOrAssignStmt(); // wangyang 可能是表达式，比如 foo() 这样的函数语句
 }
 
 // ─── 代码块 ──────────────────────────────────────────────────────────────────
@@ -736,7 +993,7 @@ StmtPtr Parser::parseVarDeclStmt(TypePtr type) {
 
     ExprPtr init = nullptr;
     if (match(TokenType::Assign)) {
-        init = parseExpression();
+        init = parseExpression(); // wangyang 这里就是语句
     }
 
     expect(TokenType::Semicolon, "Expected ';' after variable declaration");
@@ -813,6 +1070,22 @@ StmtPtr Parser::parseReturnStmt() {
     expect(TokenType::Semicolon, "Expected ';' after return");
 
     auto stmt = std::make_shared<ReturnStmt>(value);
+    stmt->location = loc;
+    return stmt;
+}
+
+// ─── delete 语句 ──────────────────────────────────────────────────────────────
+StmtPtr Parser::parseDeleteStmt() {
+    auto loc = current().location;
+    expect(TokenType::KwDelete, "Expected 'delete'");
+    bool isArray = false;
+    if (match(TokenType::LBracket)) {
+        expect(TokenType::RBracket, "Expected ']' after '[' in delete[]");
+        isArray = true;
+    }
+    ExprPtr expr = parseExpression();
+    expect(TokenType::Semicolon, "Expected ';' after delete statement");
+    auto stmt = std::make_shared<DeleteStmt>(expr, isArray);
     stmt->location = loc;
     return stmt;
 }
@@ -1137,8 +1410,8 @@ ExprPtr Parser::parsePrimaryExpr() {
     }
 
     // new 表达式
-    if (check(TokenType::Identifier) && current().text == "new") {
-        advance(); // 消费 new（简化处理：把 new 当作标识符）
+    if (check(TokenType::KwNew) || (check(TokenType::Identifier) && current().text == "new")) {
+        advance(); // 消费 new
         const Token& className = expect(TokenType::Identifier, "Expected class name after 'new'");
         auto expr = std::make_shared<NewExpr>(className.text);
         expr->location = loc;
@@ -1159,6 +1432,10 @@ ExprPtr Parser::parsePrimaryExpr() {
     // 变量引用（或 template-id：foo<int>(...) —— S3 显式模板实参）
     if (check(TokenType::Identifier)) {
         std::string name = advance().text;
+        while (check(TokenType::ColonColon)) {
+            advance();
+            name += "::" + expect(TokenType::Identifier, "Expected identifier after '::'").text;
+        }
         auto expr = std::make_shared<VarExpr>(name);
         expr->location = loc;
 

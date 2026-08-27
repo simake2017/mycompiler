@@ -27,8 +27,10 @@
 测试 tests/test_tmpl_11..19；文档 docs/learn/01..06）。
 ✅ **预处理器 P0 已完成**（#include 搜索路径 / #define 对象+函数宏 / 条件编译 / #pragma once / -E；
 测试 tests/test_pp_01..04 + tests/pp/ 头文件夹具；文档 docs/learn/07）。
+✅ **主线 A 构造/析构与顶层声明已完成**（构造函数/初始化列表、虚析构/delete、全局变量、枚举、命名空间、类型别名；
+测试 tests/unit/test_decl_and_ctor.cpp + tests/test_ctor_01..02 + tests/test_decl_01；文档 docs/learn/08）。
 构建目录 build-linux/（clang++-18）。
-⏭ 后续计划见 **docs/ROADMAP.md**（主线 A 构造/析构 → B 自动链接 → C 控制流 → D 常量折叠 → E 数组/enum/namespace → F 深水区选做，
+⏭ 后续计划见 **docs/ROADMAP.md**（主线 B 自动链接 → C 控制流 → D 常量折叠 → E 数组/高级类型 → F 深水区选做，
 每条含理论点/clang 参照/任务分解/验收）。新会话接手：先读本文件与 ROADMAP，选定主线再开工。
 
 **完整提示词与子阶段定义：docs/prompt-template-deduction.md**——新会话接手时先读它。
