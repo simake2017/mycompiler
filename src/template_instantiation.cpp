@@ -153,6 +153,14 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     TemplateDeclPtr templateDecl,
     const std::vector<TypePtr>& typeArgs) {
 
+    // 0. 实参个数校验（[temp.arg.explicit]：实参与形参一一对应）
+    if (typeArgs.size() != templateDecl->typeParams.size()) {
+        throw std::runtime_error(std::format(
+            "[Instantiate Error] template '{}' expects {} type argument(s), got {}",
+            templateDecl->classTemplate->name,
+            templateDecl->typeParams.size(), typeArgs.size()));
+    }
+
     // 1. 构建类型替换映射
     //    例: { "T" → Int }
     TypeSubstitution subst;
@@ -162,9 +170,21 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     }
 
     // 2. 生成实例化后的类名
+    //    ★ wangyang: 实例名直接充当汇编符号的一部分（方法名 <类名>_<方法>），
+    //    必须剔除空格——否则 `Box<const int&>` 会产出自带空格/逗号/尖括号的
+    //    非法符号名。规则：空格丢弃，',' 与 '<'/'>'/'&'/'*' 转为下划线。
+    //    （更严格的做法是 NameMangler 全权编码实例名；此处为教学可读性折中，
+    //    形如 Box_const_int__。）
     std::string instanceName = templateDecl->classTemplate->name;
     for (auto& arg : typeArgs) {
-        instanceName += "_" + arg->toString();
+        instanceName += "_";
+        for (char c : arg->toString()) {
+            if (c == ' ') continue;                       // 空格剔除
+            if (c == ',' || c == '<' || c == '>' || c == '&' || c == '*')
+                instanceName += '_';                      // 符号字符 → '_'
+            else
+                instanceName += c;
+        }
     }
 
     std::cout << std::format("\n  ╔══ Template Instantiation ═════════════════════════╗\n");
@@ -185,7 +205,7 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     // 3. 深拷贝类声明
     auto newClass = std::make_shared<ClassDecl>();
     newClass->name = instanceName;
-    newClass->baseClassName = templateDecl->classTemplate->baseClassName;
+    newClass->baseClassNames = templateDecl->classTemplate->baseClassNames;
     newClass->location = templateDecl->location;
 
     // 4. 克隆字段（替换类型中的模板参数）
@@ -202,6 +222,7 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     // 5. 克隆方法（替换类型和函数体中的模板参数）
     //    返回类型/形参/体内局部变量声明中的 T 全部替换，表达式经 cloneExpr 深拷贝
     std::cout << "  ║ ── Method Substitution ──\n";
+    const std::string& blueprintName = templateDecl->classTemplate->name;
     for (auto& method : templateDecl->classTemplate->methods) {
         std::cout << std::format("  ║   method '{}' : ", method->name);
 
@@ -215,8 +236,21 @@ ClassDeclPtr TemplateInstantiator::instantiate(
         std::cout << std::format(" → {}\n",
             method->returnType ? method->returnType->toString() : "void");
 
-        newClass->methods.push_back(
-            cloneMethod(method, subst, instanceName));
+        auto cloned = cloneMethod(method, subst, instanceName);
+        // ★ wangyang: 构造/析构函数的名字绑定在"类名"上——蓝图里它们叫
+        // Box / ~Box，实例类叫 Box_int，必须跟着改名，否则 mangledName
+        // 会变成 Box_int_Box，与 CodeGen 发射的调用符号（类名_类名）对不上，
+        // 链接期 undefined reference。对照 clang：实例化时按新类名重建
+        // CXXConstructorDecl 的 DeclName。
+        if (std::dynamic_pointer_cast<ConstructorDecl>(cloned) &&
+            cloned->name == blueprintName) {
+            cloned->name = instanceName;
+        }
+        if (std::dynamic_pointer_cast<DestructorDecl>(cloned) &&
+            cloned->name == "~" + blueprintName) {
+            cloned->name = "~" + instanceName;
+        }
+        newClass->methods.push_back(cloned);
     }
 
     // 6. 生成 mangled name
@@ -460,7 +494,35 @@ FuncDeclPtr TemplateInstantiator::cloneMethod(
     FuncDeclPtr method, const TypeSubstitution& subst,
     const std::string& newClassName) {
 
-    auto newMethod = std::make_shared<FunctionDecl>();
+    // ★ wangyang: 按源节点的动态类型重建 —— 构造函数要克隆成
+    // ConstructorDecl（保住 initList / isDefaultCtor），析构函数要克隆成
+    // DestructorDecl（保住 isDefaultDtor）。若一律建 FunctionDecl，
+    // 实例类的语义分析会把它当普通方法：合成构造/析构检测失效、
+    // CodeGen 发射的构造调用（Class_Class）链接不到符号。
+    // 对照 clang：TreeTransform 按 Decl 的 DeclKind 分派到对应的
+    // TransformConstructorDecl / TransformDestructorDecl。
+    FuncDeclPtr newMethod;
+    if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method)) {
+        auto clonedCtor = std::make_shared<ConstructorDecl>();
+        clonedCtor->isDefaultCtor = ctor->isDefaultCtor;
+        // 初始化列表：成员名原样保留，实参表达式递归克隆
+        for (auto& init : ctor->initList) {
+            CtorInitializer clonedInit;
+            clonedInit.memberName = init.memberName;
+            clonedInit.location = init.location;
+            for (auto& arg : init.arguments) {
+                clonedInit.arguments.push_back(cloneExpr(arg, subst));
+            }
+            clonedCtor->initList.push_back(clonedInit);
+        }
+        newMethod = clonedCtor;
+    } else if (auto dtor = std::dynamic_pointer_cast<DestructorDecl>(method)) {
+        auto clonedDtor = std::make_shared<DestructorDecl>();
+        clonedDtor->isDefaultDtor = dtor->isDefaultDtor;
+        newMethod = clonedDtor;
+    } else {
+        newMethod = std::make_shared<FunctionDecl>();
+    }
     newMethod->name = method->name;
     newMethod->isVirtual = method->isVirtual;
     newMethod->isOverride = method->isOverride;
@@ -577,6 +639,14 @@ ExprPtr TemplateInstantiator::cloneExpr(
         return cloned;
     }
 
+    // 下标访问（容器封装的糖：模板体内 v[i] 也能实例化到具体类）
+    if (auto e = std::dynamic_pointer_cast<IndexExpr>(expr)) {
+        auto cloned = std::make_shared<IndexExpr>(
+            cloneExpr(e->object, subst), cloneExpr(e->index, subst));
+        cloned->location = e->location;
+        return cloned;
+    }
+
     // this
     if (auto e = std::dynamic_pointer_cast<ThisExpr>(expr)) {
         auto cloned = std::make_shared<ThisExpr>();
@@ -591,6 +661,14 @@ ExprPtr TemplateInstantiator::cloneExpr(
         for (auto& arg : e->constructorArgs) {
             cloned->constructorArgs.push_back(cloneExpr(arg, subst));
         }
+        return cloned;
+    }
+
+    // dynamic_cast：类名是字面名（非模板参数），原样克隆即可
+    if (auto e = std::dynamic_pointer_cast<DynamicCastExpr>(expr)) {
+        auto cloned = std::make_shared<DynamicCastExpr>(
+            e->targetClassName, cloneExpr(e->operand, subst));
+        cloned->location = e->location;
         return cloned;
     }
 

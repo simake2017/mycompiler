@@ -85,7 +85,7 @@ using DeclPtr        = std::shared_ptr<Declaration>;
 enum class NodeKind : uint8_t {
     // 表达式
     IntLiteral, BoolLiteral, StringLiteral, NullptrLiteral,
-    Var, Binary, Unary, Call, Member, New, This, Delete,
+    Var, Binary, Unary, Call, Member, New, This, Delete, DynamicCast, Index,
     // 语句
     ExprStmt, VarDecl, Return, If, While, Block, Assign, DeleteStmt,
     // 声明
@@ -231,6 +231,29 @@ struct MemberExpr : Expression {
           memberName(std::move(member)), isArrow(arrow) {}
 };
 
+// ─── 下标访问表达式（语法糖，降级为 at()/set() 调用）────────────────────────
+// 对应 [expr.sub]（下标运算符）；clang: ArraySubscriptExpr /
+// CXXOperatorCallExpr（operator[] 重载形式）。
+// demo：v[i]       → IndexExpr{ object=VarExpr{v}, index=VarExpr{i} }
+// 设计（教学版 operator[] 的"糖化"）：
+//   真 C++ 里 v[i] 是 operator[] 重载调用；minicc 尚无运算符重载，
+//   于是把下标语法直接降级为两个约定方法：
+//     右值位置（读）：int x = v[i];   ≡  int x = v.at(i);
+//     左值位置（写）：v[i] = x;       ≡  v.set(i, x);
+//   类只要实现 at(int)/set(int,int) 两个成员方法，就自动获得 [] 手感
+//   （Vector<T>/Map<K,V> 封装即建立在此约定上）。
+// 语义阶段：inferIndex 校验 object 是类类型且类里有 at() 方法；
+//           结果类型 = at() 的返回类型。
+// 代码生成：emitExpr(IndexExpr) → 发射 this + 实参、callq <类名>_at；
+//           emitAssign 见 AssignStmt.target 为 IndexExpr 时改发 <类名>_set。
+struct IndexExpr : Expression {
+    ExprPtr object;  // 被下标的容器对象（类类型）
+    ExprPtr index;   // 下标表达式（按约定方法签名校验）
+    IndexExpr(ExprPtr obj, ExprPtr idx)
+        : Expression(NodeKind::Index),
+          object(std::move(obj)), index(std::move(idx)) {}
+};
+
 // ─── new 表达式 ───────────────────────────────────────────────────────────────
 // 对应 [expr.new]；clang: CXXNewExpr。
 // demo：new Point()      → NewExpr{ className="Point", constructorArgs=[] }
@@ -239,8 +262,27 @@ struct MemberExpr : Expression {
 struct NewExpr : Expression {
     std::string            className;
     std::vector<ExprPtr>   constructorArgs;
+    // ★ wangyang: P3 —— new Box<int>() 的模板实参（Parser 填写，
+    // 语义阶段实例化后把 className 改写为实例名，CodeGen 只看改写后的名字）
+    std::vector<TypePtr>   templateArgs;
     explicit NewExpr(std::string cls)
         : Expression(NodeKind::New), className(std::move(cls)) {}
+};
+
+// ─── dynamic_cast 表达式 ─────────────────────────────────────────────────────
+// 对应 [expr.dynamic.cast]；clang: CXXDynamicCastExpr。
+// demo：dynamic_cast<Derived*>(p)
+//   → DynamicCastExpr{ targetClassName="Derived", operand=VarExpr{p} }
+// 目标类型必须是"类名*"（本项目只实现指针形式）；结果类型是 Derived*。
+// 运行时借助 RTTI（typeinfo 基类链）判断实际对象类型能否到达目标类型：
+// 成功 → 返回原指针；失败 → 返回 0（对应真实 C++ 的空指针）。
+// targetType 由语义阶段在检查通过后填充（目标类的指针类型）。
+struct DynamicCastExpr : Expression {
+    std::string targetClassName;  // dynamic_cast<这里>中的类名
+    ExprPtr     operand;          // 被转换的表达式
+    DynamicCastExpr(std::string cls, ExprPtr op)
+        : Expression(NodeKind::DynamicCast),
+          targetClassName(std::move(cls)), operand(std::move(op)) {}
 };
 
 // ─── this 表达式 ──────────────────────────────────────────────────────────────
@@ -520,20 +562,28 @@ using TypeAliasDeclPtr = std::shared_ptr<TypeAliasDecl>;
 // ─── 类声明 ───────────────────────────────────────────────────────────────────
 // 对应 [class]/[class.mem]；clang: CXXRecordDecl。继承见 [class.derived]。
 // demo：class Point : public Base { int x; int foo() { ... } };
-//   → ClassDecl{ name=Point, baseClassName="Base",
+//   → ClassDecl{ name=Point, baseClassNames=["Base"],
 //                fields=[ FieldInfo{x:int} ],
 //                methods=[ FunctionDecl{foo} ],
 //                classType=<Type: Class Point> }
+// 多继承：class D : public A, public B { ... } → baseClassNames=["A","B"]
+//   （[class.mi]；本项目仅支持 public 非虚继承，声明顺序即子对象摆放顺序）
 // 语义阶段把 ClassDecl 翻译成 Type 的 ClassLayout（算偏移 / 建 vtable）。
 struct ClassDecl : Declaration {
     std::string              name;
-    std::string              baseClassName;  // 基类名（空 = 无继承）
+    std::vector<std::string> baseClassNames; // 基类名列表（空 = 无继承；
+                                             // 单继承 = 1 个元素；多继承 = 声明顺序）
     std::vector<FieldInfo>   fields;         // 字段列表
     std::vector<FuncDeclPtr> methods;        // 方法列表
     TypePtr                  classType;      // 对应的 Type 对象
     AccessModifier           currentAccess = AccessModifier::Private;
 
     ClassDecl() : Declaration(NodeKind::Class) {}
+
+    // 便捷访问：第一个基类（无继承时返回空串）——兼容单继承路径的旧语义
+    std::string firstBase() const {
+        return baseClassNames.empty() ? "" : baseClassNames.front();
+    }
 };
 using ClassDeclPtr = std::shared_ptr<ClassDecl>;
 

@@ -110,6 +110,7 @@ struct FieldInfo {
     uint32_t    offset  = 0;     // 字段在对象内存中的字节偏移量
     uint32_t    size    = 0;     // 字段占用的字节数
     AccessModifier access = AccessModifier::Public;
+    std::string sourceClass;     // 字段来源的类名（空 = 自身字段；非空 = 继承自该类）
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +124,29 @@ struct VTableEntry {
     std::string mangledName;     // 经过 name mangling 的函数符号名
     uint32_t    index   = 0;     // 在 vtable 中的索引（0-based）
     bool        isOverridden = false;
+    std::string baseFunctionName; // 原始方法名（override 检测用，不受 mangledName 更新影响）
+    // 多继承 thunk 调整量（[class.mi] + Itanium ABI 2.4）：
+    // 非 0 时，本槽位不能直接填函数地址，而要填一个跳板（thunk）——
+    // 跳板先把 this 加上 vptr[-2]（offset-to-top）归顶，再跳真实函数。
+    // 仅出现在【次表的覆写槽】：基类自己的函数期待基类 this（调用方
+    // 本来就传基类指针），无需调整；覆写函数期待最派生类 this，才要调整。
+    int         thunkAdjust = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BaseSubobject：多继承下的基类子对象信息（[class.mi]）
+// ─────────────────────────────────────────────────────────────────────────────
+// class D : A, B 的对象 = A 子对象 + B 子对象 + D 自身字段，按声明顺序摆放。
+// 每个多态基类子对象自带一个 _vptr；第一个多态基类（主基类）与派生类共享
+// 主虚表（Itanium 主基类优化），其余基类各占一张次表。
+struct BaseSubobject {
+    std::string baseClassName;        // 基类名
+    uint32_t    offset = 0;           // 子对象在完整对象中的起始偏移
+    bool        hasVTable = false;    // 该子对象是否带 _vptr（基类是否多态）
+    bool        isPrimary = false;    // 是否主基类（与派生类共享主表）
+    uint32_t    vtableSegmentOffset = 0;  // 本表段在 _ZTV 符号内的字节偏移
+                                          //（vptr = &_ZTV + 段偏移 + 16）
+    std::vector<VTableEntry> entries;     // 次表槽位（仅非主多态基类有意义）
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -146,17 +170,30 @@ struct ClassLayout {
     std::string              className;
     uint32_t                 totalSize   = 0;    // 整个对象的字节大小
     bool                     hasVTable   = false; // 是否有虚函数表
-    std::vector<FieldInfo>   fields;             // 所有字段（含继承的）
-    std::vector<VTableEntry> vtableEntries;      // 虚函数表条目
+    std::vector<FieldInfo>   fields;             // 所有字段（含继承的，名字已限定）
+    std::vector<VTableEntry> vtableEntries;      // 主虚表条目（主基类槽位合并结果）
+
+    // 多继承扩展（[class.mi]）：全部基类子对象（含单继承的 0/1 个）。
+    // 单继承时 = {一个元素, offset=0, isPrimary=true}，行为退化为原实现。
+    // CodeGen 依据它：① 摆放对象内各 _vptr；② 发射次表与 thunk；
+    // ③ 上/下转型的指针调整量；④ RTTI 的基类数组（typeinfo + 偏移）。
+    std::vector<BaseSubobject> bases;
 
     // vtable 槽位 -1：RTTI type_info 指针（位于 vtable 起始地址的前一个指针位置）
     // 在汇编层面：vtable[-1] = type_info_address
     std::string              rttiMangledName;    // RTTI 符号名
 
     // 查找字段偏移量
+    // 精确匹配 + 按 sourceClass 的限定名匹配（MI 下继承字段名带 "BaseName." 前缀）
     const FieldInfo* findField(const std::string& name) const {
+        // ① 精确匹配（自身字段 或 全限定名 "A.a"）
         for (auto& f : fields) {
             if (f.name == name) return &f;
+        }
+        // ② 限定名匹配：name="a" 时，试 "A.a" / "B.a"（按 sourceClass 分组）
+        for (auto& f : fields) {
+            if (!f.sourceClass.empty() && f.name == f.sourceClass + "." + name)
+                return &f;
         }
         return nullptr;
     }
@@ -221,6 +258,14 @@ struct Type {
 
     // ── 类类型特有 ──
     ClassLayout classLayout;    // 类的内存布局（仅 Class 类型使用）
+
+    // ── 类模板实参（P3）──
+    // Box<int> 解析为 Class(name="Box", templateArgs=[int])。
+    // 语义阶段 resolveType 见到非空实参 → 触发按需实例化（见
+    // SemanticAnalyzer::getOrInstantiateClass），产出具体实例类型
+    // （如 Box_int）后整体替换本节点——即"模板 id 是半成品类型，
+    // 实例化后才成为完整类型"（[temp.inst] 的落地形态）。
+    std::vector<TypePtr> templateArgs;
 
     // ── 模板参数类型特有 ──
     std::string templateParamName; // 模板参数名（如 "T"）

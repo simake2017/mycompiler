@@ -100,6 +100,41 @@ private:
     // 栈分配指针：每新增一个局部变量先 -= 8 再登记（栈向低地址增长）
     int m_currentStackOffset = 0;
 
+    // ── 块作用域析构（RAII 的地基）──────────────────────────────────────
+    // 栈上类对象登记：名字 → { 类名, 栈偏移, 尺寸 }
+    // [class.dtor] 栈对象在作用域结束时必须自动析构——这张表记住
+    // "这个函数里哪些局部是类对象、各自在哪、多大"，块尾据此逆序发射析构
+    struct ClassLocalInfo {
+        std::string className;
+        int offset = 0;     // 相对 %rbp 的负偏移（对象起始地址）
+        uint32_t size = 0;  // 对象尺寸（alloc 与清零都用它）
+    };
+    std::unordered_map<std::string, ClassLocalInfo> m_classLocals;
+
+    // 块作用域析构栈：每进一个 BlockStmt 压一层，块内声明的类局部追加进
+    // 当前层；块结束时逆序发射本层析构后弹层（LIFO → 逆声明序析构，
+    // [class.dtor]/2）。emitBlockStmt 用空列表压栈、返回时恢复外层列表，
+    // 天然支持嵌套块——与符号表 enterScope/exitScope 同构。
+    std::vector<std::vector<std::string>> m_blockDtorStack;
+
+    // 发射"调用 C 的析构函数"：
+    //   rdi = leaq off(%rbp)（对象地址），按 vtable 有无定虚实
+    // 与 emitDelete 共享；块尾析构是它的"无 free"版（栈对象不经过 malloc）
+    void emitClassDtorCall(const std::string& className, int rbpOffset);
+
+    // 帧空间预估：扫描函数体内所有局部变量声明，把每个的占用字节数累加
+    // （类类型按布局 totalSize 对齐到 8，其余按 8 字节槽）——序言的
+    // subq $N 用这个数，保证类对象（可能 >8B）不越出预留空间。
+    // 对照真实编译器：这就是 LLVM 的 PrologEpilogInserter 帧布局计算，
+    // 此处为最朴素的"先数后减"一遍扫描。
+    uint32_t estimateFrameSize(FuncDeclPtr func);
+    uint32_t estimateBlockSize(std::shared_ptr<BlockStmt> block);
+
+    // 多继承 upcast：从 derivedClassName 转为 baseClassName 时的偏移量。
+    // 返回 0 表示主基类或无继承关系（无需调整）。
+    uint32_t getBaseOffset(const std::string& derivedClassName,
+                           const std::string& baseClassName) const;
+
     // 当前类上下文
     // （正在发射成员函数时非空）：支撑裸字段名访问
     // （方法体内写 age 等价于 this->age）与 this 解析
@@ -108,13 +143,21 @@ private:
     // 全局类类型表指针（generate 传入）：虚调用查 vtable、new 查对象大小时用
     const std::unordered_map<std::string, TypePtr>* m_classTypes = nullptr;
 
+    // 是否出现动态转型：出现则 generate() 末尾补发运行时助手 __minicc_dynamic_cast
+    bool m_needsDynamicCastHelper = false;
+
     // ── 顶层生成 ──
     // 发射一个完整函数：序言 → 形参 spill → 函数体 → 尾声
     void emitFunction(FuncDeclPtr func);
     // 为含虚函数的类发射 vtable（.data 段，符号名 _ZTV 前缀）
     void emitVTable(const std::string& className, TypePtr classType);
     // 为含虚函数的类发射 RTTI type_info（.data 段，符号名 _ZTI 前缀）
-    void emitRTTI(const std::string& className, TypePtr classType);
+    // baseClassName 非空时第三槽写入基类 typeinfo 地址（__si_class_type_info 风格）
+    void emitRTTI(const std::string& className, TypePtr classType,
+                  const std::string& baseClassName);
+    // 多继承 thunk 跳板：次表覆写项的 this 归顶跳板
+    void emitThunk(const std::string& thunkLabel, const std::string& funcLabel,
+                   int thunkAdjust);
     // 把生成期间收集的字符串字面量统一发射到 .rodata（常量池思想）
     void emitStringLiterals();
 
@@ -158,10 +201,17 @@ private:
     void emitCall(std::shared_ptr<CallExpr> expr);
     // obj.field → [addr+偏移]（字段名降级为偏移量）
     void emitMember(std::shared_ptr<MemberExpr> expr);
+    // v[i]（读值）→ 降级为 v.at(i) 成员调用
+    // （[expr.sub] 糖化：约定方法 at()，见 ast.h IndexExpr 注释）
+    void emitIndex(std::shared_ptr<IndexExpr> expr);
     // malloc + 安装 _vptr
     void emitNew(std::shared_ptr<NewExpr> expr);
     // 从栈槽加载 this
     void emitThis(std::shared_ptr<ThisExpr> expr);
+    // dynamic_cast<T*>(e)：操作数进 %rax → 装参 → 调运行时助手，结果回 %rax
+    void emitDynamicCast(std::shared_ptr<DynamicCastExpr> expr);
+    // 发射 RTTI 运行时助手 __minicc_dynamic_cast（沿 typeinfo 基类链匹配）
+    void emitDynamicCastHelper();
 
     // ── 虚函数调用（核心！） ──
     // ptr->vfunc(args) 的汇编三部曲：

@@ -66,6 +66,7 @@ enum class TokenType : uint8_t {
     KwConst,          // const
     KwDelete,         // delete
     KwDouble,         // double
+    KwDynamicCast,    // dynamic_cast
     KwElse,           // else
     KwEnum,           // enum
     KwFalse,          // false
@@ -148,6 +149,7 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"const",     TokenType::KwConst},
     {"delete",    TokenType::KwDelete},
     {"double",    TokenType::KwDouble},
+    {"dynamic_cast", TokenType::KwDynamicCast},
     {"else",      TokenType::KwElse},
     {"enum",      TokenType::KwEnum},
     {"false",     TokenType::KwFalse},

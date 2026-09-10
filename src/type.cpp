@@ -219,7 +219,16 @@ std::string Type::toString() const {
             return referencedType ? referencedType->toString() + "&&" : "?&&";
         case TypeKind::Const:
             return innerType ? "const " + innerType->toString() : "const ?";
-        case TypeKind::Class:  return name;
+        case TypeKind::Class: {
+            // P3：模板 id（Box<int>）带上实参打印——人读形态对齐源码书写
+            if (templateArgs.empty()) return name;
+            std::string s = name + "<";
+            for (size_t i = 0; i < templateArgs.size(); i++) {
+                if (i > 0) s += ", ";
+                s += templateArgs[i] ? templateArgs[i]->toString() : "?";
+            }
+            return s + ">";
+        }
         case TypeKind::TemplateParam: return templateParamName;
         case TypeKind::Auto:   return "auto";
     }
