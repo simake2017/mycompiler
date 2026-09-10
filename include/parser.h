@@ -66,6 +66,13 @@ private:
     std::vector<Token> m_tokens;   // 完整 Token 序列（含末尾哨兵 Eof）
     size_t             m_pos = 0;  // 游标：下一个待消费的 Token 下标
 
+    // ── 模板形参名作用域（对应 clang Sema 的 TemplateParameterDepth/上下文栈）──
+    // parseTemplateDecl 收集完 template<...> 形参后把【类型形参名】压入，
+    // 解析模板体（含类模板成员）期间有效，解析完弹出。
+    // parseType 据此把裸标识符区分为 TemplateParam("T") 而非 Class("T")。
+    std::vector<std::string> m_templateParamScope;
+    bool isInTemplateParamScope(const std::string& name) const;
+
     // ── Token 流操作（LL(1) 前瞻的底层设施）──
     // 前瞻（lookahead）：不移动游标，查看当前 Token，据此决定走哪条产生式分支。
     const Token& current() const;            // 查看当前 Token（不消费）

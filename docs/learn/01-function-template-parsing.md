@@ -92,3 +92,23 @@ T twice(T x) {          [Ident:T Ident:twice ( ...]
                     S2（下一阶段）：调用 twice(21)
                     遍历候选集 → P=T, A=int ⇒ T := int → 克隆蓝图 → 实例
 ```
+
+## ⑥ 补注：类模板注册表的对称化（2026-09 修订）
+
+S1 落地时函数模板拿到了名字→候选集（`m_functionTemplateCandidates`），
+而类模板只进了公共的 `m_templates` 线性 vector——`resolveType` 判定
+`Box<int>` 是否为模板、`getOrInstantiateClass` 找蓝图，都要 O(n) 扫描。
+本次修订补齐对称性：
+
+| 决策 | 做法 | 对照 clang |
+|---|---|---|
+| 类模板注册表 | `m_classTemplates: name → TemplateDeclPtr`，`processTemplateDecl` 类模板分支 `emplace` 注册（重名取先注册者，与旧线性扫描语义一致） | 类模板名经 `DeclContext::lookup` 命中 `ClassTemplateDecl` |
+| 裸名诊断 | `resolveType` 中实参为空且命中注册表 → 早期报 `'Box' is a class template; provide template arguments`（[temp.arg.explicit]） | clang：`use of class template 'Box' requires template arguments`；若启用 CTAD 则先报 `no viable constructor or deduction guide for deduction of template arguments`（见 test_tmpl_20） |
+| 不动的部分 | `m_templates` 保留有序列表（Phase 4 驱动遍历），符号表不登记蓝图 | 实例化产物是 `ClassTemplateSpecializationDecl`，与模板 Decl 分开 |
+
+```bash
+# 复现：裸类模板名错误（错误用例 20）
+./build-linux/minicc tests/tmpl/test_tmpl_20_bare_template_error.cpp  # 期望 exit≠0
+# 注册日志：Sema Phase 3 可见 "↳ class template 'Box' registered"
+./build-linux/minicc tests/tmpl/test_tmpl_01_basic.cpp | grep registered
+```

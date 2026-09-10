@@ -47,6 +47,7 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwConst:       return "const";
         case TokenType::KwDelete:      return "delete";
         case TokenType::KwDouble:      return "double";
+        case TokenType::KwDynamicCast: return "dynamic_cast";
         case TokenType::KwElse:        return "else";
         case TokenType::KwEnum:        return "enum";
         case TokenType::KwFalse:       return "false";

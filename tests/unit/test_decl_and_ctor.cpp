@@ -147,8 +147,10 @@ TEST(Constructor, InitListAndNew) {
     CodeGen cg;
     std::string asmCode = cg.generate(unit, sema.getClassTypes(), sema.getFunctions());
     EXPECT_NE(asmCode.find("callq Point_Point"), std::string::npos);
-    EXPECT_NE(asmCode.find("init field x"), std::string::npos);
-    EXPECT_NE(asmCode.find("init field y"), std::string::npos);
+    // codegen 对初始化列表字段发射中文注释行（全阶段中文日志规范）：
+    //   movq %rax, N(%rcx)    # 初始化字段 x（偏移 N）
+    EXPECT_NE(asmCode.find("初始化字段 x"), std::string::npos);
+    EXPECT_NE(asmCode.find("初始化字段 y"), std::string::npos);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

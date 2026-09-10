@@ -97,6 +97,17 @@ const Token& Parser::advance() {
     return tok;
 }
 
+// ── 模板形参作用域查询：裸名是否命中当前 template<...> 的类型形参？──
+// wangyang: 供 parseType 区分 TemplateParam("T") 与 Class("T")。
+// 线性扫描即可：形参个数极少（个位数），无需 hash（教学取舍：可讲解 > 高性能）。
+// 对应 clang: Sema 的 TemplateParameterScope 查找（ActOnIdentifier 前判定依赖名）。
+bool Parser::isInTemplateParamScope(const std::string& name) const {
+    for (const auto& p : m_templateParamScope) {
+        if (p == name) return true;
+    }
+    return false;
+}
+
 // ── 前瞻判断（LL(1) 的核心动作）：只比较类型，不消费。──
 bool Parser::check(TokenType t) const {
     return current().type == t;
@@ -185,6 +196,9 @@ bool Parser::isAtEnd() const {
 // └──────────────────────────┴─────────────────────────────┴────────────────────────────────────────────────────────┘
 // 注：const 按教学简化统一作用于整个类型（真 C++ 中 const T* 与 T* const
 // 的 const 归属不同，这里不区分顶层/底层 const）。
+/**
+ *  wangyang 这里解析出的类型只是符号，只是把类型的结构给描述出来了
+ */
 TypePtr Parser::parseType() {
     // ── Step 1: 处理 const 前缀（例如 const int, const Vec&）──
     bool isConst = false;
@@ -224,8 +238,37 @@ TypePtr Parser::parseType() {
             advance();
             name += "::" + expect(TokenType::Identifier, "Expected type name after '::'").text;
         }
-        base = Type::makeClass(name);
-        std::cout << std::format("  [parse:type] base = {} (class/tparam)\n", name);
+        // ★ wangyang: 查询模板形参作用域 —— 裸标识符若命中当前 template<...>
+        // 声明的类型形参，建成 TemplateParam 节点而非 Class 节点。
+        // 对应 clang: Sema::isIdentiferADependentTemplateName / ActOnType
+        // 在模板上下文中把 T 解析为 TemplateTypeParmType。
+        // 注意：只认不含 '::' 的裸名（std::T 这种限定名不可能是模板形参）。
+        if (name.find("::") == std::string::npos && isInTemplateParamScope(name)) {
+            base = Type::makeTemplateParam(name);
+            std::cout << std::format("  [parse:type] base = {} (template param, scope hit)\n", name);
+        }
+        else {
+            base = Type::makeClass(name);
+            std::cout << std::format("  [parse:type] base = {} (class/tparam)\n", name);
+            // ★ wangyang: 模板 id（P3）——标识符后紧跟 '<' 即模板实参表：
+            //   Box<int>、Map<int, double>，实参递归 parseType（支持嵌套
+            //   List<Box<int>>；嵌套的 '>>' 由词法保证是两个 Greater token）。
+            // 对照 clang：ParseTemplateName + ParseTemplateArgumentList，
+            // 产出 TemplateSpecializationType；此处直接把实参挂在 Class 节点
+            // 的 templateArgs 上，语义阶段再按需实例化（[temp.inst]）。
+            if (check(TokenType::Less)) {
+                advance();  // 消费 '<'
+                std::vector<TypePtr> args;
+                do {
+                    args.push_back(parseType());
+                } while (match(TokenType::Comma));
+                expect(TokenType::Greater, "Expected '>' after template arguments");
+                base->templateArgs = std::move(args);
+                std::cout << std::format(
+                    "  [parse:type] ★ template-id: {} ({} type argument(s))\n",
+                    base->toString(), base->templateArgs.size());
+            }
+        }
     }
     else {
         error("Expected type name");
@@ -541,6 +584,20 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 
     expect(TokenType::Greater, "Expected '>' after template parameters");
 
+    // ★ wangyang: 把【类型形参名】压入模板形参作用域，使模板体解析期间
+    // parseType 能把裸 T 识别为 TemplateParam 节点。
+    // 对应 clang: Parser 进入模板声明时压入 TemplateParameterDepth
+    // （Sema::TemplateParameterScope），模板体解析完（此处为函数返回前）弹出。
+    // 只压 Type 形参：NTTP 名字（如 int N 的 N）不是类型名，不能当类型用。
+    size_t scopeBase = m_templateParamScope.size();
+    for (const auto& param : decl->templateParams) {
+        if (param.kind == TemplateParamKind::Type) {
+            m_templateParamScope.push_back(param.name);
+            std::cout << std::format("  [parse:template]   ↗ push tparam '{}' into scope\n",
+                param.name);
+        }
+    }
+
     // 解析模板体：类模板 或 函数模板（S1+）
     // 分派依据：template<...> 之后的第一个 Token
     //   class                          → 类模板
@@ -583,6 +640,12 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
         }
         std::cout << ") { ... }\n";
     }
+
+    // ★ wangyang: 模板体解析完毕，弹出本层形参作用域（与上方 push 配对）。
+    // 教学取舍：不实现嵌套模板（template<template> 套娃）的逐层作用域栈深度，
+    // 但用 size 恢复而非 clear，天然支持未来嵌套。
+    m_templateParamScope.resize(scopeBase); // 这里就是弹出刚才push 进去的元素
+    std::cout << "  [parse:template]   ↘ tparam scope popped\n";
 
     return decl;
 }
@@ -668,9 +731,13 @@ DtorDeclPtr Parser::parseDestructorDecl(const std::string& ownerClass, bool isVi
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 类声明：class Name [: public Base] { ... };
+// 类声明：class Name [: public Base [, public Base2 ...]] { ... };
 // ─────────────────────────────────────────────────────────────────────────────
-// 文法：class-decl := ('class' | 'struct') IDENT [':' 'public' IDENT] '{' member* '}' ';'
+// 文法：class-decl := ('class' | 'struct') IDENT
+//                     [':' 'public' IDENT (',' 'public' IDENT)*]
+//                     '{' member* '}' ';'
+// 多继承（[class.mi]）：逗号分隔的基类列表，每个基类必须带 public 说明符；
+// 声明顺序即子对象摆放顺序（主基类优化：第一个多态基类的虚表与派生类合并）。
 ClassDeclPtr Parser::parseClassDecl() {
     auto decl = std::make_shared<ClassDecl>();
     decl->location = current().location;
@@ -688,11 +755,17 @@ ClassDeclPtr Parser::parseClassDecl() {
     const Token& nameToken = expect(TokenType::Identifier, "Expected class name");
     decl->name = nameToken.text;
 
-    // 可选的继承
+    // 可选的继承列表：`:` 后逗号分隔，每个基类前必须显式写 public。
+    // 真实语法允许省略说明符（struct 默认 public），本项目为教学明确性强制要求。
     if (match(TokenType::Colon)) {
-        match(TokenType::KwPublic); // 简化：只支持 public 继承
-        const Token& baseName = expect(TokenType::Identifier, "Expected base class name");
-        decl->baseClassName = baseName.text; //wangyang 这里是class decl 的基础类名称
+        do {
+            if (!match(TokenType::KwPublic)) {
+                error("仅支持 public 继承（每个基类前需写 'public'）");
+            }
+            const Token& baseName = expect(TokenType::Identifier,
+                                           "Expected base class name");
+            decl->baseClassNames.push_back(baseName.text);
+        } while (match(TokenType::Comma));
     }
 
     expect(TokenType::LBrace, "Expected '{' after class name"); // wangyang 左括号
@@ -943,6 +1016,22 @@ StmtPtr Parser::parseStatement() {
         // 向前看：如果是 标识符 标识符 ; 或 标识符 标识符 = → 变量声明
         size_t savedPos = m_pos;
         std::string firstName = advance().text;
+
+        // ★ wangyang: P3 模板 id 前缀 —— `Box<int> b;` / `Map<int, double> m;`
+        // 标识符后紧跟 '<' → 按深度配对跳过整段实参表。实参只可能是类型
+        // （不含比较表达式），所以 '<'/'>' 直接计深度即可；嵌套
+        // `Box<Box<int>>` 的 '>>' 词法阶段就是两个 Greater token。
+        // 对照 clang：isDeclarationSpecifier → TryAnnotateTypeToken 会把
+        // 模板 id 注解为类型 Token，教学版用"跳过 + 回滚"的试探法等价实现。
+        if (check(TokenType::Less)) {
+            int depth = 1;
+            advance();  // 消费 '<'
+            while (!isAtEnd() && depth > 0) {
+                if (check(TokenType::Less)) depth++;
+                else if (check(TokenType::Greater)) depth--;
+                advance();
+            }
+        }
 
         // 检查是否是 类名 * → 指针类型
         while (match(TokenType::Star)) {} // 跳过指针标记
@@ -1334,6 +1423,22 @@ ExprPtr Parser::parsePostfixExpr() {
             memExpr->location = loc;
             expr = memExpr;
         }
+        else if (check(TokenType::LBracket)) {
+            // 下标访问 v[i] —— operator[] 的语法糖
+            // 文法：postfix '[' expression ']'
+            // 对应真实编译器：clang 的 ParsePostfixExpressionSuffix 处理
+            // '[' 时产出 ArraySubscriptExpr（内建数组）或
+            // CXXOperatorCallExpr（类类型 → operator[] 重载）。
+            // minicc 无运算符重载 → 产出 IndexExpr，语义阶段降级为
+            // at()/set() 成员调用（见 include/ast.h IndexExpr 注释）。
+            auto loc = current().location;
+            advance();  // consume '['
+            ExprPtr indexExpr = parseExpression();
+            expect(TokenType::RBracket, "Expected ']' after subscript");
+            auto idxExpr = std::make_shared<IndexExpr>(expr, indexExpr);
+            idxExpr->location = loc;
+            expr = idxExpr;
+        }
         else {
             break;
         }
@@ -1409,12 +1514,45 @@ ExprPtr Parser::parsePrimaryExpr() {
         return expr;
     }
 
+    // dynamic_cast<T*>(expr) 表达式（[expr.dynamic.cast]）
+    // 文法：'dynamic_cast' '<' 类名 '*' '>' '(' expr ')'
+    // 简化点：只支持"类名*"目标类型（真 C++ 还允许引用形式与静态偏移转型）。
+    if (check(TokenType::KwDynamicCast)) {
+        advance(); // 消费 dynamic_cast
+        expect(TokenType::Less, "Expected '<' after 'dynamic_cast'");
+        const Token& clsTok = expect(TokenType::Identifier,
+            "Expected class name in dynamic_cast<...>");
+        expect(TokenType::Star, "dynamic_cast target must be a pointer type (T*)");
+        expect(TokenType::Greater, "Expected '>' after dynamic_cast<...>");
+        expect(TokenType::LParen, "Expected '(' after dynamic_cast<T*>");
+        ExprPtr operand = parseExpression();
+        expect(TokenType::RParen, "Expected ')' to close dynamic_cast");
+        auto expr = std::make_shared<DynamicCastExpr>(clsTok.text, std::move(operand));
+        expr->location = loc;
+        std::cout << std::format("  [parse] dynamic_cast<{}*>(operand)\n", clsTok.text);
+        return expr;
+    }
+
     // new 表达式
     if (check(TokenType::KwNew) || (check(TokenType::Identifier) && current().text == "new")) {
         advance(); // 消费 new
         const Token& className = expect(TokenType::Identifier, "Expected class name after 'new'");
         auto expr = std::make_shared<NewExpr>(className.text);
         expr->location = loc;
+
+        // ★ wangyang: P3 —— 可选模板实参表：new Box<int>()。
+        // 与 parseType 的模板 id 分支同构（递归 parseType + 逗号分隔），
+        // 实参暂挂在节点上，语义阶段实例化后改写 className 为实例名。
+        if (check(TokenType::Less)) {
+            advance();  // 消费 '<'
+            do {
+                expr->templateArgs.push_back(parseType());
+            } while (match(TokenType::Comma));
+            expect(TokenType::Greater, "Expected '>' after template arguments");
+            std::cout << std::format(
+                "  [parse:new] ★ template-id: new {}<{} argument(s)>\n",
+                expr->className, expr->templateArgs.size());
+        }
 
         // 可选的构造参数
         if (match(TokenType::LParen)) {

@@ -43,6 +43,7 @@ set(SOURCES
     src/template_instantiation.cpp
     src/template_deduction.cpp
     src/codegen.cpp
+    src/linker.cpp
     src/main.cpp
 )
 
@@ -70,6 +71,8 @@ add_executable(unit_tests
     tests/unit/test_expr_parser.cpp
     tests/unit/test_expressions.cpp
     tests/unit/test_ast_nodes.cpp
+    tests/unit/test_rtti_layout.cpp
+    tests/unit/test_typeinfo_suite.cpp
     src/preprocessor.cpp
     src/lexer.cpp
     src/parser.cpp
@@ -78,10 +81,16 @@ add_executable(unit_tests
     src/template_deduction.cpp
     src/template_instantiation.cpp
     src/type.cpp
+    src/linker.cpp
 )
 target_include_directories(unit_tests PRIVATE include)
 target_compile_options(unit_tests PRIVATE -Wall -Wextra)
 target_link_libraries(unit_tests GTest::gtest GTest::gtest_main)
+# -rdynamic：把弱符号（vtable/typeinfo）导出进动态符号表，
+# 供 test_rtti_layout.cpp 用 dladdr 把地址解析成符号名打印内存图形；
+# 老 glibc 的 dladdr 在独立 libdl 里，需显式链接
+target_link_options(unit_tests PRIVATE -rdynamic)
+target_link_libraries(unit_tests dl)
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)

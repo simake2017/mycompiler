@@ -239,8 +239,21 @@ public:
         return m_functionTemplateCandidates;
     }
 
+    // 获取类模板注册表（类模板名 → 蓝图）
+    const std::unordered_map<std::string, TemplateDeclPtr>&
+    getClassTemplates() const {
+        return m_classTemplates;
+    }
+
     // 获取符号表（供调试输出）
     SymbolTable& getSymbolTable() { return m_symbolTable; }
+
+    // ── 诊断可视化（--dump-* 系列）──
+    // dumpHierarchy: 类层次结构图（继承树 + 每个类详情框 + typeinfo 链）
+    // dumpLayout: 三层内存布局详图（对象 → vtable(含[-2][-1]) → typeinfo 链）
+    // 由 main.cpp 根据命令行 --dump-hierarchy / --dump-layout 标志调用。
+    void dumpHierarchy(const std::unordered_map<std::string, TypePtr>& classTypes);
+    void dumpLayout(const std::unordered_map<std::string, TypePtr>& classTypes);
 
 private:
     // ── 符号表管理 ──
@@ -257,9 +270,26 @@ private:
     // 对照 clang：重载集挂在 DeclContext 上，而非普通名字查找表。
     std::unordered_map<std::string, std::vector<TemplateDeclPtr>>
                                                    m_functionTemplateCandidates;
+    // 类模板注册表：类模板名 → 蓝图。与函数模板候选集对称：
+    // m_templates 保留全部蓝图的有序列表（供 main.cpp Phase 4 遍历），
+    // 此表供按名 O(1) 查找（resolveType / getOrInstantiateClass）。
+    // 对照 clang：类模板名经 DeclContext::lookup 命中 ClassTemplateDecl，
+    // 而实例化产物是 ClassTemplateSpecializationDecl，二者分开。
+    // 重名语义：emplace 不覆盖，取先注册者（与旧线性扫描取第一个命中一致）。
+    std::unordered_map<std::string, TemplateDeclPtr> m_classTemplates;
     // ── 函数模板实例化（S5）──
     TemplateInstantiator m_instantiator;
     std::unordered_map<std::string, FuncDeclPtr> m_templateInstanceCache; // mangled 名 → 实例
+
+    // ── 类模板按需实例化（P3）──
+    // resolveType 遇到带实参的类类型（Box<int>）时调用：查缓存 →
+    // instantiate() 深拷贝蓝图 → processClassDecl 完整注册实例类。
+    // 返回实例类型（如 Box_int）；已实例化过则直接返回缓存。
+    // 对照 clang：Sema::InstantiateClass（[temp.inst] 隐式实例化点）。
+    TypePtr getOrInstantiateClass(TypePtr templateIdType, SourceLocation loc);
+    // 类模板实例缓存：「模板名<实参串>」→ 实例类型。
+    // [temp.inst]/3：同一实参组合只实例化一次，重复使用直接命中。
+    std::unordered_map<std::string, TypePtr> m_classInstanceCache;
 
     // 模板调用解析（S2~S6）：返回调用结果类型，失败返回 nullptr（交回原有报错路径）
     TypePtr resolveTemplateCall(const std::string& funcName,
@@ -287,6 +317,12 @@ private:
     void processDecl(DeclPtr decl);
     // 类注册：合并继承字段/vtable → 收集成员 → 布局 → 入符号表
     void processClassDecl(ClassDeclPtr decl);
+
+    // ── 继承图打印（可观测性：编译期输出整棵类型继承树）──
+    // Pass 1 注册完成后调用：以无基类的类为根，按 baseClassName 建树，
+    // ASCII 树形打印；标注 [polymorphic] 表示该类带虚函数表（可参与
+    // 虚调用与 dynamic_cast）。
+    void printInheritanceGraph();
     // 全局变量声明处理
     void processGlobalVarDecl(GlobalVarDeclPtr decl);
     // 枚举声明处理
@@ -301,6 +337,13 @@ private:
     void analyzeFunctionBody(FuncDeclPtr decl);
     // 模板蓝图注册（只存不查体——两阶段查找第一阶段 [temp.names] 简化）
     void processTemplateDecl(TemplateDeclPtr decl);
+
+    // ── P4 内建外部函数原型 ──
+    // memcpy/realloc/malloc/free：只在语义层登记"有这些名字、几个形参、
+    // 返回什么"（无 body），Codegen 的 generate() 因 body 为空自动跳过
+    // 发射——调用点按普通函数发射 callq，链接期由 libc 提供实现。
+    // 对照 clang：Builtins::Info 表 + __builtin_* 语义内建。
+    void registerBuiltins();
 
     // ── 语句处理 ──
     // 语句分发器（dynamic_pointer_cast 逐一尝试，教学版双分派）
@@ -350,6 +393,11 @@ private:
     TypePtr inferNew(std::shared_ptr<NewExpr> expr);
     // this：仅限成员函数内，类型为属主类指针 [class.this]
     TypePtr inferThis(std::shared_ptr<ThisExpr> expr);
+    // dynamic_cast<T*>(e)：检查目标类存在且源是类指针 → 返回 T* [expr.dynamic.cast]
+    TypePtr inferDynamicCast(std::shared_ptr<DynamicCastExpr> expr);
+    // 下标 v[i]（读值）：类必须提供 at() 约定方法 → 返回 at() 的返回类型
+    // （[expr.sub] 的糖化：operator[] 重载降级为成员方法调用）
+    TypePtr inferIndex(std::shared_ptr<IndexExpr> expr);
 
     // ── 类内存布局计算 ──
     // 逐字段对齐排布，算 offset/size/totalSize（_vptr 恒在偏移 0）
@@ -358,6 +406,11 @@ private:
     void injectVTableAndRTTI(TypePtr classType);
     // 向上取整到 alignment 的倍数：alignTo(12,8)=16
     uint32_t alignTo(uint32_t offset, uint32_t alignment);
+    // 类型的对齐要求（字节），对照 clang Context.getTypeInfoInChars().Align：
+    //   标量 = min(size, 8)（int→4, double→8, bool→1, 指针/引用→8）
+    //   类类型 = 各成员 alignOf 的递归最大值（封顶 8）——与 size 无关！
+    //   例：Five{bool×5} size=5 但 align=1，绝不能用 size 当 align。
+    uint32_t alignOf(const TypePtr& type);
 
     // ── 推导辅助 ──
     std::string inferIndent() const;

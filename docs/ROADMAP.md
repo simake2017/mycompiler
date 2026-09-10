@@ -1,9 +1,8 @@
 # 后续计划（ROADMAP）
 
-> 状态快照（2026-07-30）：两条 P0 主线已完成——
-> ① 函数模板实参推导 S1~S6（推导/显式实参/不可推导上下文/实例化/重载决议）
-> ② 预处理器 P0（#include/#define/条件编译/#pragma once/-E）。
-> 测试：tests/test_tmpl_01..19 + test_pp_01..04 全绿；文档：docs/learn/01..07。
+> 状态快照（2026-09-09）：P0 主线（函数模板推导 S1~S6、预处理器）+ 主线 A（构造/析构）
+> + 主线 B（自研链接器）+ 主线 G（多继承布局，见 learn/17）已完成。
+> 回归红线 test_tmpl_01..10 全绿；mi_03/mi_04 为登记的既有失败（见主线 G 待办表）。
 > 构建：`cmake -S . -B build-linux -DCMAKE_CXX_COMPILER=clang++-18 && cmake --build build-linux -j`
 
 ---
@@ -29,7 +28,16 @@
 
 **验收/产物**：tests/test_ctor_01..NN（含初始化顺序陷阱用例、多态 delete 用例）+ docs/learn/08
 
-## 主线 B：自动链接出可执行文件（体验闭环，工程量小）
+## ✅ 主线 B：自动链接出可执行文件（已完成 2026-09-03）
+
+**实际落地方案**（摸底后调整，见 docs/learn/15）：不调用系统 `ld`，
+而是自研教学链接器 `src/linker.cpp`（~700 行），借助系统 `as` 产出 .o 后
+自行完成 读 .o → 合并节 → 布局 → 符号决议 → 重定位回填 → 写非 PIE 可执行 ELF。
+内置 `_start`（call main + exit_group syscall）与 64KB bump 版 malloc/free，
+不依赖系统 ld / crt / libc。`-S` 保留只吐汇编。
+产物：执行类用例一条命令直出二进制运行（退出码与 clang oracle 一致）+
+docs/learn/15-linker-elf-and-mini-ld.md（ROADMAP 原定编号 09，
+因 09..14 已被其他主题占用，顺延为 15）。
 
 **理论点**
 - 编译流水线全貌：.s → as → .o → ld → ELF；`_start`(crt1.o) → __libc_start_main → main
@@ -46,6 +54,38 @@
 3. 错误透传：链接失败时原样展示 ld 报错
 
 **验收/产物**：现有执行类用例（tmpl 14/15/17/19、pp 01..03）一条命令直出二进制并运行 + docs/learn/09
+
+## ✅ 主线 G：多继承布局（已完成 2026-09-09，见 docs/learn/17）
+
+**落地内容**：Itanium ABI primary base（第一个**多态**基类恒占 offset 0，
+全非多态时首个基类视作 primary）、次表 thunk 覆写（thunkAdjust = -base.offset）、
+size/align 分离（新增 `alignOf()`，类类型 align = 成员 align 递归 max）、
+嵌套类字段内联子对象（Sema 字段 `resolveType` + CodeGen `leaq` 折叠 +
+ctor 初始化列表嵌套构造调用）。
+产物：tests/mi/test_mi_01..07 + docs/learn/17-multiple-inheritance-layout.md。
+
+**登记待办（既有失败，非本轮引入）**
+
+| 项 | 现状 | 修复方向 |
+|---|---|---|
+| mi_03 | lexer 不支持 `?:` 三元运算符，COMPILE_FAIL | 主线 C 顺带做（Lexer+Parser+Sema+CodeGen 四层） |
+| mi_04 | 菱形继承 `Q_f` LINK ERROR：Sema 未拒绝重复基类，Q 继承 X 后符号未生成 | Sema 层加菱形/重复基类检测，期望报错文案见测试头注释；真正支持留给主线 F 虚继承 |
+
+**P2 架构观察（只记录，暂不动手）**
+
+1. `decl->fields` 与 `classLayout.fields` 双清单 + 末尾整体回填
+   （semantic_analyzer.cpp:891）；clang 是一次成型不可变 ASTRecordLayout
+2. 成员查找不穿透继承链：`obj->get()` 在 `D*` 上查不到 `P::get`
+3. vtable 覆写靠字符串剥/拼类名前缀匹配符号名，脆弱；宜存结构化符号引用
+4. **内置 bump malloc 不做对齐（待修）**：`new T` 的堆地址对齐保证在真实
+   世界里由 operator new 契约提供（[new.delete.single]，x86-64 恒 16B 对齐；
+   过对齐类型走 `operator new(size, align_val_t)`，clang 参照
+   CGExprCXX.cpp::EmitCXXNewExpr 的 getNewAlignment()）。minicc 的
+   linker.cpp:319 注入 malloc 是 `heapPtr + size` 裸推进——连续 new 多个
+   小对象后，后续对象首地址可能不满足类型 align，alignOf 的布局计算在堆上
+   不再成立。现有 mi 测试每例只 new 一个对象故未踩雷。修复方向：推进处
+   `size = alignUp(size,16)`（add $15 / and $-16，3 条指令），并补 mi_08
+   连续 new 两个小对象验证地址对齐
 
 ## 主线 C：控制流补全（P2，KwFor token 已留坑）
 
