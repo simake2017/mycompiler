@@ -95,11 +95,11 @@ CMake 会自动检测变更，只重编译修改过的文件。
 ### 常用命令
 
 ```bash
-# ── 基本编译（终端打印完整 6 阶段日志）──
-./build/minicc tests/test_tmpl_01_basic.cpp
+# ── 基本编译：默认直出可执行文件（内部自动 as + 自研链接器）──
+./build/minicc tests/test_tmpl_01_basic.cpp -o /tmp/demo && /tmp/demo
 
-# ── 同时输出汇编文件 ──
-./build/minicc tests/test_tmpl_01_basic.cpp -o output.s
+# ── 只输出汇编（-S 跳过链接，等价旧行为）──
+./build/minicc tests/test_tmpl_01_basic.cpp -S -o output.s
 
 # ── 额外打印 Token 流（词法分析细节）──
 ./build/minicc tests/test_tmpl_01_basic.cpp --dump-tokens

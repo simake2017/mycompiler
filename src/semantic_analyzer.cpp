@@ -49,6 +49,9 @@
 #include <iostream>
 #include <algorithm>
 #include <cassert>
+#include <map>
+#include <set>
+#include <functional>
 
 namespace minicc {
 
@@ -197,6 +200,63 @@ void SymbolTable::dumpCurrentScope() const {
 //       typeCompatible(int, const int) = true（剥顶层 const）
 //       typeCompatible(double, int)  = true  （int → double，[conv.promo]）
 //       typeCompatible(int, bool)    = false （无此隐式转换规则 → 报错）
+TypePtr SemanticAnalyzer::resolveType(TypePtr type) {
+    if (!type) return nullptr;
+    if (type->isClass()) {
+        // ── P3：模板 id（Box<int>）→ 按需实例化，产出具体实例类型 ──
+        // 判定条件：携带非空实参，且该名字是已登记的类模板蓝图
+        // （类模板注册表 m_classTemplates，O(1) 查找）。
+        // （普通已实例化类如 Box_int 实参为空，走下面的符号表替换。）
+        if (!type->templateArgs.empty()) {
+            if (m_classTemplates.count(type->name)) {
+                // 实参先递归解析（实参本身可能是模板 id：Box<Box<int>>）
+                TypePtr tid = Type::makeClass(type->name);
+                tid->templateArgs.reserve(type->templateArgs.size());
+                for (auto& arg : type->templateArgs) {
+                    tid->templateArgs.push_back(resolveType(arg));
+                }
+                return getOrInstantiateClass(tid, SourceLocation{});
+            }
+        } else if (m_classTemplates.count(type->name)) {
+            // ── 裸类模板名（[temp.arg.explicit]）──
+            // `Box b;` 不带实参：蓝图不是类型，不能当类名解析。
+            // 对照 clang：use of class template 'Box' requires template
+            // arguments。此处早期报错，而不是放行未解析类型到使用期
+            // 才报 'Class not declared'（诊断不指向根因）。
+            error(std::format("'{}' is a class template; provide template "
+                              "arguments (e.g. {}<int>)",
+                              type->name, type->name), SourceLocation{});
+        }
+        Symbol* sym = m_symbolTable.lookup(type->name);
+        // Parser 遇到 `Dog*` 这类书写名时会临时 new 一个 Class("Dog")，
+        // 其 classLayout 是空的；真正带字段/偏移/虚表布局的类型在
+        // processClassDecl 阶段已登记进符号表（kind=Type）。
+        // 只要查到的注册类型与来者不是同一个对象，就用注册版替换——
+        // 否则后面 inferMember 的 classLayout.findField 会在空布局上查无此字段。
+        if (sym && sym->kind == SymbolKind::Type && sym->type &&
+            sym->type != type) { // wangyang **** 指针不相同说明指向的不是同
+            return sym->type;
+        }
+    }
+    if (type->isPointer()) {
+        auto base = resolveType(type->pointeeType);
+        if (base != type->pointeeType) return Type::makePointer(base);
+    }
+    if (type->isReference()) {
+        auto base = resolveType(type->referencedType);
+        if (base != type->referencedType) return Type::makeLValueReference(base);
+    }
+    if (type->isRValueReference()) {
+        auto base = resolveType(type->referencedType);
+        if (base != type->referencedType) return Type::makeRValueReference(base);
+    }
+    if (type->isConst()) {
+        auto base = resolveType(type->innerType);
+        if (base != type->innerType) return Type::makeConst(base);
+    }
+    return type;
+}
+
 static bool typeCompatible(const TypePtr& expected, const TypePtr& got) {
     if (!expected || !got) return false;
     TypePtr e = expected, g = got;
@@ -232,24 +292,43 @@ std::string SemanticAnalyzer::inferIndent() const {
 // 函数体延迟到 ActOnTopLevelDecl/完整定义后再逐一分析。
 // 限制：Pass 1 单遍处理继承，基类必须先于派生类出现在源码中
 //      （不支持前向声明，[class] 教学级简化）。
+void SemanticAnalyzer::processDecl(DeclPtr decl) {
+    // wangyang 这两行是一样的，模板方法，实际是要求<> 中写明实际类型的，只是这里能推到出来，所以省略了
+    // if (auto cls = std::dynamic_pointer_cast<ClassDecl, Declaration>(decl)) {
+    // 这里如果是返回空指针，就不会往下走了
+    if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
+        processClassDecl(cls);
+    } else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
+        processTemplateDecl(tmpl);
+    } else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+        processGlobalVarDecl(gvar);
+    } else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(decl)) {
+        processEnumDecl(enm);
+    } else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
+        processNamespaceDecl(ns);
+    } else if (auto ta = std::dynamic_pointer_cast<TypeAliasDecl>(decl)) {
+        processTypeAliasDecl(ta);
+    }
+}
+
 void SemanticAnalyzer::analyze(TranslationUnit& unit) {
 
-    std::cout << "\n  ┌──── Pass 1: 注册类与模板 ────────────────────────\n";
+    // P4：libc 内建原型先登记——早于 Pass 1，全程可见
+    registerBuiltins();
+
+    std::cout << "\n  ┌──── Pass 1: 注册类、模板、全局变量与命名空间 ────\n";
     for (auto& decl : unit.declarations) {
-        if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-            processClassDecl(cls);
-        } else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
-            processTemplateDecl(tmpl);
-        }
+        processDecl(decl);
     }
+
+    // Pass 1 完成后所有类的继承关系已就绪 → 打印继承图（可观测性）
+    printInheritanceGraph();
 
     std::cout << "\n  ┌──── Pass 2: 注册所有函数（支持递归）──────────────\n";
     for (auto& decl : unit.declarations) {
         if (auto func = std::dynamic_pointer_cast<FunctionDecl>(decl)) {
             registerFunction(func);
         } else if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-            // 类方法同样注册为函数（fullName = 类名::方法名），
-            // 供方法调用解析与 CodeGen 输出。
             for (auto& method : cls->methods) {
                 registerFunction(method);
             }
@@ -269,6 +348,154 @@ void SemanticAnalyzer::analyze(TranslationUnit& unit) {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 继承图打印（可观测性设施：把 Pass 1 收集到的继承关系渲染成 ASCII 树）
+// ─────────────────────────────────────────────────────────────────────────────
+// 做什么：以"无基类的类"为根，沿 baseClassNames 向下展开，树形打印全部类。
+// 理论：类继承关系构成一片森林（多继承场景下是 DAG；本项目简化为
+//       主基类链 forest）。真编译器在 Sema 内部维护 CXXRecordDecl 的
+//       getBases() 边表，本函数用 ClassDecl.firstBase() 即时重建同样的图。
+// 标注：[polymorphic] = 带虚函数表 → 对象含 _vptr，可参与虚调用与
+//       dynamic_cast 的运行时类型检查（typeinfo 继承链由 CodeGen 发射）。
+// 输出示例（对应类 Animal/ Dog : Animal / Cat : Animal）：
+//   │ ═══ 类型继承图（inheritance graph）═══
+//   │ Animal [polymorphic]
+//   │ ├── Dog [polymorphic]
+//   │ └── Cat [polymorphic]
+void SemanticAnalyzer::printInheritanceGraph() {
+    // ① 邻接表：父类名 → 子类名列表（m_classDecls 是 Pass 1 的成果）
+    std::map<std::string, std::vector<std::string>> children;
+    std::vector<std::string> roots; // 无基类的根类
+    for (auto& [name, decl] : m_classDecls) {
+        if (decl->baseClassNames.empty()) {
+            roots.push_back(name);
+        } else {
+            for (auto& bn : decl->baseClassNames)
+                children[bn].push_back(name);
+        }
+    }
+
+    if (m_classDecls.empty()) return; // 无类可打印，静默跳过
+
+    auto isPoly = [this](const std::string& cls) {
+        auto it = m_classTypes.find(cls);
+        return it != m_classTypes.end() && it->second->classLayout.hasVTable;
+    };
+
+    std::cout << "  │ ═══ 类型继承图（inheritance graph）═══\n";
+
+    // ② 深度优先递归：prefix 记录竖线骨架，branch 决定本节点的分叉符号
+    std::function<void(const std::string&, const std::string&, const std::string&)> dfs =
+        [&](const std::string& cls, const std::string& prefix, const std::string& branch) {
+            std::cout << std::format("  │ {}{}{}{}\n", prefix, branch, cls,
+                isPoly(cls) ? " [polymorphic]" : "");
+            auto it = children.find(cls);
+            if (it == children.end()) return;
+            auto& kids = it->second;
+            std::sort(kids.begin(), kids.end()); // 排序保证输出可复现
+            for (size_t i = 0; i < kids.size(); ++i) {
+                bool last = (i + 1 == kids.size());
+                // 本层分叉符号 + 下探一层的骨架（最后子节点以下空格延续）
+                dfs(kids[i],
+                    prefix + (branch.empty() ? "" : (last ? "    " : "│   ")),
+                    last ? "└── " : "├── ");
+            }
+        };
+
+    std::sort(roots.begin(), roots.end());
+    for (auto& r : roots) {
+        dfs(r, "", "");
+    }
+}
+
+void SemanticAnalyzer::processGlobalVarDecl(GlobalVarDeclPtr decl) {
+    decl->declaredType = resolveType(decl->declaredType);
+    if (decl->initializer) {
+        TypePtr initType = inferType(decl->initializer);
+        if (decl->declaredType->isAuto()) {
+            decl->declaredType = initType;
+        } else if (!typeCompatible(decl->declaredType, initType)) {
+            error(std::format("Cannot initialize global variable '{}' of type '{}' with value of type '{}'",
+                decl->name, decl->declaredType->toString(), initType->toString()), decl->location);
+        }
+    }
+    m_globalVars.push_back(decl);
+
+    Symbol sym;
+    sym.name = decl->name;
+    sym.type = decl->declaredType;
+    sym.kind = SymbolKind::Variable;
+    sym.isLocal = false;
+    sym.definedAt = decl->location;
+    m_symbolTable.globalScope()->define(decl->name, sym);
+
+    std::cout << std::format("  [register] global variable '{}' : {}\n",
+        decl->name, decl->declaredType ? decl->declaredType->toString() : "auto");
+}
+
+void SemanticAnalyzer::processEnumDecl(EnumDeclPtr decl) {
+    m_enumDecls[decl->name] = decl;
+    TypePtr enumType = decl->underlyingType ? decl->underlyingType : Type::makeInt();
+
+    for (auto& item : decl->items) {
+        if (item.valueExpr) {
+            inferType(item.valueExpr);
+        }
+        if (!decl->isScoped) {
+            Symbol sym;
+            sym.name = item.name;
+            sym.type = enumType;
+            sym.kind = SymbolKind::Variable;
+            sym.isLocal = false;
+            sym.definedAt = item.location;
+            m_symbolTable.globalScope()->define(item.name, sym);
+        }
+        if (!decl->name.empty()) {
+            Symbol scopedSym;
+            scopedSym.name = decl->name + "::" + item.name;
+            scopedSym.type = enumType;
+            scopedSym.kind = SymbolKind::Variable;
+            scopedSym.isLocal = false;
+            scopedSym.definedAt = item.location;
+            m_symbolTable.globalScope()->define(scopedSym.name, scopedSym);
+        }
+    }
+    std::cout << std::format("  [register] enum '{}' ({} items)\n", decl->name, decl->items.size());
+}
+
+void SemanticAnalyzer::processNamespaceDecl(NamespaceDeclPtr decl) {
+    std::cout << std::format("  [namespace] enter namespace '{}'\n", decl->name);
+    for (auto& innerDecl : decl->declarations) {
+        if (auto func = std::dynamic_pointer_cast<FunctionDecl>(innerDecl)) {
+            func->name = decl->name + "::" + func->name;
+            registerFunction(func);
+        } else if (auto cls = std::dynamic_pointer_cast<ClassDecl>(innerDecl)) {
+            cls->name = decl->name + "::" + cls->name;
+            processClassDecl(cls);
+        } else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(innerDecl)) {
+            gvar->name = decl->name + "::" + gvar->name;
+            processGlobalVarDecl(gvar);
+        } else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(innerDecl)) {
+            enm->name = decl->name + "::" + enm->name;
+            processEnumDecl(enm);
+        } else {
+            processDecl(innerDecl);
+        }
+    }
+}
+
+void SemanticAnalyzer::processTypeAliasDecl(TypeAliasDeclPtr decl) {
+    Symbol sym;
+    sym.name = decl->aliasName;
+    sym.type = decl->underlyingType;
+    sym.kind = SymbolKind::Type;
+    sym.isLocal = false;
+    sym.definedAt = decl->location;
+    m_symbolTable.globalScope()->define(decl->aliasName, sym);
+    std::cout << std::format("  [register] type alias '{}' = {}\n",
+        decl->aliasName, decl->underlyingType ? decl->underlyingType->toString() : "?");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -293,50 +520,213 @@ void SemanticAnalyzer::analyze(TranslationUnit& unit) {
 //     callq *(%rdi) 按索引 0 间接跳转 → 落到 Dog_speak（动态分派）
 void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
     std::cout << std::format("  [register] class '{}' ", decl->name);
-    if (!decl->baseClassName.empty()) {
-        std::cout << std::format(": public {}", decl->baseClassName);
+    if (!decl->baseClassNames.empty()) {
+        std::cout << ": public ";
+        for (size_t i = 0; i < decl->baseClassNames.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << decl->baseClassNames[i];
+        }
     }
     std::cout << "\n";
 
     // 为本类新建类型对象：classLayout（字段/偏移/vtable）都挂在它上面，
     // 完成后注册进 m_classTypes，全局唯一（"编译期看符号"的那个符号）。
+    // 注意：必须【立刻】挂到 decl->classType 上——后面的
+    // computeClassLayout(decl) 从 decl->classType 取类型计算偏移；
+    // 若拖到函数末尾才赋值，布局会算在一个 hasVTable=false 的
+    // 临时孤儿类型上：字段偏移漏掉 _vptr、totalSize=0，
+    // CodeGen 按 0 字节 malloc，运行期写必然越界。
     TypePtr classType = Type::makeClass(decl->name);
+    decl->classType = classType;
 
-    // ── 处理继承 ──
-    if (!decl->baseClassName.empty()) {
-        auto baseIt = m_classTypes.find(decl->baseClassName);
-        if (baseIt == m_classTypes.end()) {
-            error(std::format("Base class '{}' not found", decl->baseClassName),
-                  decl->location);
+    // ── 处理继承（多继承：[class.mi] Itanium 主基类优化模型）──
+    // 策略：第一个多态基类 = 主基类（共享主表+字段无限定），
+    //       其余多态基类 = 次基类（独立次表 entries，字段带 "BaseName." 前缀）。
+    //       非多态基类的字段也带 "BaseName." 前缀（避免多基类同名冲突）。
+    std::vector<std::string> allBaseFieldNames; // 所有基类字段名（用于自身字段限定）
+    bool hasPrimaryVTable = false;
+    // 注意：本循环【不计算】子对象偏移——offset 统一由循环后的 [relocate]
+    // 阶段按 Itanium 规则摆放（primary 恒占 0，其余从 primary 尾部对齐累加）。
+    // 历史教训：曾在循环里边扫边放（currentOffset 累加），当非多态基类声明在
+    // 多态基类之前时，A 先占 0、primary P 又写死 0 → 子对象重叠（A.x 压 _vptr）；
+    // 且 primary 分支的 currentOffset 是"重置"而非累加，会把先摆的进度悄悄丢弃。
+
+    if (!decl->baseClassNames.empty()) {
+        // 保存自身字段（Parser 已将它们填入 decl->fields），继承处理中重建顺序
+        std::vector<FieldInfo> ownFields = std::move(decl->fields);
+        decl->fields.clear();
+
+        for (size_t baseIdx = 0; baseIdx < decl->baseClassNames.size(); ++baseIdx) {
+            const std::string& baseName = decl->baseClassNames[baseIdx];
+            auto baseIt = m_classTypes.find(baseName);
+            if (baseIt == m_classTypes.end()) { // wangyang 这里就是要 必须先声明base 类才可以，必须要按照顺序去初始化才可以
+                error(std::format("Base class '{}' not found", baseName), decl->location);
+            }
+            TypePtr baseType = baseIt->second;
+
+            // 收集基类字段名（用于自身字段限定）
+            for (auto& bf : baseType->classLayout.fields) {
+                std::string rawName = bf.name;
+                auto dot = rawName.find('.');
+                if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                allBaseFieldNames.push_back(rawName);
+            }
+
+            if (!hasPrimaryVTable && baseType->classLayout.hasVTable) { // wangyang 第一个有虚函数的类才算是主基类
+                // ═══ 主基类（primary base）═══
+                // 合并字段到主字段列表 + 合并 vtable 到主表
+                // 字段名不加限定前缀（保持单继承兼容）
+                for (auto& baseField : baseType->classLayout.fields) {
+                    FieldInfo fi = baseField;
+                    if (fi.sourceClass.empty()) fi.sourceClass = baseName;
+                    decl->fields.push_back(fi);
+                }
+                for (auto& baseEntry : baseType->classLayout.vtableEntries) {
+                    classType->classLayout.vtableEntries.push_back(baseEntry);
+                }
+                classType->classLayout.hasVTable = true;
+                hasPrimaryVTable = true;
+
+                BaseSubobject primarySub;
+                primarySub.baseClassName = baseName;
+                primarySub.hasVTable = true;
+                primarySub.isPrimary = true;
+                primarySub.vtableSegmentOffset = 0;
+                // offset 不在此设置：[relocate] 阶段统一置 0 并摆放其余子对象
+                classType->classLayout.bases.push_back(primarySub);
+
+                std::cout << std::format("    ↳ [primary] '{}': {} fields, {} vtable entries\n",
+                    baseName, baseType->classLayout.fields.size(),
+                    baseType->classLayout.vtableEntries.size());
+            } else if (baseType->classLayout.hasVTable) {
+                // ═══ 次基类（secondary base）═══
+                // 字段带 "BaseName." 限定前缀；vtable 条目存入独立次表 entries
+                for (auto& baseField : baseType->classLayout.fields) {
+                    FieldInfo fi = baseField;
+                    // 提取裸名（已有前缀则去掉）
+                    std::string rawName = fi.name;
+                    auto dot = rawName.find('.');
+                    if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                    fi.name = baseName + "." + rawName;
+                    fi.sourceClass = baseName;
+                    decl->fields.push_back(fi);
+                }
+
+                BaseSubobject secSub;
+                secSub.baseClassName = baseName;
+                secSub.hasVTable = true;
+                secSub.isPrimary = false;
+                // offset 由 [relocate] 阶段统一摆放
+                // 次表条目（独立于主表，覆写时设 thunkAdjust）
+                for (auto& baseEntry : baseType->classLayout.vtableEntries) { // wangyang 次基类的vtable entry 不是放到 classLayout里面的
+                    VTableEntry secEntry = baseEntry;
+                    secEntry.mangledName = baseName + "_" + (baseEntry.baseFunctionName.empty()
+                        ? std::string(baseEntry.mangledName.substr(baseEntry.mangledName.find('_') + 1))
+                        : baseEntry.baseFunctionName);
+                    secEntry.baseFunctionName = baseEntry.baseFunctionName.empty()
+                        ? baseEntry.mangledName.substr(baseEntry.mangledName.find('_') + 1)
+                        : baseEntry.baseFunctionName;
+                    secSub.entries.push_back(secEntry);
+                }
+                classType->classLayout.bases.push_back(secSub);
+
+                std::cout << std::format("    ↳ [secondary] '{}': {} fields, {} vtable entries\n",
+                    baseName, baseType->classLayout.fields.size(),
+                    secSub.entries.size());
+            } else {
+                // ═══ 非多态基类 ═══
+                // 字段带限定前缀，无 vtable 贡献
+                for (auto& baseField : baseType->classLayout.fields) {
+                    FieldInfo fi = baseField;
+                    std::string rawName = fi.name;
+                    auto dot = rawName.find('.');
+                    if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                    fi.name = baseName + "." + rawName;
+                    fi.sourceClass = baseName;
+                    decl->fields.push_back(fi);
+                }
+
+                BaseSubobject nonPolySub;
+                nonPolySub.baseClassName = baseName;
+                nonPolySub.hasVTable = false;
+                nonPolySub.isPrimary = false;
+                // offset 由 [relocate] 阶段统一摆放
+                classType->classLayout.bases.push_back(nonPolySub);
+
+                std::cout << std::format("    ↳ [non-poly] '{}': {} fields\n",
+                    baseName, baseType->classLayout.fields.size());
+            }
         }
 
-        TypePtr baseType = baseIt->second;
+        // ── 统一摆放子对象偏移（Itanium [class.mi]：primary 恒占 offset 0）──
+        // 这是子对象偏移的【唯一】计算点（上方循环只收集字段与 vtable 条目，
+        // 不写 offset，避免"边扫边放"产生两个 offset=0 的历史 bug）。
+        // Itanium 规则：primary = 第一个【多态】基类（与声明顺序无关），
+        // 恒放 offset 0；其余子对象（含声明在 primary 之前的非多态基类）
+        // 一律从 primary 子对象尾部开始依次对齐摆放。
+        // 简化声明：全部基类都非多态时，第一个基类视作 primary（占 0），
+        // 保持与 computeClassLayout 的字段放置规则一致。
+        if (!classType->classLayout.bases.empty()) {
+            size_t primaryIdx = 0;
+            bool anyPoly = false;
+            for (size_t i = 0; i < classType->classLayout.bases.size(); ++i) {
+                if (classType->classLayout.bases[i].hasVTable) {
+                    primaryIdx = i;
+                    anyPoly = true;
+                    break;
+                }
+            }
+            for (size_t i = 0; i < classType->classLayout.bases.size(); ++i)
+                classType->classLayout.bases[i].isPrimary = (i == primaryIdx);
 
-        // 继承基类的字段
-        // 注意插到字段列表【头部】——基类子对象必须排在派生类成员之前
-        // （[class.mem] 对象布局顺序），多级继承时顺序为
-        // 祖父字段…基类字段…自身字段。
-        for (auto& baseField : baseType->classLayout.fields) {
-            decl->fields.insert(decl->fields.begin(), baseField);
+            // place 恒从 primary 子对象尾部起算——无论 primary 是多态基类
+            // （真 primary）还是全非多态时的首个基类（视作 primary）。
+            // 历史 bug：这里曾用 if (anyPoly) 守卫，全非多态时 place 停在 0，
+            // 第二个基类被 alignTo(0,8)=0 放到 offset 0，与首个基类字段重叠
+            // （D : A{int x}, B{int y} → x@0 与 y@0 互踩，构造 B 覆盖 x）。
+            uint32_t place = 0;
+            {
+                auto pIt = m_classTypes.find(
+                    classType->classLayout.bases[primaryIdx].baseClassName);
+                if (pIt != m_classTypes.end())
+                    place = pIt->second->classLayout.totalSize; // primary 尾部
+            }
+            (void)anyPoly; // anyPoly 仅保留语义说明作用，不再参与 place 计算
+            for (size_t i = 0; i < classType->classLayout.bases.size(); ++i) {
+                auto& sub = classType->classLayout.bases[i];
+                if (sub.isPrimary) { sub.offset = 0; continue; }
+                sub.offset = alignTo(place, 8); // wangyang ****这里非常关键, 这里会对结束位置再做一次偏移，彻底锁死对应的位置
+                auto bIt = m_classTypes.find(sub.baseClassName);
+                place = sub.offset + (bIt != m_classTypes.end()
+                    ? bIt->second->classLayout.totalSize : 0);
+                std::cout << std::format("    ↳ [relocate] '{}' → offset {} (primary='{}' 占 0)\n",
+                    sub.baseClassName, sub.offset,
+                    classType->classLayout.bases[primaryIdx].baseClassName);
+            }
         }
 
-        // 继承基类的虚函数
-        // 整表拷贝过来：派生类的 override 将在下面"同槽位改写"，
-        // 未 override 的槽位原样保留（仍指向基类实现）。
-        for (auto& baseEntry : baseType->classLayout.vtableEntries) {
-            classType->classLayout.vtableEntries.push_back(baseEntry);
+        // 追加自身字段到最后
+        for (auto& f : ownFields) {
+            decl->fields.push_back(f);
         }
+    }
 
-        // 基类有 vtable（含虚函数）→ 派生类对象也必须带 _vptr，
-        // 即使派生类自己没声明任何新虚函数。
-        if (baseType->classLayout.hasVTable) {
-            classType->classLayout.hasVTable = true;
+    // 自身字段与基类字段同名时加限定前缀（避免覆写基类字段名）
+    size_t inheritedCount = 0;
+    for (auto& baseName : decl->baseClassNames) {
+        auto baseIt = m_classTypes.find(baseName);
+        if (baseIt != m_classTypes.end())
+            inheritedCount += baseIt->second->classLayout.fields.size();
+    }
+    for (size_t i = inheritedCount; i < decl->fields.size(); ++i) {
+        std::string rawName = decl->fields[i].name;
+        for (auto& bfn : allBaseFieldNames) {
+            if (rawName == bfn) {
+                decl->fields[i].name = decl->name + "." + rawName;
+                decl->fields[i].sourceClass = decl->name;
+                break;
+            }
         }
-
-        std::cout << std::format("    ↳ Inherited {} fields, {} vtable entries from '{}'\n",
-            baseType->classLayout.fields.size(),
-            baseType->classLayout.vtableEntries.size(),
-            decl->baseClassName);
     }
 
     // ── 注册字段到符号表 ──
@@ -344,6 +734,16 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
     // 逐一转成 FieldInfo 挂进布局表；具体 offset/size 稍后由
     // computeClassLayout 统一计算。
     for (auto& field : decl->fields) {
+        // 字段类型必须先 resolveType：Parser 造的 Class("Five") 是占位类型
+        // （classLayout 全空，totalSize=0），不换成注册版本会导致
+        //   ① sizeInBytes()=0 → 字段占 0 字节，后续字段重叠、malloc 分配不足；
+        //   ② inferMember 拿空布局查 o->f.a → "No member 'a'"。
+        // 对照 clang（RecordLayoutBuilder.cpp:1850 LayoutField）：成员布局信息
+        // 经 Context.getTypeInfoInChars(D->getType()) 一次取回 TI.Width/TI.Align，
+        // 类型永远是 complete 的注册版（ASTContext::getASTRecordLayout 按需递归
+        // 构建+缓存），不存在占位类型。
+        field.type = resolveType(field.type);
+
         FieldInfo fi;
         fi.name = field.name;
         fi.type = field.type;
@@ -354,9 +754,117 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             field.name, field.type ? field.type->toString() : "?");
     }
 
+    // ── 合成默认构造与析构（若未显式提供）──
+    bool hasExplicitCtor = false;
+    bool hasExplicitDtor = false;
+    for (auto& method : decl->methods) {
+        if (std::dynamic_pointer_cast<ConstructorDecl>(method) || method->name == decl->name) {
+            hasExplicitCtor = true;
+        }
+        if (std::dynamic_pointer_cast<DestructorDecl>(method) || method->name == "~" + decl->name) {
+            hasExplicitDtor = true;
+        }
+    }
+
+    if (!hasExplicitCtor) {
+        auto defaultCtor = std::make_shared<ConstructorDecl>();
+        defaultCtor->name = decl->name;
+        defaultCtor->ownerClassName = decl->name;
+        defaultCtor->returnType = Type::makeVoid();
+        defaultCtor->isDefaultCtor = true;
+        defaultCtor->body = std::make_shared<BlockStmt>();
+        decl->methods.push_back(defaultCtor);
+    }
+    if (!hasExplicitDtor) {
+        auto defaultDtor = std::make_shared<DestructorDecl>();
+        defaultDtor->name = "~" + decl->name;
+        defaultDtor->ownerClassName = decl->name;
+        defaultDtor->returnType = Type::makeVoid();
+        defaultDtor->isDefaultDtor = true;
+        defaultDtor->body = std::make_shared<BlockStmt>();
+        decl->methods.push_back(defaultDtor);
+    }
+
+    // ── 校验构造函数初始化列表 ──
+    for (auto& method : decl->methods) {
+        if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method)) {
+            for (auto& init : ctor->initList) {
+                bool found = false;
+                // 检查是否匹配任一基类名
+                for (auto& bn : decl->baseClassNames) {
+                    if (init.memberName == bn) { found = true; break; }
+                }
+                // 检查是否匹配自身字段（含限定名）
+                for (auto& f : decl->fields) {
+                    if (f.name == init.memberName) {
+                        // 去掉限定名再比
+                        found = true; break;
+                    }
+                    // 匹配裸名
+                    std::string rawName = f.name; // wangyang 有可能因为上面操作 成了 "a.name"这种结构
+                    auto dot = rawName.find('.');
+                    if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                    if (rawName == init.memberName) { found = true; break; }
+                }
+                if (!found) {
+                    error(std::format("Member '{}' not found in class '{}' during initializer list",
+                        init.memberName, decl->name), init.location);
+                }
+            }
+        }
+    }
+
     // ── 注册方法，检查虚函数 ──
     for (auto& method : decl->methods) {
         method->ownerClassName = decl->name;
+
+        std::string methodNameInVTable = method->name.starts_with("~") ? "dtor" : method->name;
+
+        // Override 检测：即使没有 virtual 关键字，也检查是否覆写基类虚函数
+        // （C++ 标准：覆写虚函数不需要重新声明 virtual）
+        bool overriddenInPrimary = false;
+        bool overriddenInSecondary = false;
+
+        // 查主表
+        for (auto& entry : classType->classLayout.vtableEntries) {
+            std::string entryFuncName = entry.baseFunctionName.empty()
+                ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
+                : entry.baseFunctionName;
+            if (entryFuncName == methodNameInVTable) {
+                entry.mangledName = decl->name + "_" + methodNameInVTable; // wangyang 这里会对继承的多态函数修饰
+                entry.baseFunctionName = methodNameInVTable;
+                entry.isOverridden = true;
+                overriddenInPrimary = true;
+                // 覆写基类虚函数 → 自身也变成虚函数
+                method->isVirtual = true;
+                break;
+            }
+        }
+
+        // 查次表 entries（多继承时次基类的覆写）
+        // 注意：即使主表已命中，也要查次表——同名函数可能同时存在于主表和次表
+        // （如 whoAmI 同时在 A 和 B 中），需要同时更新两处的覆写
+        for (auto& base : classType->classLayout.bases) {
+            if (base.isPrimary || !base.hasVTable) continue;
+            for (auto& entry : base.entries) {
+                std::string entryFuncName = entry.baseFunctionName.empty()
+                    ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
+                    : entry.baseFunctionName;
+                if (entryFuncName == methodNameInVTable) {
+                    entry.mangledName = decl->name + "_" + methodNameInVTable; // wangyang 这里会覆盖掉次基类  原先的名字
+                    entry.baseFunctionName = methodNameInVTable;
+                    entry.isOverridden = true;
+                    overriddenInSecondary = true; // 覆写了，那么下面就不用在写了
+                    // 覆写基类虚函数 → 自身也变成虚函数
+                    method->isVirtual = true;
+                    // thunk 调整量：-(次基类子对象偏移)
+                    entry.thunkAdjust = -(int)base.offset;
+                    std::cout << std::format("      ↳ override in secondary '{}': thunkAdjust={}\n",
+                        base.baseClassName, entry.thunkAdjust);
+                    break;
+                }
+            }
+        }
 
         std::cout << std::format("    method: {}() → {}{}\n",
             method->name,
@@ -367,31 +875,17 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
         if (method->isVirtual) {
             classType->classLayout.hasVTable = true;
 
-            // override 检测（[class.virtual]，教学简化：用 mangled 名子串
-            // 匹配同名虚函数；标准按签名+const 限定精确比对）：
-            // 命中基类槽位 → 原位改写 mangledName，索引保持不变 ——
-            // 这正是动态分派的关键：调用方统一按槽位索引间接跳转，
-            // 基类指针也能落到派生类实现。
-            bool overridden = false;
-            for (auto& entry : classType->classLayout.vtableEntries) {
-                if (entry.mangledName.find(method->name) != std::string::npos) {
-                    entry.mangledName = decl->name + "_" + method->name;
-                    entry.isOverridden = true;
-                    overridden = true;
-                    break;
-                }
-            }
-
-            if (!overridden) {
-                // 非 override → 本类新声明的虚函数：追加到 vtable 末尾，
-                // 索引 = 当前表长（之后 injectVTableAndRTTI 会统一重排）。
+            if (!overriddenInPrimary && !overriddenInSecondary) { // wangyang **既没有覆盖主虚函数 又没有覆盖次虚函数
                 VTableEntry entry;
-                entry.mangledName = decl->name + "_" + method->name;
+                entry.mangledName = decl->name + "_" + methodNameInVTable; // wangyang 这里会修饰为当前 类名_方法名
+                entry.baseFunctionName = methodNameInVTable;
                 entry.index = static_cast<uint32_t>(
                     classType->classLayout.vtableEntries.size());
-                classType->classLayout.vtableEntries.push_back(entry);
+                classType->classLayout.vtableEntries.push_back(entry); // wangyang 也就是说classLayout 只会放 主基类和自己的虚函数
             }
         }
+        std::cout << std::format("  ◀◀ END override check for '{}' (class '{}')\n",
+            method->name, decl->name);
     }
 
     // ── 计算内存布局 ──
@@ -404,7 +898,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
 
     // 写回最终字段列表：decl->fields（基类+自身，且已被 computeClassLayout
     // 填好 offset/size）整体覆盖前面逐步 push 的版本，作为布局的权威结果。
-    classType->classLayout.fields = decl->fields;
+    classType->classLayout.fields = decl->fields; // wangyang **这里时会做一个最终的回填
 
     // ── 注册到全局符号表 ──
     // 三处登记：m_classTypes（类型+布局）、m_classDecls（AST 声明）、
@@ -460,27 +954,118 @@ void SemanticAnalyzer::computeClassLayout(ClassDeclPtr decl) {
 
     uint32_t offset = 0;
     uint32_t maxAlign = 1;
+    bool hasVTable = classType->classLayout.hasVTable;
 
     // 如果有虚函数，先放 _vptr
-    if (classType->classLayout.hasVTable) {
+    if (hasVTable) {
         offset = 8;
         maxAlign = 8;
     }
 
-    for (auto& field : decl->fields) {
-        uint32_t fieldAlign = std::max(1u,
-            std::min(field.type->sizeInBytes(), 8u));
-        uint32_t fieldSize = field.type->sizeInBytes();
-
-        offset = alignTo(offset, fieldAlign);
-        field.offset = offset;
-        field.size = fieldSize;
-        offset += fieldSize;
-        maxAlign = std::max(maxAlign, fieldAlign);
+    // ── 多继承布局：子对象偏移由 processClassDecl 的 [relocate] 阶段统一摆放 ──
+    // 那里按 Itanium 规则已完成：primary（第一个多态基类，全非多态时取首个基类）
+    // 占 offset 0，其余子对象从 primary 尾部依次对齐摆放。本函数只负责：
+    //   ① 从 bases 里读出 primary 的名字（决定字段走"直接复用偏移"分支）；
+    //   ② 逐字段放置（见下）。
+    // 历史 bug：这里曾用 bi==0 判定主基类，与 processClassDecl 的
+    // "第一个多态基类"标准打架——当非多态基类声明在前时，两边选出不同的
+    // primary，导致 A.offset 与 P.offset 同为 0，A.x 压在 _vptr 上。
+    std::string currentPrimaryBase;
+    for (auto& base : classType->classLayout.bases) {
+        if (base.isPrimary) {
+            currentPrimaryBase = base.baseClassName; // 找到主基类
+            break;
+        }
     }
 
-    classType->classLayout.totalSize = alignTo(offset, maxAlign);
-    if (decl->fields.empty() && classType->classLayout.hasVTable) {
+    // ── 逐字段放置 ──
+    // 字段顺序：[主基类字段...][次基类1字段...][次基类2字段...][自身字段...]
+    // 策略：对每个次基类字段，复用基类自身的偏移（field 在基类布局中的 offset），
+    //   加上该基类在 D 中的子对象起始偏移（base.offset），即可得到在 D 中的绝对偏移。
+    //   主基类字段 offset=0（共享 _vptr），直接复用基类偏移。
+    //   自身字段从最后一个基类子对象尾部继续累加。
+    uint32_t currentFieldOffset = offset;  // 自身字段起始偏移（动态推进）
+    std::string prevSrcClass;
+
+    // 先计算自身字段的起始偏移（所有基类子对象之后）
+    if (!decl->baseClassNames.empty()) {
+        for (auto& base : classType->classLayout.bases) {
+            auto baseIt = m_classTypes.find(base.baseClassName);
+            if (baseIt != m_classTypes.end()) {
+                uint32_t end = base.offset + baseIt->second->classLayout.totalSize;
+                if (end > currentFieldOffset) currentFieldOffset = end; //wangyang 这里是一种覆盖设置 offset，前面 已经设置过每个 class 的base offset ,每个layout 已经自己对齐过了
+            }
+        }
+        currentFieldOffset = alignTo(currentFieldOffset, 8);// 最后对齐到8 就可以了
+    }
+
+    for (auto& field : decl->fields) {
+        std::string srcClass = field.sourceClass;
+        if (srcClass.empty()) srcClass = decl->name;
+
+        if (srcClass == currentPrimaryBase) {
+            // 主基类字段：直接用基类布局中的偏移（主基类 offset=0，共享 _vptr）
+            // 查找该字段在基类布局中的原始偏移
+            auto baseIt = m_classTypes.find(srcClass);
+            if (baseIt != m_classTypes.end()) {
+                std::string rawName = field.name;
+                auto dot = rawName.find('.');
+                if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                for (auto& bf : baseIt->second->classLayout.fields) {
+                    std::string bfRaw = bf.name;
+                    auto bfdot = bfRaw.find('.');
+                    if (bfdot != std::string::npos) bfRaw = bfRaw.substr(bfdot + 1);
+                    if (bfRaw == rawName) {
+                        field.offset = bf.offset; // wangyang 字段的对齐，已经在自身计算的时候对齐过了
+                        field.size = bf.size;
+                        break;
+                    }
+                }
+            }
+        } else if (srcClass != decl->name) {
+            // 次基类字段：base.offset + 基类内部偏移
+            for (auto& base : classType->classLayout.bases) {
+                if (base.baseClassName == srcClass) {
+                    auto baseIt = m_classTypes.find(srcClass);
+                    if (baseIt != m_classTypes.end()) {
+                        std::string rawName = field.name;
+                        auto dot = rawName.find('.');
+                        if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
+                        for (auto& bf : baseIt->second->classLayout.fields) {
+                            std::string bfRaw = bf.name;
+                            auto bfdot = bfRaw.find('.');
+                            if (bfdot != std::string::npos) bfRaw = bfRaw.substr(bfdot + 1);
+                            if (bfRaw == rawName) {
+                                field.offset = base.offset + bf.offset; // wangyang 这里会添加这个类的基础偏移位置
+                                field.size = bf.size;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } else {
+            // 自身字段：从基类子对象尾部继续
+            // ── size 与 align 分离（对照 clang LayoutField 的 TI.Width / TI.Align）──
+            // fieldSize = 字段占用字节数；fieldAlign = 字段的对齐要求。
+            // 关键：类类型字段的 align ≠ size——Five{bool×5} size=5 但 align=1，
+            // 若拿 size 当 align 会推出 alignTo(4,5)=9 这种非 2 幂的错位布局。
+            uint32_t fieldAlign = alignOf(field.type);   // 对齐要求（成员 align 递归 max）
+            uint32_t fieldSize = field.type->sizeInBytes(); // 实际占用字节
+            // wangyang 对齐的精髓就是 起始地址要能够 整除 filedAlign
+            currentFieldOffset = alignTo(currentFieldOffset, fieldAlign);
+            field.offset = currentFieldOffset;
+            field.size = fieldSize;
+            currentFieldOffset += fieldSize; // 加上这个字段的长度，等于当前位置
+            maxAlign = std::max(maxAlign, fieldAlign);
+        }
+    }
+
+    offset = currentFieldOffset;
+
+    classType->classLayout.totalSize = alignTo(offset, maxAlign); // wangyang 最终长度也会进行一个对齐
+    if (decl->fields.empty() && hasVTable) {
         classType->classLayout.totalSize = 8;
     }
 }
@@ -501,6 +1086,20 @@ void SemanticAnalyzer::injectVTableAndRTTI(TypePtr classType) {
     for (size_t i = 0; i < classType->classLayout.vtableEntries.size(); i++) {
         classType->classLayout.vtableEntries[i].index = static_cast<uint32_t>(i);
     }
+
+    // ── 多继承：计算次表段在 _ZTV 符号内的字节偏移 ──
+    // _ZTV 布局：[主表头 16B][主表槽位...][次表头 16B][次表槽位...]...
+    // 每段表头 = 16B（8B offset-to-top + 8B RTTI ptr）
+    // 主表段 vtableSegmentOffset = 0（vptr 直接指主表头后 16B 处）
+    uint32_t segmentOffset = 16 + static_cast<uint32_t>(
+        classType->classLayout.vtableEntries.size()) * 8;
+    for (auto& base : classType->classLayout.bases) {
+        if (base.isPrimary || !base.hasVTable) continue;
+        base.vtableSegmentOffset = segmentOffset;
+        segmentOffset += 16 + static_cast<uint32_t>(base.entries.size()) * 8;
+        std::cout << std::format("    [MI] secondary '{}' vtableSegmentOffset={}\n",
+            base.baseClassName, base.vtableSegmentOffset);
+    }
 }
 
 // 向上取整到 alignment 的倍数：alignTo(12,8)=16，alignTo(16,8)=16，
@@ -509,6 +1108,31 @@ void SemanticAnalyzer::injectVTableAndRTTI(TypePtr classType) {
 uint32_t SemanticAnalyzer::alignTo(uint32_t offset, uint32_t alignment) {
     if (alignment == 0) return offset;
     return (offset + alignment - 1) / alignment * alignment;
+}
+
+// 类型的对齐要求（字节）。对照 clang：ASTContext::getTypeInfoInChars 对
+// record 返回其 ASTRecordLayout 的 Alignment（= 成员 align 的递归最大值，
+// 见 RecordLayoutBuilder.cpp UpdateAlignment），对标量返回 TargetInfo ABI 表值。
+// 教学简化：标量 = min(size,8)（int→4 double→8 bool→1 指针/引用→8，与 ABI 表一致）；
+// 类类型 = 各成员 alignOf 递归 max（封顶 8）；无成员的空类 → align 1。
+// 绝不能拿 sizeInBytes 当 align：Five{bool×5} size=5 align=1，
+// Five{int,int} size=8 align=4——size/align 是两个独立维度。
+uint32_t SemanticAnalyzer::alignOf(const TypePtr& type) {
+    if (!type) return 1;
+    switch (type->kind) {
+        case TypeKind::Const:
+            return type->innerType ? alignOf(type->innerType) : 1;
+        case TypeKind::Class: {
+            uint32_t a = 1;
+            for (auto& f : type->classLayout.fields)
+                a = std::max(a, alignOf(f.type)); // 会找到 最大 的字段
+            return std::min(a, 8u);
+        }
+        default: {
+            uint32_t s = type->sizeInBytes();
+            return s == 0 ? 1u : std::min(s, 8u); // Void/未知类型兜底 1
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,6 +1149,11 @@ uint32_t SemanticAnalyzer::alignTo(uint32_t offset, uint32_t alignment) {
 // 示例：Animal::speak(int) → mangledName="Animal_speak"，符号表条目
 //       { name="speak", kind=Function, type=int, ownerClass="Animal" }
 void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
+    decl->returnType = resolveType(decl->returnType);
+    for (auto& param : decl->parameters) {
+        param.type = resolveType(param.type);
+    }
+
     std::string fullName = decl->ownerClassName.empty()
         ? decl->name
         : decl->ownerClassName + "::" + decl->name;
@@ -537,7 +1166,25 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
     if (decl->ownerClassName.empty()) {
         decl->mangledName = decl->name;
     } else {
-        decl->mangledName = decl->ownerClassName + "_" + decl->name;
+        if (decl->name.starts_with("~")) {
+            decl->mangledName = decl->ownerClassName + "_dtor";
+        } else {
+            decl->mangledName = decl->ownerClassName + "_" + decl->name;
+            // 构造函数/方法重载：同名多个时追加参数个数区分
+            // 检查是否已有同名方法（当前方法尚未加入 m_functions 时已经 push_back 了，
+            // 所以计数要 -1）
+            size_t sameNameCount = 0;
+            for (auto& f : m_functions) {
+                if (f.get() != decl.get()
+                    && f->ownerClassName == decl->ownerClassName
+                    && f->name == decl->name) {
+                    ++sameNameCount;
+                }
+            }
+            if (sameNameCount > 0 || decl->parameters.size() > 0) {
+                decl->mangledName += "_" + std::to_string(decl->parameters.size());
+            }
+        }
     }
 
     // 注册到符号表
@@ -560,6 +1207,72 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
         fullName, paramStr,
         decl->returnType ? decl->returnType->toString() : "void",
         decl->mangledName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 内建外部函数原型注册（P4）
+// ─────────────────────────────────────────────────────────────────────────────
+// 做什么：给 libc 的四个内存管理函数登记"语义外壳"——名字、形参表、返回类型，
+//   body 一律 nullptr。三处登记缺一不可：
+//     ① m_functionMap：调用点按裸名查找命中（与自由函数同一条路径）
+//     ② m_functions：CodeGen 的 generate() 遍历它，但 `if (func->body)`
+//        守卫自动跳过发射 → .s 里不会出现这些函数的汇编体
+//     ③ 符号表：kind=Function，任何作用域可见
+//   于是用户写 `int* p = malloc(8);`：语义检查认识名字、实参个数匹配，
+//   调用点按普通函数发射 `callq malloc`，链接期由 libc 提供真实现。
+//
+// 对照 clang：内建也走"先有声明再使用"——Builtins::Info 大表给出每个
+//   __builtin_* 的类型串（ASTContext::getBuiltinType 翻译成 C 原型），
+//   语义检查照常进行；区别只在真 clang 多数内建会在 IR 层替换为
+//   llvm.memcpy 等 intrinsic，而本项目直接调 libc 符号，链接器兜底。
+//
+// 签名取舍（教学级简化）：minicc 无 void/size_t 语义（只有 int 与指针），
+//   故一律 int* 表示"一块内存"、int 表示"字节数"：
+//     malloc(int)             → int*   （emitNew 已有 `callq malloc` 先例）
+//     free(int*)              → void
+//     memcpy(int*,int*,int)   → int*   （返回目标指针，对齐 libc 语义）
+//     realloc(int*,int)       → int*   （原块扩容/搬家，返回新块首址）
+// 对照 CodeGen::emitDelete 末尾的 `callq free`——那里是编译器自己合成的
+//   调用，这里则把同一个符号暴露给用户代码，闭环自洽。
+void SemanticAnalyzer::registerBuiltins() {
+    // 登记一个原型：构造无 body 的 FunctionDecl 并写入三处
+    auto declare = [this](const std::string& name, TypePtr ret,
+                          std::vector<TypePtr> paramTypes) {
+        auto decl = std::make_shared<FunctionDecl>();
+        decl->name = name;
+        decl->returnType = std::move(ret);
+        decl->body = nullptr;  // 纯声明 → CodeGen 跳过发射，链接期由 libc 提供
+        for (size_t i = 0; i < paramTypes.size(); i++) {
+            Parameter p;
+            p.name = "arg" + std::to_string(i);
+            p.type = std::move(paramTypes[i]);
+            decl->parameters.push_back(std::move(p));
+        }
+        decl->mangledName = name;          // 外部符号：不修饰，直接用原名
+        m_functionMap[name] = decl;
+        m_functions.push_back(decl);
+
+        Symbol sym;
+        sym.name = name;
+        sym.type = decl->returnType;
+        sym.kind = SymbolKind::Function;
+        sym.isLocal = false;
+        m_symbolTable.globalScope()->define(name, sym);  // 显式进全局作用域
+    };
+
+    TypePtr intTy  = Type::makeInt();
+    TypePtr intPtr = Type::makePointer(intTy);
+    TypePtr voidTy = Type::makeVoid();
+
+    declare("malloc", intPtr, {intTy});               // malloc(int n)
+    declare("free", voidTy, {intPtr});                // free(int* p)
+    declare("memcpy", intPtr, {intPtr, intPtr, intTy}); // memcpy(dst, src, n)
+    declare("realloc", intPtr, {intPtr, intTy});      // realloc(p, n)
+
+    std::cout << "  [builtin] ✔ registered libc prototypes: "
+                 "malloc(int)→int*, free(int*), "
+                 "memcpy(int*,int*,int)→int*, realloc(int*,int)→int*    "
+                 "[P4: no body — codegen skips, linker binds libc]\n";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -677,6 +1390,14 @@ void SemanticAnalyzer::processTemplateDecl(TemplateDeclPtr decl) {
     if (decl->isClassTemplate()) {
         std::cout << std::format("> {} (class blueprint stored, not analyzed)\n",
             decl->templateName());
+        // ── 类模板注册表（与函数模板候选集对称）──
+        // 名字→蓝图 O(1) 查找；emplace 不覆盖，重名取先注册者
+        // （与旧线性扫描 m_templates 取第一个命中的语义一致）。
+        auto [it, inserted] =
+            m_classTemplates.emplace(decl->templateName(), decl);
+        std::cout << std::format("    ↳ class template '{}' registered{}\n",
+            decl->templateName(),
+            inserted ? "" : " (duplicate name, first registration wins)");
     } else {
         // ── 函数模板（S1）──
         // 只注册蓝图，不分析函数体：模板体中的 T 是"依赖类型"，
@@ -723,6 +1444,17 @@ void SemanticAnalyzer::processStmt(StmtPtr stmt) {
         processAssignStmt(assign);
     else if (auto expr = std::dynamic_pointer_cast<ExprStmt>(stmt))
         processExprStmt(expr);
+    else if (auto del = std::dynamic_pointer_cast<DeleteStmt>(stmt))
+        processDeleteStmt(del);
+}
+
+void SemanticAnalyzer::processDeleteStmt(std::shared_ptr<DeleteStmt> stmt) {
+    TypePtr ptrType = inferType(stmt->pointerExpr);
+    if (!ptrType || !ptrType->isPointer()) {
+        error("delete operand must be a pointer", stmt->location);
+    }
+    std::cout << std::format("  [delete] delete {}{}\n",
+        stmt->isArray ? "[] " : "", ptrType->toString());
 }
 
 // 复合语句 `{ … }` → 新建块作用域（[basic.scope.block]）：
@@ -757,6 +1489,7 @@ void SemanticAnalyzer::processBlockStmt(std::shared_ptr<BlockStmt> block) {
 //   `int x = 3.14;`        → 无兼容规则 → 报 Type mismatch
 // ═════════════════════════════════════════════════════════════════════════════
 void SemanticAnalyzer::processVarDecl(std::shared_ptr<VarDeclStmt> decl) {
+    decl->declaredType = resolveType(decl->declaredType);
     TypePtr type = decl->declaredType;
 
     if (decl->initializer) {
@@ -896,11 +1629,12 @@ void SemanticAnalyzer::processReturnStmt(std::shared_ptr<ReturnStmt> stmt) {
             m_currentReturnType ? m_currentReturnType->toString() : "?");
 
         // 类型检查（含 [conv.lval] 引用剥除 / 数值提升）
-        if (retType && m_currentReturnType
-            && !typeCompatible(m_currentReturnType, retType)) {
+        TypePtr expType = resolveType(m_currentReturnType);
+        if (retType && expType
+            && !typeCompatible(expType, retType)) {
             error(std::format(
                 "Return type mismatch: expected '{}', got '{}'",
-                m_currentReturnType->toString(), retType->toString()),
+                expType->toString(), retType->toString()),
                 stmt->location);
         }
     } else {
@@ -980,6 +1714,14 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
         type = inferNew(e);
     else if (auto e = std::dynamic_pointer_cast<ThisExpr>(expr))
         type = inferThis(e);
+    else if (auto e = std::dynamic_pointer_cast<DynamicCastExpr>(expr))
+        type = inferDynamicCast(e);
+    else if (auto e = std::dynamic_pointer_cast<IndexExpr>(expr))
+        type = inferIndex(e);
+    else if (auto e = std::dynamic_pointer_cast<DeleteExpr>(expr)) {
+        inferType(e->pointerExpr);
+        type = Type::makeVoid();
+    }
 
     expr->resolvedType = type;
     return type;
@@ -1229,6 +1971,50 @@ TypePtr SemanticAnalyzer::inferCall(std::shared_ptr<CallExpr> expr) {
             t ? t->toString() : "?", isLValue ? " (lvalue)" : " (rvalue)");
     }
 
+    // ── 成员方法调用（P3 修复）：按"对象类 → 方法表"查，不走全局名字表 ──
+    // ★ wangyang: Box_int::get 与 Box_double::get 这类同名方法（模板实例、
+    // 或多类同名成员）在全局 m_functionMap 里互相覆盖（registerFunction 以
+    // 裸名作键），直接查名字表会随机命中别的类的方法，返回类型/参数全错。
+    // 对照 clang：成员调用走 UnqualifiedIdExpr 的类作用域限定查找
+    // （BuildMemberCallExpr → LookupMember），普通名字查找只是兜底。
+    // 前提：先补推导 callee 成员表达式，拿到 mem->object 的 resolvedType。
+    if (auto mem = std::dynamic_pointer_cast<MemberExpr>(expr->callee)) {
+        if (!mem->object->resolvedType) {
+            m_inferDepth++;
+            inferType(mem->object);
+            m_inferDepth--;
+        }
+        TypePtr objType = mem->object->resolvedType;
+        if (objType && objType->isPointer()) objType = objType->pointeeType;
+        if (objType && objType->isClass()) {
+            // 搜索对象类及其所有基类（BFS）的方法
+            std::vector<std::string> searchQueue = {objType->name};
+            std::set<std::string> searched;
+            while (!searchQueue.empty()) {
+                std::string clsName = searchQueue.back(); searchQueue.pop_back();
+                if (!searched.insert(clsName).second) continue;
+                auto classIt = m_classDecls.find(clsName);
+                if (classIt != m_classDecls.end()) {
+                    for (auto& method : classIt->second->methods) {
+                        if (method->name == funcName &&
+                            method->parameters.size() == argTypes.size()) {
+                            std::cout << std::format(
+                                "{}[call] {}.{}({} args) → {}    [class-scoped member call{}]\n",
+                                inferIndent(), objType->name, funcName, argTypes.size(),
+                                method->returnType ? method->returnType->toString() : "?",
+                                clsName != objType->name ? std::format(" via '{}'", clsName) : "");
+                            return method->returnType;
+                        }
+                    }
+                    // 搜基类
+                    for (auto& bn : classIt->second->baseClassNames)
+                        searchQueue.insert(searchQueue.begin(), bn);
+                }
+            }
+        }
+        // 类里没查到 → 落入下方既有路径（兼容既有行为与报错）
+    }
+
     // ── 普通函数/方法（既有路径；S6：非模板优先于模板）──
     auto it = m_functionMap.find(funcName);
     if (it != m_functionMap.end()) {
@@ -1362,6 +2148,94 @@ TypePtr SemanticAnalyzer::resolveTemplateCall(
 //   ③ analyzeFunctionBody(实例)：用具体类型检查函数体 ——
 //      这就是两阶段查找 [temp.names] 的第二阶段
 //      （第一阶段 = processTemplateDecl 只注册蓝图不查体）。
+// ─────────────────────────────────────────────────────────────────────────────
+// P3：类模板按需实例化（[temp.inst] 隐式实例化点）
+// ─────────────────────────────────────────────────────────────────────────────
+// 触发时机：类型位置（变量声明/形参/返回类型）出现 Box<int> 这类模板 id，
+// resolveType 发现"带实参的类名命中类模板蓝图"即调入本函数。
+// 三步走（对照 clang：Sema::ActOnTag → InstantiateClass → 成员延迟分析）：
+//   ① instantiate()    深拷贝蓝图 + 结构化替换 → 实例 ClassDecl（如 Box_int）
+//   ② processClassDecl 实例类按普通类走完整注册（构造/析构合成、布局、
+//                      vtable/RTTI、符号表）
+//   ③ 实例方法注册 + 函数体分析 —— 即两阶段查找的第二阶段：
+//      蓝图期无法检查的依赖类型，在实参落地后做真正的类型检查。
+// 缓存先行：先写缓存再析方法体，方法体若再引用同一实例（递归/互用）直接命中。
+TypePtr SemanticAnalyzer::getOrInstantiateClass(
+    TypePtr templateIdType, SourceLocation loc) {
+
+    // ── 缓存键：模板名 + 实参可读串，如 "Box<int>" ──
+    std::string key = templateIdType->name + "<";
+    for (size_t i = 0; i < templateIdType->templateArgs.size(); i++) {
+        if (i > 0) key += ",";
+        key += templateIdType->templateArgs[i]
+                   ? templateIdType->templateArgs[i]->toString() : "?";
+    }
+    key += ">";
+
+    auto cached = m_classInstanceCache.find(key);
+    if (cached != m_classInstanceCache.end()) {
+        std::cout << std::format(
+            "  [instantiate:class] cache hit: {} (skip re-instantiation)\n", key);
+        return cached->second;
+    }
+
+    // ── 查蓝图（类模板注册表 O(1)；重名取先注册者，emplace 不覆盖）──
+    TemplateDeclPtr blueprint;
+    if (auto it = m_classTemplates.find(templateIdType->name);
+        it != m_classTemplates.end()) {
+        blueprint = it->second;
+    }
+    if (!blueprint) {
+        error(std::format("'{}' is not a class template", templateIdType->name), loc);
+    }
+    if (blueprint->typeParams.size() != templateIdType->templateArgs.size()) {
+        error(std::format(
+            "class template '{}' expects {} type argument(s), but {} given",
+            templateIdType->name, blueprint->typeParams.size(),
+            templateIdType->templateArgs.size()), loc);
+    }
+
+    std::cout << std::format(
+        "\n  [instantiate:class] ★ on-demand instantiation: {}\n", key);
+
+    // ── ① 深拷贝蓝图 + 结构化替换 ── // wangyang **** 这里就是我一直想要的部分，对template 进行实例化解析
+    ClassDeclPtr instance =
+        m_instantiator.instantiate(blueprint, templateIdType->templateArgs);
+
+    // ── ② 实例类完整注册（与源码中手写的类一视同仁）──
+    processClassDecl(instance);
+
+    TypePtr instanceType = m_classTypes[instance->name];
+
+    // 实例类符号同时登记进全局作用域：实例化可能在某函数体分析中途触发，
+    // processClassDecl 会把符号 define 进该函数作用域——兄弟函数不可见。
+    // 全局作用域冗余登记一份，保证任何位置 lookup("Box_int") 都命中。
+    Symbol globalSym;
+    globalSym.name = instance->name;
+    globalSym.type = instanceType;
+    globalSym.kind = SymbolKind::Type;
+    globalSym.isLocal = false;
+    globalSym.definedAt = instance->location;
+    m_symbolTable.globalScope()->define(instance->name, globalSym);
+
+    // 缓存先行写入（方法体分析可能再次引用本实例——递归/互用场景）
+    m_classInstanceCache[key] = instanceType;
+
+    // ── ③ 实例方法：注册（等价 Pass 2）+ 函数体分析（等价 Pass 3）──
+    for (auto& method : instance->methods) {
+        registerFunction(method);
+    }
+    for (auto& method : instance->methods) {
+        analyzeFunctionBody(method);
+    }
+
+    std::cout << std::format(
+        "  [instantiate:class] ✔ {} ready ({} bytes, {} method(s))\n",
+        instance->name, instanceType->classLayout.totalSize,
+        instance->methods.size());
+    return instanceType;
+}
+
 FuncDeclPtr SemanticAnalyzer::getOrInstantiateFunction(
     TemplateDeclPtr tmpl, const std::vector<TypePtr>& args) {
     std::string mangled =
@@ -1474,19 +2348,134 @@ TypePtr SemanticAnalyzer::inferMember(std::shared_ptr<MemberExpr> expr) {
         expr->memberName, actualType->name), expr->location);
 }
 
+// 下标表达式 v[i]（读值形态）：
+//   [expr.sub] 的糖化——minicc 没有运算符重载，IndexExpr 在此被
+//   "语义化"为成员调用约定：容器类必须提供 at() 方法，
+//   v[i] 读值 ≡ v.at(i)（CodeGen 按此发射）。
+//   校验两件事：① object 是类类型；② 该类存在形参合法的 at() 方法。
+//   结果类型 = at() 的返回类型（Vector::at → int，Map::at → value 类型）。
+TypePtr SemanticAnalyzer::inferIndex(std::shared_ptr<IndexExpr> expr) {
+    m_inferDepth++;
+    TypePtr objType = inferType(expr->object);
+    m_inferDepth--;
+
+    if (!objType) {
+        error("Cannot subscript expression of null type", expr->location);
+    }
+
+    // 支持容器指针：p[i] ≡ (*p)[i]（与 MemberExpr 的 -> 解引用同一约定）
+    TypePtr actualType = objType;
+    if (objType->isPointer()) {
+        actualType = objType->pointeeType;
+    }
+
+    if (!actualType || !actualType->isClass()) {
+        error(std::format("Cannot apply subscript to non-class type '{}'",
+            actualType ? actualType->toString() : "?"), expr->location);
+    }
+
+    // 查约定方法 at()：必须存在且恰好接收 1 个形参
+    auto classIt = m_classDecls.find(actualType->name);
+    if (classIt == m_classDecls.end()) {
+        error(std::format("Class '{}' not declared", actualType->name),
+              expr->location);
+    }
+
+    std::shared_ptr<FunctionDecl> atMethod;  // 形参校验与结果类型共用
+    for (auto& method : classIt->second->methods) {
+        if (method->name == "at" && method->parameters.size() == 1) {
+            atMethod = method;
+            break;
+        }
+    }
+    if (!atMethod) {
+        error(std::format(
+            "Class '{}' has no at() method —— subscript requires the "
+            "at()/set() convention (see docs/learn/12)", actualType->name),
+            expr->location);
+    }
+
+    // 下标表达式推导 + 与 at() 形参类型校验
+    TypePtr idxType = inferType(expr->index);
+    if (idxType && !typeCompatible(atMethod->parameters[0].type, idxType)) {
+        error(std::format(
+            "Subscript type '{}' does not match {}.at() parameter '{}'",
+            idxType->toString(), actualType->name,
+            atMethod->parameters[0].type->toString()), expr->location);
+    }
+
+    std::cout << std::format("{}[index] {}[{}] → {}    (sugar for {}.at(i))\n",
+        inferIndent(), actualType->name,
+        idxType ? idxType->toString() : "?",
+        atMethod->returnType ? atMethod->returnType->toString() : "?",
+        actualType->name);
+
+    return atMethod->returnType;
+}
+
 // new 表达式 [expr.new]（大幅简化）：
 //   只检查类名是否已注册；返回"指向该类的指针"类型；
 //   分配字节数 = computeClassLayout 算出的 totalSize（CodeGen 据此调 malloc）。
 //   不调用构造函数（构造/析构特性尚未实现，见 ROADMAP 主线 A）。
 TypePtr SemanticAnalyzer::inferNew(std::shared_ptr<NewExpr> expr) {
+    // ★ wangyang: P3 —— new Box<int>()：先按需实例化，className 原地改写
+    // 为实例名（如 Box_int）。之后全管线（本函数查表、CodeGen::emitNew）
+    // 只认实例名，模板痕迹在语义阶段一次性抹平。
+    if (!expr->templateArgs.empty()) {
+        TypePtr tid = Type::makeClass(expr->className);
+        for (auto& arg : expr->templateArgs) {
+            tid->templateArgs.push_back(resolveType(arg));
+        }
+        TypePtr instance = getOrInstantiateClass(tid, expr->location);
+        std::cout << std::format("  [new] template-id new {} → new {} (instantiated)\n",
+            expr->className, instance->name);
+        expr->className = instance->name;
+        expr->templateArgs.clear();
+    }
+
     auto it = m_classTypes.find(expr->className);
     if (it == m_classTypes.end()) {
         error(std::format("Unknown class '{}'", expr->className), expr->location);
     }
 
-    std::cout << std::format("{}[new] {} → {}*    (size={} bytes)\n",
+    // 推导构造函数实参类型
+    std::vector<TypePtr> argTypes;
+    for (auto& arg : expr->constructorArgs) {
+        argTypes.push_back(inferType(arg));
+    }
+
+    // 查找匹配的构造函数
+    auto classIt = m_classDecls.find(expr->className);
+    if (classIt != m_classDecls.end()) {
+        bool foundMatch = false;
+        for (auto& method : classIt->second->methods) {
+            auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method);
+            if (!ctor && method->name != expr->className) continue;
+            if (method->parameters.size() == argTypes.size()) {
+                bool match = true;
+                for (size_t i = 0; i < argTypes.size(); ++i) {
+                    if (!typeCompatible(method->parameters[i].type, argTypes[i])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    foundMatch = true;
+                    break;
+                }
+            }
+        }
+        if (!foundMatch && (!argTypes.empty() || !classIt->second->methods.empty())) {
+            if (!argTypes.empty()) {
+                error(std::format("No matching constructor for class '{}' with {} arguments",
+                    expr->className, argTypes.size()), expr->location);
+            }
+        }
+    }
+
+    std::cout << std::format("{}[new] {} → {}*    (size={} bytes, args={})\n",
         inferIndent(), expr->className, expr->className,
-        it->second->classLayout.totalSize);
+        it->second->classLayout.totalSize, argTypes.size());
 
     return Type::makePointer(it->second);
 }
@@ -1511,6 +2500,78 @@ TypePtr SemanticAnalyzer::inferThis(std::shared_ptr<ThisExpr>) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// dynamic_cast<T*>(expr)：运行时类型检查转型 [expr.dynamic.cast]
+// ─────────────────────────────────────────────────────────────────────────────
+// 检查规则（对应真 C++ 的子集——只支持"类指针 → 类指针"）：
+//   1. 目标类型必须是已声明的类名；
+//   2. 源表达式必须是"指向类的指针"（如 Base*）；
+//   3. 编译期静态检查：源类与目标类必须存在继承关联
+//      （目标 ⊆ 源的祖先链，或源 ⊆ 目标的祖先链），否则 clang 直接报错
+//      "cannot cast 'A *' to 'B *' via dynamic_cast"；
+//   4. 成败取决于运行时实际类型，编译期不裁决——这正是 dynamic_cast 与
+//      static_cast 的本质区别（static_cast 完全由静态类型推导）。
+// 结果类型：T*（指针类型）。
+TypePtr SemanticAnalyzer::inferDynamicCast(std::shared_ptr<DynamicCastExpr> expr) {
+    // 1. 目标类必须已声明
+    auto targetIt = m_classTypes.find(expr->targetClassName);
+    if (targetIt == m_classTypes.end()) {
+        error(std::format("Unknown class '{}' in dynamic_cast", expr->targetClassName),
+            expr->location);
+    }
+
+    // 2. 源表达式必须是"指向类的指针"
+    TypePtr srcType = inferType(expr->operand);
+    if (!srcType || !srcType->isPointer()
+        || !srcType->pointeeType || !srcType->pointeeType->isClass()) {
+        error("dynamic_cast operand must be a pointer to a class",
+            expr->location);
+    }
+    std::string srcClass = srcType->pointeeType->name;
+
+    // 3. 静态可达性检查：真 C++ 只要求两类"同属一个继承体系"
+    //    （[expr.dynamic.cast]：源与目标须关联，兄弟类互转也合法，
+    //    成败交由运行时的实际类型裁决）。因此这里的编译期判据是：
+    //    存在公共祖先（含自身等同：a == b）。
+    //    hasCommonAncestor(a, b)：收集 a 的祖先集，沿 b 链上溯查找交集。
+    auto hasCommonAncestor = [this](const std::string& a, const std::string& b) {
+        // BFS 收集 a 的全部祖先（遍历所有 baseClassNames，不再只走 firstBase）
+        std::set<std::string> anc;
+        std::vector<std::string> work = {a};
+        while (!work.empty()) {
+            std::string cur = work.back(); work.pop_back();
+            if (!anc.insert(cur).second) continue;  // 已访问
+            auto declIt = m_classDecls.find(cur);
+            if (declIt != m_classDecls.end()) {
+                for (auto& bn : declIt->second->baseClassNames)
+                    work.push_back(bn);
+            }
+        }
+        // BFS 检查 b 的祖先是否有交集
+        work.push_back(b);
+        std::set<std::string> visited;
+        while (!work.empty()) {
+            std::string cur = work.back(); work.pop_back();
+            if (!visited.insert(cur).second) continue;
+            if (anc.count(cur)) return true;
+            auto declIt = m_classDecls.find(cur);
+            if (declIt != m_classDecls.end()) {
+                for (auto& bn : declIt->second->baseClassNames)
+                    work.push_back(bn);
+            }
+        }
+        return false;
+    };
+    if (!hasCommonAncestor(expr->targetClassName, srcClass)) {
+        error(std::format("Cannot dynamic_cast '{}*' to '{}*': unrelated class types",
+            srcClass, expr->targetClassName), expr->location);
+    }
+
+    std::cout << std::format("{}[dynamic_cast] {}* → {}*    (runtime RTTI check)\n",
+        inferIndent(), srcClass, expr->targetClassName);
+    return Type::makePointer(targetIt->second);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 错误处理
 // ─────────────────────────────────────────────────────────────────────────────
 // 统一错误出口：携带源码位置（行/列）抛出异常，由 main() 捕获打印。
@@ -1519,6 +2580,374 @@ TypePtr SemanticAnalyzer::inferThis(std::shared_ptr<ThisExpr>) {
 [[noreturn]] void SemanticAnalyzer::error(const std::string& msg, SourceLocation loc) {
     throw std::runtime_error(
         std::format("[Semantic Error] {}: {}", loc.toString(), msg));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 诊断可视化：--dump-hierarchy / --dump-layout
+// ═════════════════════════════════════════════════════════════════════════════
+// 由 main.cpp 根据命令行标志调用。正常编译路径不受影响。
+//
+// typeinfo 形态判断规则（Itanium ABI 三种形态）：
+//   bases.empty()       → 'C' (__class_type_info,     无基类, 链终点)
+//   bases.size() == 1   → 'S' (__si_class_type_info,  单继承, base 指针)
+//   bases.size() > 1    → 'V' (__vmi_class_type_info, 多继承, base 数组)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static char typeinfoForm(const ClassLayout& layout) {
+    if (layout.bases.empty()) return 'C';
+    if (layout.bases.size() == 1) return 'S';
+    return 'V';
+}
+
+static const char* typeinfoName(char form) {
+    switch (form) {
+        case 'C': return "__class_type_info";
+        case 'S': return "__si_class_type_info";
+        case 'V': return "__vmi_class_type_info";
+        default:  return "?";
+    }
+}
+
+// 递归打印 typeinfo 链：当前类 → base → base.base → ...
+static void printRTTIChain(
+    const std::string& className,
+    const std::unordered_map<std::string, TypePtr>& classTypes,
+    const std::string& indent,
+    std::set<std::string>& visited)
+{
+    std::string mangled = std::format("_ZTI{}{}", className.length(), className);
+
+    if (visited.count(className)) {
+        std::cout << std::format("{}{} → (已访问，跳过)\n", indent, mangled);
+        return;
+    }
+    visited.insert(className);
+
+    auto it = classTypes.find(className);
+    if (it == classTypes.end()) {
+        std::cout << std::format("{}{} → (未知类)\n", indent, mangled);
+        return;
+    }
+
+    auto& layout = it->second->classLayout;
+    char form = typeinfoForm(layout);
+
+    std::cout << std::format("{}{} ['{}' {}]", indent, mangled, form, typeinfoName(form));
+
+    if (layout.bases.empty()) {
+        std::cout << " → 终止\n";
+        return;
+    }
+
+    if (layout.bases.size() == 1) {
+        auto& base = layout.bases[0];
+        std::cout << std::format(" ──base──→\n");
+        printRTTIChain(base.baseClassName, classTypes, indent, visited);
+    } else {
+        std::cout << std::format(" (base_count={})\n", layout.bases.size());
+        for (size_t i = 0; i < layout.bases.size(); ++i) {
+            auto& base = layout.bases[i];
+            bool last = (i + 1 == layout.bases.size());
+            std::string branch = last ? "└── " : "├── ";
+            std::string childIndent = indent + (last ? "    " : "│   ");
+            std::cout << std::format("{}{}bases[{}] @offset={}: ",
+                indent, branch, i, base.offset);
+            printRTTIChain(base.baseClassName, classTypes, childIndent, visited);
+        }
+    }
+}
+
+void SemanticAnalyzer::dumpHierarchy(
+    const std::unordered_map<std::string, TypePtr>& classTypes)
+{
+    if (classTypes.empty()) return;
+
+    std::cout << "\n";
+    std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  类层次结构图 (Class Hierarchy Diagram)                         ║\n";
+    std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
+
+    // ── ① 继承树 ──
+    std::cout << "\n  ┌─ 继承树 (Inheritance Tree) ──────────────────────────────────\n";
+
+    std::map<std::string, std::vector<std::string>> children;
+    std::vector<std::string> roots;
+    for (auto& [name, type] : classTypes) {
+        if (type->classLayout.bases.empty()) {
+            roots.push_back(name);
+        } else {
+            for (auto& base : type->classLayout.bases)
+                children[base.baseClassName].push_back(name);
+        }
+    }
+
+    auto isPoly = [](const TypePtr& t) { return t->classLayout.hasVTable; };
+    auto getSize = [](const TypePtr& t) { return t->classLayout.totalSize; };
+
+    std::set<std::string> treeVisited;
+    std::function<void(const std::string&, const std::string&, const std::string&)> dfs =
+        [&](const std::string& cls, const std::string& prefix, const std::string& branch) {
+            auto it = classTypes.find(cls);
+            if (it == classTypes.end()) return;
+            auto& t = it->second;
+            bool dup = !treeVisited.insert(cls).second;
+            if (dup) {
+                std::cout << std::format("  │ {}{}{}  [{}{}B]  ↑ (已展开)\n",
+                    prefix, branch, cls,
+                    isPoly(t) ? "polymorphic, " : "",
+                    getSize(t));
+                return;
+            }
+            std::cout << std::format("  │ {}{}{}  [{}{}B]\n",
+                prefix, branch, cls,
+                isPoly(t) ? "polymorphic, " : "",
+                getSize(t));
+            auto ci = children.find(cls);
+            if (ci == children.end()) return;
+            auto& kids = ci->second;
+            std::sort(kids.begin(), kids.end());
+            for (size_t i = 0; i < kids.size(); ++i) {
+                bool last = (i + 1 == kids.size());
+                dfs(kids[i],
+                    prefix + (branch.empty() ? "" : (last ? "    " : "│   ")),
+                    last ? "└── " : "├── ");
+            }
+        };
+
+    std::sort(roots.begin(), roots.end());
+    for (auto& r : roots) {
+        dfs(r, "", "");
+    }
+    std::cout << "  └───────────────────────────────────────────────────────────────\n";
+
+    // ── ② 每个类的详情框 ──
+    // 按类名字母顺序打印（确保每个类只打印一次）
+    std::vector<std::string> ordered;
+    for (auto& [name, type] : classTypes) {
+        ordered.push_back(name);
+    }
+    std::sort(ordered.begin(), ordered.end());
+
+    for (auto& name : ordered) {
+        auto it = classTypes.find(name);
+        if (it == classTypes.end()) continue;
+        auto& layout = it->second->classLayout;
+        char form = typeinfoForm(layout);
+
+        std::cout << std::format("\n  ┌─ {} ─────────────────────────────────────────────────\n", name);
+
+        // typeinfo 形态
+        std::cout << std::format("  │  typeinfo : {} ['{}'", typeinfoName(form), form);
+        if (form == 'C') std::cout << " 无基类";
+        else if (form == 'S') std::cout << " 单继承";
+        else if (form == 'V') std::cout << " 多继承";
+        std::cout << "]\n";
+
+        // size
+        std::cout << std::format("  │  size     : {} bytes\n", layout.totalSize);
+
+        // 基类
+        if (!layout.bases.empty()) {
+            for (auto& base : layout.bases) {
+                std::cout << std::format("  │  基类     : {} ({}{}, offset={})\n",
+                    base.baseClassName,
+                    base.isPrimary ? "主基类" : "次基类",
+                    base.hasVTable ? ", 多态" : "",
+                    base.offset);
+            }
+        }
+
+        // 字段（区分继承 vs 自有）
+        if (!layout.fields.empty()) {
+            bool hasInherited = false, hasOwn = false;
+            for (auto& f : layout.fields) {
+                if (f.sourceClass.empty() || f.sourceClass == name) hasOwn = true;
+                else hasInherited = true;
+            }
+            if (hasInherited) {
+                std::cout << "  │  继承字段 :\n";
+                for (auto& f : layout.fields) {
+                    if (!f.sourceClass.empty() && f.sourceClass != name) {
+                        std::cout << std::format("  │    +{:<4} {:<12} : {} ({})  ← {}\n",
+                            f.offset, f.name,
+                            f.type ? f.type->toString() : "?",
+                            f.size, f.sourceClass);
+                    }
+                }
+            }
+            if (hasOwn) {
+                std::cout << "  │  自有字段 :\n";
+                for (auto& f : layout.fields) {
+                    if (f.sourceClass.empty() || f.sourceClass == name) {
+                        std::cout << std::format("  │    +{:<4} {:<12} : {} ({})\n",
+                            f.offset, f.name,
+                            f.type ? f.type->toString() : "?",
+                            f.size);
+                    }
+                }
+            }
+        }
+
+        // 虚函数
+        if (layout.hasVTable && !layout.vtableEntries.empty()) {
+            std::cout << "  │  虚函数   :\n";
+            for (auto& entry : layout.vtableEntries) {
+                std::cout << std::format("  │    [{}] {} {}",
+                    entry.index, entry.mangledName,
+                    entry.isOverridden ? "(override)" : "");
+                if (entry.thunkAdjust != 0)
+                    std::cout << std::format("  thunk={}", entry.thunkAdjust);
+                std::cout << "\n";
+            }
+            std::cout << std::format("  │  RTTI     : {}\n", layout.rttiMangledName);
+        }
+
+        // RTTI 链
+        std::cout << "  │  RTTI 链  :\n";
+        std::set<std::string> visited;
+        printRTTIChain(name, classTypes, "  │    ", visited);
+
+        std::cout << "  └───────────────────────────────────────────────────────────────\n";
+    }
+}
+
+void SemanticAnalyzer::dumpLayout(
+    const std::unordered_map<std::string, TypePtr>& classTypes)
+{
+    if (classTypes.empty()) return;
+
+    std::cout << "\n";
+    std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  类内存布局详图 (Memory Layout Detail)                          ║\n";
+    std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
+
+    // 按继承顺序：先打印无基类的，再打印有基类的
+    std::vector<std::string> ordered;
+    for (auto& [name, type] : classTypes) {
+        if (type->classLayout.bases.empty())
+            ordered.push_back(name);
+    }
+    for (auto& [name, type] : classTypes) {
+        if (!type->classLayout.bases.empty())
+            ordered.push_back(name);
+    }
+    std::sort(ordered.begin(), ordered.end());
+
+    for (auto& name : ordered) {
+        auto it = classTypes.find(name);
+        if (it == classTypes.end()) continue;
+        auto& layout = it->second->classLayout;
+
+        std::cout << std::format("\n  ━━ {} ({} bytes) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n",
+            name, layout.totalSize);
+
+        // ── 第一层：对象内存 ──
+        std::cout << std::format("  ┌─ {} 对象 ({}B) ─────────────────────────────────┐\n",
+            name, layout.totalSize);
+        if (layout.hasVTable) {
+            std::cout << std::format("  │  +{:<3} _vptr ────────────────────────┐\n", 0);
+        }
+        for (auto& f : layout.fields) {
+            std::string src = "";
+            if (!f.sourceClass.empty() && f.sourceClass != name)
+                src = std::format("  ← {}", f.sourceClass);
+            std::cout << std::format("  │  +{:<3} {:<10} : {} ({}B){}\n",
+                f.offset, f.name,
+                f.type ? f.type->toString() : "?",
+                f.size, src);
+        }
+        std::cout << "  └──────────────────────────────────────────────────────┘\n";
+
+        if (!layout.hasVTable) continue;
+
+        // ── 第二层：vtable ──
+        std::string vtblName = std::format("_ZTV{}{}", name.length(), name);
+        std::string rttiName = std::format("_ZTI{}{}", name.length(), name);
+        std::cout << std::format("                                        │\n");
+        std::cout << std::format("                                        ▼\n");
+        std::cout << std::format("  ┌─ {} ──────────────────────────────────────────┐\n", vtblName);
+        std::cout << std::format("  │  [-2]  offset-to-top = 0    ─→ 归顶: top = obj + 0\n");
+        std::cout << std::format("  │  [-1]  typeinfo ptr ──────────┐  ─→ {} (RTTI)\n", rttiName);
+        std::cout << std::format("  │  ── ↑ vptr 指向此处 ───────── │ ──\n");
+        for (auto& entry : layout.vtableEntries) {
+            std::cout << std::format("  │  [{:<2}]  {}{}\n",
+                entry.index, entry.mangledName,
+                entry.isOverridden ? "  (override)" : "");
+        }
+        std::cout << std::format("  └────────────────────────────── │ ──────────────────────────┘\n");
+
+        // ── 第三层：typeinfo 链 ──
+        std::cout << std::format("                                  │\n");
+        std::cout << std::format("                                  ▼\n");
+
+        char form = typeinfoForm(layout);
+        std::string rttiBoxName = std::format("_ZTI{}{}", name.length(), name);
+        std::cout << std::format("  ┌─ {} ({}) ────────────────────────────────────┐\n",
+            rttiBoxName, form);
+        std::cout << std::format("  │  +0   vptr  → 形态标记 '{}'\n", form);
+        std::cout << std::format("  │  +8   name  → \"{}\" (mangled: {}{})\n",
+            name, name.length(), name);
+
+        if (form == 'V') {
+            // VMI 类型：只列出 bases 数组，不递归展开（避免深层嵌套太复杂）
+            std::cout << std::format("  │  +16  base_count = {}\n", layout.bases.size());
+            for (size_t i = 0; i < layout.bases.size(); ++i) {
+                auto& base = layout.bases[i];
+                std::cout << std::format("  │  bases[{}]: {} @offset={} [{}]\n",
+                    i, base.baseClassName, base.offset,
+                    base.isPrimary ? "primary" : "secondary");
+            }
+            std::cout << std::format("  └───────────────────────────────────────────────────┘\n");
+        } else {
+            // 'S'（单继承）或 'C'（无基类）：沿主基类链递归展开
+            std::set<std::string> layoutVisited;
+            layoutVisited.insert(name);
+            std::string currentName = name;
+            const ClassLayout* currentLayout = &layout;
+
+            while (true) {
+                if (currentLayout->bases.empty()) {
+                    // 'C' 类型：链终止
+                    std::cout << std::format("  │  (无 +16 字段 — 链终止)\n");
+                    std::cout << std::format("  └───────────────────────────────────────────────────┘\n");
+                    break;
+                }
+                // 'S' 类型：有 +16 base 指针
+                std::cout << std::format("  │  +16  base  ──────────────────────┐\n");
+                std::cout << std::format("  └───────────────────────────────────── │ ─────┘\n");
+                std::cout << std::format("                                        │\n");
+                std::cout << std::format("                                        ▼\n");
+
+                auto& base = currentLayout->bases[0];
+                auto baseIt = classTypes.find(base.baseClassName);
+                if (baseIt == classTypes.end()) {
+                    std::cout << std::format("  ┌─ _ZTI{}{} (?) ──────────────────────────────────┐\n",
+                        base.baseClassName.length(), base.baseClassName);
+                    std::cout << std::format("  │  (基类不在当前翻译单元中)\n");
+                    std::cout << std::format("  └───────────────────────────────────────────────────┘\n");
+                    break;
+                }
+                if (!layoutVisited.insert(base.baseClassName).second) {
+                    std::cout << std::format("  ┌─ _ZTI{}{} → (已访问，跳过) ──────────────────────┐\n",
+                        base.baseClassName.length(), base.baseClassName);
+                    std::cout << std::format("  └───────────────────────────────────────────────────┘\n");
+                    break;
+                }
+
+                auto& baseLayout = baseIt->second->classLayout;
+                char baseForm = typeinfoForm(baseLayout);
+                std::string baseRttiName = std::format("_ZTI{}{}",
+                    base.baseClassName.length(), base.baseClassName);
+                std::cout << std::format("  ┌─ {} ({}) ────────────────────────────────────┐\n",
+                    baseRttiName, baseForm);
+                std::cout << std::format("  │  +0   vptr  → 形态标记 '{}'\n", baseForm);
+                std::cout << std::format("  │  +8   name  → \"{}\"\n", base.baseClassName);
+
+                currentName = base.baseClassName;
+                currentLayout = &baseLayout;
+            }
+        }
+    }
 }
 
 } // namespace minicc

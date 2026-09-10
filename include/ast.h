@@ -85,11 +85,12 @@ using DeclPtr        = std::shared_ptr<Declaration>;
 enum class NodeKind : uint8_t {
     // 表达式
     IntLiteral, BoolLiteral, StringLiteral, NullptrLiteral,
-    Var, Binary, Unary, Call, Member, New, This,
+    Var, Binary, Unary, Call, Member, New, This, Delete, DynamicCast, Index,
     // 语句
-    ExprStmt, VarDecl, Return, If, While, Block, Assign,
+    ExprStmt, VarDecl, Return, If, While, Block, Assign, DeleteStmt,
     // 声明
-    Function, Class, Template,
+    Function, Class, Template, GlobalVar, Enum, Namespace, TypeAlias,
+    Constructor, Destructor,
 };
 
 struct ASTNode {
@@ -104,6 +105,14 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 // Expression：表达式基类（有类型信息）
 // ─────────────────────────────────────────────────────────────────────────────
+// 【核心特征】：表达式的核心在于“计算”和“求值”。它一定有确定的类型（resolvedType），并且一定能计算出一个具体的值。
+// 【与 Statement 的区别】：表达式可以作为另一个表达式的一部分（如 a + (b * c)），而语句不行。表达式本身一般不单独存在，除非被包装成 ExprStmt（如 foo();）。
+// 【与 Declaration 的区别】：表达式不向符号表引入新名字，只是读取已有的名字或计算新的值。
+// 【代码示例】：
+//    - `42`           （IntLiteralExpr，类型 int，值 42）
+//    - `a + b`        （BinaryExpr，类型由 a 和 b 决定，计算它们的和）
+//    - `foo(x, y)`    （CallExpr，类型为 foo 的返回值类型，值为函数的执行结果）
+//
 // 对应 clang::Expr。每个表达式经语义分析后都有唯一类型 resolvedType
 // （[expr]：每个表达式都有类型）。Parser 阶段 resolvedType 为空，阶段 3 填充。
 struct Expression : ASTNode {
@@ -222,6 +231,29 @@ struct MemberExpr : Expression {
           memberName(std::move(member)), isArrow(arrow) {}
 };
 
+// ─── 下标访问表达式（语法糖，降级为 at()/set() 调用）────────────────────────
+// 对应 [expr.sub]（下标运算符）；clang: ArraySubscriptExpr /
+// CXXOperatorCallExpr（operator[] 重载形式）。
+// demo：v[i]       → IndexExpr{ object=VarExpr{v}, index=VarExpr{i} }
+// 设计（教学版 operator[] 的"糖化"）：
+//   真 C++ 里 v[i] 是 operator[] 重载调用；minicc 尚无运算符重载，
+//   于是把下标语法直接降级为两个约定方法：
+//     右值位置（读）：int x = v[i];   ≡  int x = v.at(i);
+//     左值位置（写）：v[i] = x;       ≡  v.set(i, x);
+//   类只要实现 at(int)/set(int,int) 两个成员方法，就自动获得 [] 手感
+//   （Vector<T>/Map<K,V> 封装即建立在此约定上）。
+// 语义阶段：inferIndex 校验 object 是类类型且类里有 at() 方法；
+//           结果类型 = at() 的返回类型。
+// 代码生成：emitExpr(IndexExpr) → 发射 this + 实参、callq <类名>_at；
+//           emitAssign 见 AssignStmt.target 为 IndexExpr 时改发 <类名>_set。
+struct IndexExpr : Expression {
+    ExprPtr object;  // 被下标的容器对象（类类型）
+    ExprPtr index;   // 下标表达式（按约定方法签名校验）
+    IndexExpr(ExprPtr obj, ExprPtr idx)
+        : Expression(NodeKind::Index),
+          object(std::move(obj)), index(std::move(idx)) {}
+};
+
 // ─── new 表达式 ───────────────────────────────────────────────────────────────
 // 对应 [expr.new]；clang: CXXNewExpr。
 // demo：new Point()      → NewExpr{ className="Point", constructorArgs=[] }
@@ -230,8 +262,27 @@ struct MemberExpr : Expression {
 struct NewExpr : Expression {
     std::string            className;
     std::vector<ExprPtr>   constructorArgs;
+    // ★ wangyang: P3 —— new Box<int>() 的模板实参（Parser 填写，
+    // 语义阶段实例化后把 className 改写为实例名，CodeGen 只看改写后的名字）
+    std::vector<TypePtr>   templateArgs;
     explicit NewExpr(std::string cls)
         : Expression(NodeKind::New), className(std::move(cls)) {}
+};
+
+// ─── dynamic_cast 表达式 ─────────────────────────────────────────────────────
+// 对应 [expr.dynamic.cast]；clang: CXXDynamicCastExpr。
+// demo：dynamic_cast<Derived*>(p)
+//   → DynamicCastExpr{ targetClassName="Derived", operand=VarExpr{p} }
+// 目标类型必须是"类名*"（本项目只实现指针形式）；结果类型是 Derived*。
+// 运行时借助 RTTI（typeinfo 基类链）判断实际对象类型能否到达目标类型：
+// 成功 → 返回原指针；失败 → 返回 0（对应真实 C++ 的空指针）。
+// targetType 由语义阶段在检查通过后填充（目标类的指针类型）。
+struct DynamicCastExpr : Expression {
+    std::string targetClassName;  // dynamic_cast<这里>中的类名
+    ExprPtr     operand;          // 被转换的表达式
+    DynamicCastExpr(std::string cls, ExprPtr op)
+        : Expression(NodeKind::DynamicCast),
+          targetClassName(std::move(cls)), operand(std::move(op)) {}
 };
 
 // ─── this 表达式 ──────────────────────────────────────────────────────────────
@@ -242,9 +293,28 @@ struct ThisExpr : Expression {
     ThisExpr() : Expression(NodeKind::This) {}
 };
 
+// ─── delete 表达式 ────────────────────────────────────────────────────────────
+// 对应 [expr.delete]；clang: CXXDeleteExpr。
+// demo：delete ptr;  → DeleteExpr{ pointerExpr=VarExpr{ptr}, isArray=false }
+// 先调用析构函数（如果是类类型指针），再调用 free 释放堆内存。
+struct DeleteExpr : Expression {
+    ExprPtr pointerExpr;
+    bool    isArray = false; // 是否为 delete[]
+    explicit DeleteExpr(ExprPtr p, bool isArr = false)
+        : Expression(NodeKind::Delete), pointerExpr(std::move(p)), isArray(isArr) {}
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Statement：语句基类
 // ─────────────────────────────────────────────────────────────────────────────
+// 【核心特征】：语句的核心在于“控制流程”和“执行动作”。它没有类型，也不会计算出一个可被后续引用的值。
+// 【与 Expression 的区别】：语句是一条完整的指令，控制程序怎么跑（循环、条件、返回），而表达式只是指令里算数的部分。你不能写 `int x = if (a) { 1; };`，因为 `if` 是语句没有值。
+// 【与 Declaration 的区别】：语句执行具体的运行时逻辑，而声明侧重于向编译器报告“这里有个什么东西”。虽然变量声明（VarDeclStmt）在 C++ 中算作语句，但大部分纯声明（如类、函数蓝图）不是。
+// 【代码示例】：
+//    - `return 0;`         （ReturnStmt，动作是退出函数）
+//    - `if (flag) { ... }` （IfStmt，动作是分支跳转）
+//    - `x = 5;`            （AssignStmt，动作是修改内存，本项目里算作语句。注：C++里赋值本身是表达式，这里简化了）
+//
 // 对应 clang::Stmt。语句没有值、只描述执行动作（区别于带 resolvedType 的表达式）。
 struct Statement : ASTNode {
     explicit Statement(NodeKind k) : ASTNode(k) {}
@@ -339,9 +409,26 @@ struct BlockStmt : Statement {
         : Statement(NodeKind::Block), statements(std::move(stmts)) {}
 };
 
+// ─── delete 语句 ──────────────────────────────────────────────────────────────
+// 对应 [stmt.expr] / [expr.delete]；在语句位置出现的 `delete p;` 或 `delete[] p;`
+struct DeleteStmt : Statement {
+    ExprPtr pointerExpr;
+    bool    isArray = false;
+    explicit DeleteStmt(ExprPtr p, bool isArr = false)
+        : Statement(NodeKind::DeleteStmt), pointerExpr(std::move(p)), isArray(isArr) {}
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Declaration：顶层声明基类
 // ─────────────────────────────────────────────────────────────────────────────
+// 【核心特征】：声明的核心在于“向符号表引入新的名字（标识符）”，并描述它们的结构和签名，供后面的代码引用。
+// 【与 Expression 的区别】：声明是编译期的概念，它告诉编译器“如何看待”后面的表达式，声明本身不产出运行时的值。
+// 【与 Statement 的区别】：声明大多不能放在普通语句的位置随便执行。顶层声明如类、函数、模板，它们是构建程序骨架的基石，而语句是填充在函数体里的血肉。
+// 【代码示例】：
+//    - `int foo(int x);`                     （FunctionDecl，引入名字 foo）
+//    - `class Point { int x; int y; };`      （ClassDecl，引入名字 Point，以及它的内存布局）
+//    - `template<typename T> class MyPtr;`   （TemplateDecl，引入一个需要实例化的蓝图）
+//
 // 对应 clang::Decl。声明引入名字（函数/类/模板），是符号表的构成单元。
 struct Declaration : ASTNode {
     explicit Declaration(NodeKind k) : ASTNode(k) {}
@@ -382,23 +469,121 @@ struct FunctionDecl : Declaration {
 };
 using FuncDeclPtr = std::shared_ptr<FunctionDecl>;
 
+// ─── 构造函数初始化器 ─────────────────────────────────────────────────────────
+// 对应 [class.base.init]；clang: CXXCtorInitializer。
+// demo：Point(int x, int y) : m_x(x), m_y(y) {} 中的 m_x(x)
+struct CtorInitializer {
+    std::string          memberName; // 字段名或基类名
+    std::vector<ExprPtr> arguments;  // 传入的实参
+    SourceLocation       location;
+};
+
+// ─── 构造函数声明 ─────────────────────────────────────────────────────────────
+// 对应 [class.ctor]；clang: CXXConstructorDecl。
+// 构造函数没有返回值类型，可携带初始化列表 initList。
+struct ConstructorDecl : FunctionDecl {
+    std::vector<CtorInitializer> initList;
+    bool                         isDefaultCtor = false; // 是否为编译器合成的默认构造
+
+    ConstructorDecl() {
+        kind = NodeKind::Constructor;
+    }
+};
+using CtorDeclPtr = std::shared_ptr<ConstructorDecl>;
+
+// ─── 析构函数声明 ─────────────────────────────────────────────────────────────
+// 对应 [class.dtor]；clang: CXXDestructorDecl。
+// 析构函数名字为 ~ClassName，无参无返回值，可声明为 virtual。
+struct DestructorDecl : FunctionDecl {
+    bool isDefaultDtor = false; // 是否为编译器合成的默认析构
+
+    DestructorDecl() {
+        kind = NodeKind::Destructor;
+    }
+};
+using DtorDeclPtr = std::shared_ptr<DestructorDecl>;
+
+// ─── 全局变量声明 ─────────────────────────────────────────────────────────────
+// 对应 [dcl.dcl] / [dcl.init]；clang: VarDecl (isStaticDataMember() == false && hasGlobalStorage())。
+// demo：int g_counter = 0;
+struct GlobalVarDecl : Declaration {
+    std::string name;
+    TypePtr     declaredType;
+    ExprPtr     initializer; // 可为 nullptr
+
+    GlobalVarDecl() : Declaration(NodeKind::GlobalVar) {}
+};
+using GlobalVarDeclPtr = std::shared_ptr<GlobalVarDecl>;
+
+// ─── 枚举声明 ─────────────────────────────────────────────────────────────────
+// 对应 [dcl.enum]；clang: EnumDecl / EnumConstantDecl。
+// demo：enum Color { Red = 1, Green, Blue };
+//       enum class Status : int { Ok = 0, Error = -1 };
+struct EnumItem {
+    std::string    name;
+    int64_t        value = 0;
+    bool           hasCustomValue = false;
+    ExprPtr        valueExpr = nullptr;
+    SourceLocation location;
+};
+
+struct EnumDecl : Declaration {
+    std::string           name;
+    bool                  isScoped = false; // enum class / enum struct
+    TypePtr               underlyingType;   // 底层类型（默认 int）
+    std::vector<EnumItem> items;
+
+    EnumDecl() : Declaration(NodeKind::Enum) {}
+};
+using EnumDeclPtr = std::shared_ptr<EnumDecl>;
+
+// ─── 命名空间声明 ─────────────────────────────────────────────────────────────
+// 对应 [namespace.def]；clang: NamespaceDecl。
+// demo：namespace Math { int add(int a, int b) { return a + b; } }
+struct NamespaceDecl : Declaration {
+    std::string          name;
+    std::vector<DeclPtr> declarations;
+
+    NamespaceDecl() : Declaration(NodeKind::Namespace) {}
+};
+using NamespaceDeclPtr = std::shared_ptr<NamespaceDecl>;
+
+// ─── 类型别名声明 ─────────────────────────────────────────────────────────────
+// 对应 [dcl.typedef] / [dcl.type.simple]；clang: TypeAliasDecl / TypedefDecl。
+// demo：using IntPtr = int*;  或  typedef int* IntPtr;
+struct TypeAliasDecl : Declaration {
+    std::string aliasName;
+    TypePtr     underlyingType;
+
+    TypeAliasDecl() : Declaration(NodeKind::TypeAlias) {}
+};
+using TypeAliasDeclPtr = std::shared_ptr<TypeAliasDecl>;
+
 // ─── 类声明 ───────────────────────────────────────────────────────────────────
 // 对应 [class]/[class.mem]；clang: CXXRecordDecl。继承见 [class.derived]。
 // demo：class Point : public Base { int x; int foo() { ... } };
-//   → ClassDecl{ name=Point, baseClassName="Base",
+//   → ClassDecl{ name=Point, baseClassNames=["Base"],
 //                fields=[ FieldInfo{x:int} ],
 //                methods=[ FunctionDecl{foo} ],
 //                classType=<Type: Class Point> }
+// 多继承：class D : public A, public B { ... } → baseClassNames=["A","B"]
+//   （[class.mi]；本项目仅支持 public 非虚继承，声明顺序即子对象摆放顺序）
 // 语义阶段把 ClassDecl 翻译成 Type 的 ClassLayout（算偏移 / 建 vtable）。
 struct ClassDecl : Declaration {
     std::string              name;
-    std::string              baseClassName;  // 基类名（空 = 无继承）
+    std::vector<std::string> baseClassNames; // 基类名列表（空 = 无继承；
+                                             // 单继承 = 1 个元素；多继承 = 声明顺序）
     std::vector<FieldInfo>   fields;         // 字段列表
     std::vector<FuncDeclPtr> methods;        // 方法列表
     TypePtr                  classType;      // 对应的 Type 对象
     AccessModifier           currentAccess = AccessModifier::Private;
 
     ClassDecl() : Declaration(NodeKind::Class) {}
+
+    // 便捷访问：第一个基类（无继承时返回空串）——兼容单继承路径的旧语义
+    std::string firstBase() const {
+        return baseClassNames.empty() ? "" : baseClassNames.front();
+    }
 };
 using ClassDeclPtr = std::shared_ptr<ClassDecl>;
 
@@ -422,11 +607,26 @@ using ClassDeclPtr = std::shared_ptr<ClassDecl>;
 //                       body=BlockStmt[ ReturnStmt[ BinaryExpr{Add,
 //                           VarExpr{x}, VarExpr{x}} ] ] } }
 //   （T 以 TemplateParam 占位类型存在；实例化时才被替换为实际类型）
+// ─── 模板形参（类型形参 vs 非类型形参 NTTP）──────────────────────────────
+// 对应 [temp.param]；clang: TemplateTypeParmDecl / NonTypeTemplateParmDecl
+enum class TemplateParamKind {
+    Type,    // typename T, class T
+    NonType, // int N, bool Flag 等非类型模板参数 (NTTP)
+};
+
+struct TemplateParam {
+    TemplateParamKind kind = TemplateParamKind::Type;
+    std::string       name;
+    TypePtr           nonType = nullptr; // 非类型形参对应的类型（如 int）
+    SourceLocation    location;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 struct TemplateDecl : Declaration {
-    std::vector<std::string> typeParams;     // 模板参数名列表（如 ["T", "U"]）
-    ClassDeclPtr             classTemplate;  // 类模板蓝图（与 funcTemplate 互斥）
-    FuncDeclPtr              funcTemplate;   // 函数模板蓝图（S1+）
+    std::vector<std::string>   typeParams;     // 模板参数名列表（如 ["T", "N"]，向后兼容）
+    std::vector<TemplateParam> templateParams; // 结构化模板形参列表（含类型/非类型区分）
+    ClassDeclPtr               classTemplate;  // 类模板蓝图（与 funcTemplate 互斥）
+    FuncDeclPtr                funcTemplate;   // 函数模板蓝图（S1+）
 
     TemplateDecl() : Declaration(NodeKind::Template) {}
 

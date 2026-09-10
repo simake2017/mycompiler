@@ -19,7 +19,7 @@
 ## 开发规范
 - 全阶段中文日志，关键算法要有 trace（如推导逐对打印 `P=T A=int ⇒ T := int ✓`）
 - 语义 oracle：任何新特性先跑 `clang++-18 -emit-llvm -S` 确认预期，再写实现
-- 参考源只移植算法、禁止整段拷贝 clang 代码；参照源码在 /home/magene/runtime/cppproject/llvm-project
+- 参考源只移植算法、禁止整段拷贝 clang 代码；参照源码在 ~/cppproject/llvm-project/（即 /root/cppproject/llvm-project/）
 - 工具链用本机 clang++-18；Makefile 的 macOS homebrew 路径是坏的要避开/修复
 
 ## 当前主线任务
@@ -27,8 +27,13 @@
 测试 tests/test_tmpl_11..19；文档 docs/learn/01..06）。
 ✅ **预处理器 P0 已完成**（#include 搜索路径 / #define 对象+函数宏 / 条件编译 / #pragma once / -E；
 测试 tests/test_pp_01..04 + tests/pp/ 头文件夹具；文档 docs/learn/07）。
+✅ **主线 A 构造/析构与顶层声明已完成**（构造函数/初始化列表、虚析构/delete、全局变量、枚举、命名空间、类型别名；
+测试 tests/unit/test_decl_and_ctor.cpp + tests/test_ctor_01..02 + tests/test_decl_01；文档 docs/learn/08）。
+✅ **主线 B 自研链接器已完成**（默认直出非 PIE 可执行文件：借系统 as 产 .o，自研链接器合并节/符号决议/重定位回填；
+内置 _start+64KB bump malloc/free，不依赖系统 ld/crt/libc；-S 只吐汇编；
+新文件 include/linker.h + src/linker.cpp；文档 docs/learn/15，编号顺延因 09..14 已被占用）。
 构建目录 build-linux/（clang++-18）。
-⏭ 后续计划见 **docs/ROADMAP.md**（主线 A 构造/析构 → B 自动链接 → C 控制流 → D 常量折叠 → E 数组/enum/namespace → F 深水区选做，
+⏭ 后续计划见 **docs/ROADMAP.md**（主线 C 控制流 → D 常量折叠 → E 数组/高级类型 → F 深水区选做，
 每条含理论点/clang 参照/任务分解/验收）。新会话接手：先读本文件与 ROADMAP，选定主线再开工。
 
 **完整提示词与子阶段定义：docs/prompt-template-deduction.md**——新会话接手时先读它。

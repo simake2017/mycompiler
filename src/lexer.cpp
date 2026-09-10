@@ -45,22 +45,30 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwBool:        return "bool";
         case TokenType::KwClass:       return "class";
         case TokenType::KwConst:       return "const";
+        case TokenType::KwDelete:      return "delete";
         case TokenType::KwDouble:      return "double";
+        case TokenType::KwDynamicCast: return "dynamic_cast";
         case TokenType::KwElse:        return "else";
+        case TokenType::KwEnum:        return "enum";
         case TokenType::KwFalse:       return "false";
         case TokenType::KwFor:         return "for";
         case TokenType::KwIf:          return "if";
         case TokenType::KwInt:         return "int";
+        case TokenType::KwNamespace:   return "namespace";
+        case TokenType::KwNew:         return "new";
         case TokenType::KwNullptr:     return "nullptr";
         case TokenType::KwOverride:    return "override";
         case TokenType::KwPublic:      return "public";
         case TokenType::KwPrivate:     return "private";
         case TokenType::KwProtected:   return "protected";
         case TokenType::KwReturn:      return "return";
+        case TokenType::KwStruct:      return "struct";
         case TokenType::KwTemplate:    return "template";
         case TokenType::KwThis:        return "this";
         case TokenType::KwTrue:        return "true";
+        case TokenType::KwTypedef:     return "typedef";
         case TokenType::KwTypename:    return "typename";
+        case TokenType::KwUsing:       return "using";
         case TokenType::KwVirtual:     return "virtual";
         case TokenType::KwVoid:        return "void";
         case TokenType::KwWhile:       return "while";
@@ -110,7 +118,7 @@ const char* tokenTypeName(TokenType t) {
 // 左值实参最多拷贝一次——一个签名覆盖两种情况。
 // 示例：Lexer lex("int x = 42;"); → m_source 持有该串，m_pos=0，m_line=m_col=1。
 Lexer::Lexer(std::string source)
-    : m_source(std::move(source)) {}
+    : m_source(std::move(source)) {} // wangyang 这里会设置相应的值
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 字符级操作
@@ -137,8 +145,8 @@ char Lexer::peekNext() const {
 // 所有 token 的 SourceLocation 都由这里积累而来。
 // 示例："a\nb" → advance()=='a'；再 advance()=='\n'（行号 1→2、列号归 1）。
 char Lexer::advance() {
-    char c = m_source[m_pos++];
-    if (c == '\n') {
+    char c = m_source[m_pos++]; // wangyang 指针会移动
+    if (c == '\n') { // 在这里面会标识行号和  和 列号
         m_line++;
         m_col = 1;
     } else {
@@ -150,7 +158,7 @@ char Lexer::advance() {
 // 光标是否已越过最后一个字符（用 >= ：消费完最后一个字符后再调一次也安全）。
 // 示例：空源码 → 构造后立即 isAtEnd()==true，nextToken() 直接返回 Eof。
 bool Lexer::isAtEnd() const {
-    return m_pos >= m_source.size();
+    return m_pos >= m_source.size(); // 也就是说 是字符文件
 }
 
 // 快照当前 (行, 列)。每个扫描函数都在开头先拍快照——
@@ -263,11 +271,11 @@ Token Lexer::scanIdentifierOrKeyword() {
 
     while (!isAtEnd() && (std::isalnum(static_cast<unsigned char>(peek())) // 字母数字
                           || peek() == '_')) { // 下划线
-        text += advance();
+        text += advance(); //wangyang 每个标识符或者关键字都是用字母或者下划线开头
     }
 
     // 查关键字表
-    auto it = kKeywordMap.find(text);
+    auto it = kKeywordMap.find(text); // 判断是不是关键词
     if (it != kKeywordMap.end()) {
         return makeToken(it->second, text, loc);
     }
@@ -286,12 +294,12 @@ Token Lexer::scanIdentifierOrKeyword() {
 // 这样 CodeGen 阶段可以直接把内容嵌入 .rodata 段。
 Token Lexer::scanString() {
     auto loc = currentLocation();
-    advance(); // 消费开头的 "
+    advance(); // 消费开头的 " 只是往前推进，但是不添加
 
     std::string text;
     while (!isAtEnd() && peek() != '"') {
         if (peek() == '\\') { // wangyang 这里是读取到内容是 \(反斜线)的意思
-            advance(); // 消费反斜杠
+            advance(); // 消费反斜杠 wangyang 这里只是往前推进，但是不添加到text 当中
             char escaped = advance();
             // 转义翻译表：n→换行  t→制表符  \\→反斜杠  \"→双引号；
             // default 原样保留（真实 C++ 对未知转义报错，本项目宽容处理）
@@ -334,8 +342,8 @@ Token Lexer::scanString() {
 //          "->" → Token{Arrow}；      "-5" → Token{Minus}，光标停在 '5'。
 Token Lexer::scanOperator() {
     auto loc = currentLocation();
-    char c = advance();
-    char n = peek();
+    char c = advance(); // 会消费
+    char n = peek(); //只是取出来 ,中间不能有空格，比如>= 不能是 > =
 
     // c：已消费的首字符；n：前瞻一字符（只读，匹配成功才 advance() 消费它）
     // 双字符运算符
@@ -430,7 +438,7 @@ Token Lexer::nextToken() {
         return makeToken(TokenType::Eof, "", currentLocation());
     }
 
-    char c = peek();
+    char c = peek(); // wangyang peek 指针不会移动
 
     // 数字开头 → 数字字面量
     if (std::isdigit(static_cast<unsigned char>(c))) {
@@ -438,7 +446,7 @@ Token Lexer::nextToken() {
     }
 
     // 字母或下划线开头 → 标识符或关键字
-    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') { // 如果是 字母或者_开头
         return scanIdentifierOrKeyword();
     }
 

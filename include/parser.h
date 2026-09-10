@@ -66,6 +66,13 @@ private:
     std::vector<Token> m_tokens;   // 完整 Token 序列（含末尾哨兵 Eof）
     size_t             m_pos = 0;  // 游标：下一个待消费的 Token 下标
 
+    // ── 模板形参名作用域（对应 clang Sema 的 TemplateParameterDepth/上下文栈）──
+    // parseTemplateDecl 收集完 template<...> 形参后把【类型形参名】压入，
+    // 解析模板体（含类模板成员）期间有效，解析完弹出。
+    // parseType 据此把裸标识符区分为 TemplateParam("T") 而非 Class("T")。
+    std::vector<std::string> m_templateParamScope;
+    bool isInTemplateParamScope(const std::string& name) const;
+
     // ── Token 流操作（LL(1) 前瞻的底层设施）──
     // 前瞻（lookahead）：不移动游标，查看当前 Token，据此决定走哪条产生式分支。
     const Token& current() const;            // 查看当前 Token（不消费）
@@ -86,21 +93,22 @@ private:
     TypePtr parseType();
 
     // ── 声明解析 ──
-    // declaration := template-decl | class-decl | ['virtual'] function-decl
-    // 分派依据：第一个前瞻 Token（'template' / 'class' / ['virtual'] + 类型名）
-    DeclPtr         parseDeclaration();
-    // template-decl := 'template' '<' ( ('typename'|'class') IDENT (',' ...)* ) '>'
-    //                  ( class-decl | function-decl )
-    TemplateDeclPtr parseTemplateDecl();
-    // class-decl := 'class' IDENT [':' 'public' IDENT] '{' member* '}' ';'
-    ClassDeclPtr    parseClassDecl();
-    // function-decl := type IDENT '(' parameter-list ')' ['override']
-    //                  ( compound-stmt | ';' )
-    FuncDeclPtr     parseFunctionDecl(bool isVirtual = false,
-                                      const std::string& ownerClass = "");
-    // method-decl := ['virtual'] function-decl   （类体内成员，带所属类名）
-    FuncDeclPtr     parseMethodDecl(const std::string& ownerClass,
-                                    AccessModifier access);
+    // declaration := template-decl | class-decl | enum-decl | namespace-decl
+    //              | type-alias-decl | global-var-decl | ['virtual'] function-decl
+    DeclPtr            parseDeclaration();
+    TemplateDeclPtr    parseTemplateDecl();
+    ClassDeclPtr       parseClassDecl();
+    EnumDeclPtr        parseEnumDecl();
+    NamespaceDeclPtr   parseNamespaceDecl();
+    TypeAliasDeclPtr   parseTypeAliasDecl();
+    GlobalVarDeclPtr   parseGlobalVarDecl();
+    FuncDeclPtr        parseFunctionDecl(bool isVirtual = false,
+                                         const std::string& ownerClass = "");
+    FuncDeclPtr        parseMethodDecl(const std::string& ownerClass,
+                                       AccessModifier access);
+    CtorDeclPtr        parseConstructorDecl(const std::string& ownerClass);
+    DtorDeclPtr        parseDestructorDecl(const std::string& ownerClass, bool isVirtual = false);
+    std::vector<CtorInitializer> parseCtorInitializerList();
 
     // ── 语句解析 ──
     // stmt := compound-stmt | if-stmt | while-stmt | return-stmt
@@ -117,6 +125,8 @@ private:
     StmtPtr parseWhileStmt();
     // return-stmt := 'return' [expr] ';'
     StmtPtr parseReturnStmt();
+    // delete-stmt := 'delete' ['[' ']'] expr ';'
+    StmtPtr parseDeleteStmt();
     // expr-or-assign := expr ['=' expr] ';'
     StmtPtr parseExprOrAssignStmt();
 

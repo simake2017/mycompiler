@@ -10,24 +10,28 @@
 //     → [3] 语义分析 (SemaAnalyzer) → 带类型信息的 AST + 内存布局
 //     → [4] 模板实例化 (TemplateInst) → 展开后的真实代码
 //     → [5] 代码生成 (CodeGen)      → x86-64 汇编 (.s)
-//     → [6] 链接 (Linker, 简化)     → 可执行文件（留给系统链接器）
+//     → [6] 链接 (MiniLinker)       → 可执行文件（内置 _start + malloc，不依赖系统 ld）
 //
 // 用法：
 //   ./minicc <source.cpp> [-o output.s] [--dump-tokens] [--dump-ast]
 // =============================================================================
 //
 // ─── 命令行参数详解（本文件 main() 解析）─────────────────────────────────
-//   minicc <source.cpp> [-o output.s] [-I dir] [-E] [--dump-tokens] [--dump-ast]
+//   minicc <source.cpp> [-o output] [-I dir] [-S] [-E] [--dump-*]
 //
 //   <source.cpp>    输入源文件（必填）
-//   -o output.s     输出路径：正常模式写汇编；-E 模式写预处理文本。
-//                   缺省时正常模式取 <source>.s，-E 模式直接打印到 stdout。
+//   -o output       输出路径：默认模式输出可执行文件（缺省取 <source> 去扩展名）；
+//                   -S 模式输出汇编 <source>.s；-E 模式写预处理文本。
+//   -S              只到阶段 5 为止，输出 .s 汇编（等价 gcc -S，不链接）
 //   -I dir          头文件搜索目录，可重复（-I include -I third_party），
 //                   出现顺序即搜索优先级，原样传给预处理器。
 //   -E              只执行阶段 0（预处理）并输出结果，等价 gcc -E，
 //                   用于调试宏/include/条件编译问题。
-//   --dump-tokens   阶段 1 后打印完整 Token 流（调试）
-//   --dump-ast      阶段 2 后打印 AST 顶层声明（调试）
+//   --dump-tokens       阶段 1 后打印完整 Token 流（调试）
+//   --dump-ast          阶段 2 后打印 AST 顶层声明（调试）
+//   --dump-hierarchy    阶段 3 后打印类层次结构图（继承树 + typeinfo 链）
+//   --dump-layout       阶段 3 后打印类内存布局详图（对象→vtable→RTTI 三层）
+//   多个 --dump-* 可同时使用，如 --dump-hierarchy --dump-layout
 //
 // 示例：
 //   ./minicc tests/test_tmpl_01.cpp                 # 全管线 → test_tmpl_01.s
@@ -57,9 +61,10 @@
 //     │ 阶段5 代码生成   codegen.cpp                 generate()
 //     ▼
 //   output.s（x86-64 AT&T 汇编）
-//     │ 阶段6 链接（简化）：交给系统工具链
+//     │ 阶段6 链接：系统 as 出 .o → 内置 MiniLinker（src/linker.cpp）
+//     │        合并节 → 符号决议 → 重定位回填 → 写最小可执行 ELF
 //     ▼
-//   gcc -o output output.s -lstdc++
+//   可执行文件（非 PIE，入口 _start；内置 malloc/free，不依赖系统 ld）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include "lexer.h"
@@ -68,6 +73,7 @@
 #include "preprocessor.h"
 #include "template_instantiation.h"
 #include "codegen.h"
+#include "linker.h"
 
 #include <fstream>
 #include <iostream>
@@ -127,63 +133,357 @@ void dumpTokens(const std::vector<Token>& tokens) {
     }
 }
 
-// 打印 AST（简化版）
-// 由 --dump-ast 触发：只展开顶层声明——类（含基类/字段/方法）、
-// 函数、模板（类模板递归打印其蓝图体，函数模板打印参数个数与返回类型）。
-void dumpAST(const TranslationUnit& unit, int indent = 0) {
-    auto printIndent = [&](int level) {
-        for (int i = 0; i < level; i++) std::cout << "  ";
-    };
+// ── AST 树形打印（增强版）──────────────────────────────────────────────────────
+// 使用 ├──/└──/│ 风格绘制完整 AST，包含函数体、语句、表达式。
+// 由 --dump-ast 触发。
 
-    for (auto& decl : unit.declarations) {
-        if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-            printIndent(indent);
-            std::cout << std::format("ClassDecl: {}\n", cls->name);
-            if (!cls->baseClassName.empty()) {
-                printIndent(indent + 1);
-                std::cout << std::format("Base: {}\n", cls->baseClassName);
-            }
-            for (auto& field : cls->fields) {
-                printIndent(indent + 1);
-                std::cout << std::format("Field: {} : {}\n",
-                    field.name, field.type ? field.type->toString() : "?");
-            }
-            for (auto& method : cls->methods) {
-                printIndent(indent + 1);
-                std::cout << std::format("Method: {} ({}) {}\n",
-                    method->name,
-                    method->isVirtual ? "virtual" : "normal",
-                    method->returnType ? method->returnType->toString() : "?");
-            }
+static void dumpExpr(ExprPtr expr, const std::string& prefix, bool isLast);
+static void dumpStmt(StmtPtr stmt, const std::string& prefix, bool isLast);
+static void dumpBlock(std::shared_ptr<BlockStmt> block, const std::string& prefix);
+
+// 打印节点标签 + 子节点前缀
+static void printNode(const std::string& prefix, bool isLast, const std::string& label) {
+    std::string branch = isLast ? "└── " : "├── ";
+    std::cout << prefix << branch << label << "\n";
+}
+
+// 表达式打印：按动态类型分发
+static void dumpExpr(ExprPtr expr, const std::string& prefix, bool isLast) {
+    if (!expr) {
+        printNode(prefix, isLast, "nullptr");
+        return;
+    }
+
+    std::string branch = isLast ? "└── " : "├── ";
+    std::string childPrefix = prefix + (isLast ? "    " : "│   ");
+
+    if (auto e = std::dynamic_pointer_cast<IntLiteralExpr>(expr)) {
+        printNode(prefix, isLast, std::format("IntLiteral: {}", e->value));
+    }
+    else if (auto e = std::dynamic_pointer_cast<BoolLiteralExpr>(expr)) {
+        printNode(prefix, isLast, std::format("BoolLiteral: {}", e->value ? "true" : "false"));
+    }
+    else if (auto e = std::dynamic_pointer_cast<StringLiteralExpr>(expr)) {
+        printNode(prefix, isLast, std::format("StringLiteral: \"{}\"", e->value));
+    }
+    else if (auto e = std::dynamic_pointer_cast<NullptrLiteralExpr>(expr)) {
+        printNode(prefix, isLast, "NullptrLiteral");
+    }
+    else if (auto e = std::dynamic_pointer_cast<VarExpr>(expr)) {
+        printNode(prefix, isLast, std::format("VarExpr: {}", e->name));
+    }
+    else if (auto e = std::dynamic_pointer_cast<ThisExpr>(expr)) {
+        printNode(prefix, isLast, "ThisExpr");
+    }
+    else if (auto e = std::dynamic_pointer_cast<BinaryExpr>(expr)) {
+        std::string opStr;
+        switch (e->op) {
+            case BinaryOp::Add: opStr = "+"; break;
+            case BinaryOp::Sub: opStr = "-"; break;
+            case BinaryOp::Mul: opStr = "*"; break;
+            case BinaryOp::Div: opStr = "/"; break;
+            case BinaryOp::Mod: opStr = "%"; break;
+            case BinaryOp::Eq:  opStr = "=="; break;
+            case BinaryOp::Neq: opStr = "!="; break;
+            case BinaryOp::Lt:  opStr = "<"; break;
+            case BinaryOp::Gt:  opStr = ">"; break;
+            case BinaryOp::Le:  opStr = "<="; break;
+            case BinaryOp::Ge:  opStr = ">="; break;
+            case BinaryOp::And: opStr = "&&"; break;
+            case BinaryOp::Or:  opStr = "||"; break;
         }
-        else if (auto func = std::dynamic_pointer_cast<FunctionDecl>(decl)) {
-            printIndent(indent);
-            std::cout << std::format("FunctionDecl: {} → {}\n",
-                func->name,
-                func->returnType ? func->returnType->toString() : "?");
+        printNode(prefix, isLast, std::format("BinaryExpr: {}", opStr));
+        dumpExpr(e->left, childPrefix, false);
+        dumpExpr(e->right, childPrefix, true);
+    }
+    else if (auto e = std::dynamic_pointer_cast<UnaryExpr>(expr)) {
+        std::string opStr = (e->op == UnaryOp::Neg) ? "-" : "!";
+        printNode(prefix, isLast, std::format("UnaryExpr: {}", opStr));
+        dumpExpr(e->operand, childPrefix, true);
+    }
+    else if (auto e = std::dynamic_pointer_cast<CallExpr>(expr)) {
+        printNode(prefix, isLast, "CallExpr");
+        dumpExpr(e->callee, childPrefix, e->arguments.empty());
+        for (size_t i = 0; i < e->arguments.size(); ++i) {
+            bool last = (i + 1 == e->arguments.size());
+            std::cout << childPrefix << (last ? "└── " : "├── ") << "arg[" << i << "]\n";
+            dumpExpr(e->arguments[i], childPrefix + (last ? "    " : "│   "), true);
         }
-        else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
-            printIndent(indent);
-            std::cout << std::format("TemplateDecl({}): <",
-                tmpl->isClassTemplate() ? "class" : "function");
-            for (size_t i = 0; i < tmpl->typeParams.size(); i++) {
-                if (i > 0) std::cout << ", ";
-                std::cout << tmpl->typeParams[i];
-            }
-            std::cout << ">\n";
-            if (tmpl->classTemplate) {
-                dumpAST({{tmpl->classTemplate}}, indent + 1);
-            }
-            if (tmpl->funcTemplate) {
-                printIndent(indent + 1);
-                std::cout << std::format("FunctionTemplate: {}({} params) → {}\n",
-                    tmpl->funcTemplate->name,
-                    tmpl->funcTemplate->parameters.size(),
-                    tmpl->funcTemplate->returnType ?
-                        tmpl->funcTemplate->returnType->toString() : "void");
+    }
+    else if (auto e = std::dynamic_pointer_cast<MemberExpr>(expr)) {
+        std::string access = e->isArrow ? "->" : ".";
+        printNode(prefix, isLast, std::format("MemberExpr: {}{}", access, e->memberName));
+        dumpExpr(e->object, childPrefix, true);
+    }
+    else if (auto e = std::dynamic_pointer_cast<IndexExpr>(expr)) {
+        printNode(prefix, isLast, "IndexExpr");
+        dumpExpr(e->object, childPrefix, false);
+        dumpExpr(e->index, childPrefix, true);
+    }
+    else if (auto e = std::dynamic_pointer_cast<NewExpr>(expr)) {
+        printNode(prefix, isLast, std::format("NewExpr: {}", e->className));
+        for (size_t i = 0; i < e->constructorArgs.size(); ++i) {
+            bool last = (i + 1 == e->constructorArgs.size());
+            std::cout << childPrefix << (last ? "└── " : "├── ") << "arg[" << i << "]\n";
+            dumpExpr(e->constructorArgs[i], childPrefix + (last ? "    " : "│   "), true);
+        }
+    }
+    else if (auto e = std::dynamic_pointer_cast<DynamicCastExpr>(expr)) {
+        printNode(prefix, isLast, std::format("DynamicCastExpr: <{}*>", e->targetClassName));
+        dumpExpr(e->operand, childPrefix, true);
+    }
+    else if (auto e = std::dynamic_pointer_cast<DeleteExpr>(expr)) {
+        printNode(prefix, isLast, e->isArray ? "DeleteExpr[]" : "DeleteExpr");
+        dumpExpr(e->pointerExpr, childPrefix, true);
+    }
+    else {
+        printNode(prefix, isLast, "UnknownExpr");
+    }
+}
+
+// 语句打印：按动态类型分发
+static void dumpStmt(StmtPtr stmt, const std::string& prefix, bool isLast) {
+    if (!stmt) {
+        printNode(prefix, isLast, "nullptr");
+        return;
+    }
+
+    std::string branch = isLast ? "└── " : "├── ";
+    std::string childPrefix = prefix + (isLast ? "    " : "│   ");
+
+    if (auto s = std::dynamic_pointer_cast<ExprStmt>(stmt)) {
+        printNode(prefix, isLast, "ExprStmt");
+        dumpExpr(s->expr, childPrefix, true);
+    }
+    else if (auto s = std::dynamic_pointer_cast<VarDeclStmt>(stmt)) {
+        std::string typeStr = s->declaredType ? s->declaredType->toString() : "auto";
+        printNode(prefix, isLast, std::format("VarDeclStmt: {} : {}", s->name, typeStr));
+        if (s->initializer) {
+            dumpExpr(s->initializer, childPrefix, true);
+        }
+    }
+    else if (auto s = std::dynamic_pointer_cast<AssignStmt>(stmt)) {
+        printNode(prefix, isLast, "AssignStmt");
+        dumpExpr(s->target, childPrefix, false);
+        dumpExpr(s->value, childPrefix, true);
+    }
+    else if (auto s = std::dynamic_pointer_cast<ReturnStmt>(stmt)) {
+        printNode(prefix, isLast, "ReturnStmt");
+        if (s->value) {
+            dumpExpr(s->value, childPrefix, true);
+        }
+    }
+    else if (auto s = std::dynamic_pointer_cast<IfStmt>(stmt)) {
+        printNode(prefix, isLast, "IfStmt");
+        std::cout << childPrefix << "├── condition\n";
+        dumpExpr(s->condition, childPrefix + "│   ", true);
+        std::cout << childPrefix << "├── thenBranch\n";
+        dumpStmt(s->thenBranch, childPrefix + "│   ", true);
+        if (s->elseBranch) {
+            std::cout << childPrefix << "└── elseBranch\n";
+            dumpStmt(s->elseBranch, childPrefix + "    ", true);
+        }
+    }
+    else if (auto s = std::dynamic_pointer_cast<WhileStmt>(stmt)) {
+        printNode(prefix, isLast, "WhileStmt");
+        std::cout << childPrefix << "├── condition\n";
+        dumpExpr(s->condition, childPrefix + "│   ", true);
+        std::cout << childPrefix << "└── body\n";
+        dumpStmt(s->body, childPrefix + "    ", true);
+    }
+    else if (auto s = std::dynamic_pointer_cast<BlockStmt>(stmt)) {
+        printNode(prefix, isLast, "BlockStmt");
+        for (size_t i = 0; i < s->statements.size(); ++i) {
+            bool last = (i + 1 == s->statements.size());
+            dumpStmt(s->statements[i], childPrefix, last);
+        }
+    }
+    else if (auto s = std::dynamic_pointer_cast<DeleteStmt>(stmt)) {
+        printNode(prefix, isLast, s->isArray ? "DeleteStmt[]" : "DeleteStmt");
+        dumpExpr(s->pointerExpr, childPrefix, true);
+    }
+    else {
+        printNode(prefix, isLast, "UnknownStmt");
+    }
+}
+
+// Block 打印（函数体）
+static void dumpBlock(std::shared_ptr<BlockStmt> block, const std::string& prefix) {
+    if (!block) return;
+    std::cout << prefix << "└── Block\n";
+    std::string childPrefix = prefix + "    ";
+    for (size_t i = 0; i < block->statements.size(); ++i) {
+        bool last = (i + 1 == block->statements.size());
+        dumpStmt(block->statements[i], childPrefix, last);
+    }
+}
+
+// 函数体打印（支持普通函数、构造函数、析构函数）
+static void dumpFunctionBody(FuncDeclPtr func, const std::string& prefix) {
+    if (!func || !func->body) return;
+
+    std::string childPrefix = prefix + "    ";
+
+    // 构造函数的初始化列表
+    if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(func)) {
+        if (!ctor->initList.empty()) {
+            std::cout << prefix << "├── InitList\n";
+            for (size_t i = 0; i < ctor->initList.size(); ++i) {
+                bool last = (i + 1 == ctor->initList.size());
+                std::string branch = last ? "└── " : "├── ";
+                std::cout << childPrefix << branch << ctor->initList[i].memberName << "\n";
+                std::string argPrefix = childPrefix + (last ? "    " : "│   ");
+                for (size_t j = 0; j < ctor->initList[i].arguments.size(); ++j) {
+                    bool lastArg = (j + 1 == ctor->initList[i].arguments.size());
+                    dumpExpr(ctor->initList[i].arguments[j], argPrefix, lastArg);
+                }
             }
         }
     }
+
+    // 函数体
+    if (func->body) {
+        dumpBlock(func->body, prefix);
+    }
+}
+
+// 顶层声明打印
+void dumpAST(const TranslationUnit& unit) {
+    std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║  语法树 (Abstract Syntax Tree)                                   ║\n";
+    std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
+    std::cout << "\n  TranslationUnit\n";
+
+    for (size_t i = 0; i < unit.declarations.size(); ++i) {
+        bool isLast = (i + 1 == unit.declarations.size());
+        std::string prefix = "  ";
+        std::string branch = isLast ? "└── " : "├── ";
+        std::string childPrefix = prefix + (isLast ? "    " : "│   ");
+
+        auto& decl = unit.declarations[i];
+
+        if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
+            std::string bases;
+            if (!cls->baseClassNames.empty()) {
+                bases = " : ";
+                for (size_t j = 0; j < cls->baseClassNames.size(); ++j) {
+                    bases += (j ? ", " : "") + cls->baseClassNames[j];
+                }
+            }
+            std::cout << prefix << branch << std::format("ClassDecl: {}{}\n", cls->name, bases);
+
+            // 字段
+            for (size_t j = 0; j < cls->fields.size(); ++j) {
+                auto& f = cls->fields[j];
+                bool lastField = (j + 1 == cls->fields.size()) && cls->methods.empty();
+                std::string typeStr = f.type ? f.type->toString() : "?";
+                std::cout << childPrefix << (lastField ? "└── " : "├── ")
+                          << std::format("Field: {} : {} (+{}, {}B)\n",
+                              f.name, typeStr, f.offset, f.size);
+            }
+
+            // 方法
+            for (size_t j = 0; j < cls->methods.size(); ++j) {
+                auto& method = cls->methods[j];
+                bool lastMethod = (j + 1 == cls->methods.size());
+                std::string flags;
+                if (method->isVirtual) flags += " [virtual]";
+                if (method->isOverride) flags += " [override]";
+                if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(method)) {
+                    flags += " [ctor]";
+                }
+                if (auto dtor = std::dynamic_pointer_cast<DestructorDecl>(method)) {
+                    flags += " [dtor]";
+                }
+
+                std::string retStr = method->returnType ? method->returnType->toString() : "void";
+                std::cout << childPrefix << (lastMethod ? "└── " : "├── ")
+                          << std::format("Method: {}() → {}{}\n",
+                              method->name, retStr, flags);
+
+                if (method->body) {
+                    dumpFunctionBody(method, childPrefix + (lastMethod ? "    " : "│   "));
+                }
+            }
+        }
+        else if (auto func = std::dynamic_pointer_cast<FunctionDecl>(decl)) {
+            std::string retStr = func->returnType ? func->returnType->toString() : "?";
+            std::cout << prefix << branch << std::format("FunctionDecl: {}() → {}\n",
+                func->name, retStr);
+
+            // 参数
+            for (size_t j = 0; j < func->parameters.size(); ++j) {
+                bool lastParam = (j + 1 == func->parameters.size()) && !func->body;
+                std::string typeStr = func->parameters[j].type ?
+                    func->parameters[j].type->toString() : "?";
+                std::cout << childPrefix << (lastParam ? "└── " : "├── ")
+                          << std::format("Param: {} : {}\n",
+                              func->parameters[j].name, typeStr);
+            }
+
+            if (func->body) {
+                dumpFunctionBody(func, childPrefix);
+            }
+        }
+        else if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+            std::string typeStr = gvar->declaredType ? gvar->declaredType->toString() : "auto";
+            std::cout << prefix << branch << std::format("GlobalVarDecl: {} : {}\n",
+                gvar->name, typeStr);
+            if (gvar->initializer) {
+                dumpExpr(gvar->initializer, childPrefix, true);
+            }
+        }
+        else if (auto enm = std::dynamic_pointer_cast<EnumDecl>(decl)) {
+            std::cout << prefix << branch << std::format("EnumDecl: {} ({} items)\n",
+                enm->name, enm->items.size());
+            for (size_t j = 0; j < enm->items.size(); ++j) {
+                bool lastItem = (j + 1 == enm->items.size());
+                std::cout << childPrefix << (lastItem ? "└── " : "├── ")
+                          << std::format("{} = {}\n", enm->items[j].name, enm->items[j].value);
+            }
+        }
+        else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
+            std::cout << prefix << branch << std::format("NamespaceDecl: {}\n", ns->name);
+            // 递归打印命名空间内容
+            TranslationUnit subUnit;
+            subUnit.declarations = ns->declarations;
+            for (size_t j = 0; j < subUnit.declarations.size(); ++j) {
+                // 简单递归（可以优化为更完整的实现）
+                std::cout << childPrefix << "  ...\n";
+                break;
+            }
+        }
+        else if (auto ta = std::dynamic_pointer_cast<TypeAliasDecl>(decl)) {
+            std::string typeStr = ta->underlyingType ? ta->underlyingType->toString() : "?";
+            std::cout << prefix << branch << std::format("TypeAliasDecl: {} = {}\n",
+                ta->aliasName, typeStr);
+        }
+        else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
+            std::string params = "<";
+            for (size_t j = 0; j < tmpl->typeParams.size(); ++j) {
+                params += (j ? ", " : "") + tmpl->typeParams[j];
+            }
+            params += ">";
+            std::cout << prefix << branch << std::format("TemplateDecl({}){}\n",
+                tmpl->isClassTemplate() ? "class" : "function", params);
+
+            if (tmpl->classTemplate) {
+                std::cout << childPrefix << "└── ClassTemplate\n";
+                // 可以递归打印类模板内容
+            }
+            if (tmpl->funcTemplate) {
+                std::string retStr = tmpl->funcTemplate->returnType ?
+                    tmpl->funcTemplate->returnType->toString() : "void";
+                std::cout << childPrefix << "└── "
+                          << std::format("FunctionTemplate: {}({} params) → {}\n",
+                              tmpl->funcTemplate->name,
+                              tmpl->funcTemplate->parameters.size(),
+                              retStr);
+            }
+        }
+    }
+
+    std::cout << "\n════════════════════════════════════════════════════════════\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -194,16 +494,24 @@ void dumpAST(const TranslationUnit& unit, int indent = 0) {
 int main(int argc, char* argv[]) {
     // 缺少输入文件 → 打印用法并以非零码退出
     if (argc < 2) {
-        std::cerr << "Usage: minicc <source.cpp> [-o output.s] [-I dir] [-E] "
+        std::cerr << "Usage: minicc <source.cpp> [-o output] [-I dir] [-S] [-E] "
                      "[--dump-tokens] [--dump-ast]\n";
         return 1;
     }
 
     std::string inputFile = argv[1];
     std::string outputFile;
-    bool dumpTokensFlag = false;
-    bool dumpAstFlag = false;
+    // ── DumpOptions：诊断可视化标志 ──
+    // 正常编译不变，--dump-* 按需触发对应的可视化输出
+    struct DumpOptions {
+        bool tokens = false;        // --dump-tokens
+        bool ast = false;           // --dump-ast
+        bool hierarchy = false;     // --dump-hierarchy
+        bool layout = false;        // --dump-layout
+        bool any() const { return tokens || ast || hierarchy || layout; }
+    } dump;
     bool emitPreprocessed = false;          // -E：只输出预处理结果（同 gcc -E）
+    bool emitAsmOnly = false;              // -S：只吐汇编，不链接（同 gcc -S）
     std::vector<std::string> includeDirs;   // -I 搜索目录（可多次）
 
     // 解析命令行参数
@@ -217,17 +525,29 @@ int main(int argc, char* argv[]) {
             includeDirs.push_back(argv[++i]);
         } else if (arg == "-E") {
             emitPreprocessed = true;
+        } else if (arg == "-S") {
+            emitAsmOnly = true;             // 只到汇编为止（保留旧行为）
         } else if (arg == "--dump-tokens") {
-            dumpTokensFlag = true;
+            dump.tokens = true;
         } else if (arg == "--dump-ast") {
-            dumpAstFlag = true;
+            dump.ast = true;
+        } else if (arg == "--dump-hierarchy") {
+            dump.hierarchy = true;
+        } else if (arg == "--dump-layout") {
+            dump.layout = true;
         }
     }
 
     // 默认输出文件名（-E 模式不需要）
     if (outputFile.empty() && !emitPreprocessed) {
-        outputFile = std::filesystem::path(inputFile)
-            .replace_extension(".s").string();
+        if (emitAsmOnly) {
+            outputFile = std::filesystem::path(inputFile)
+                .replace_extension(".s").string();
+        } else {
+            // 默认直出可执行文件（同 gcc：去扩展名）
+            outputFile = std::filesystem::path(inputFile)
+                .replace_extension("").string();
+        }
     }
 
     // 六个阶段串联执行；任何阶段抛出的异常（预处理错/语法错/类型错...）
@@ -274,7 +594,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << std::format("  {} tokens generated\n", tokens.size());
 
-        if (dumpTokensFlag) {
+        if (dump.tokens) {
             std::cout << "\n  Token dump:\n";
             dumpTokens(tokens);
         }
@@ -292,7 +612,7 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("  {} top-level declarations parsed\n",
             unit.declarations.size());
 
-        if (dumpAstFlag) {
+        if (dump.ast) {
             std::cout << "\n  AST dump:\n";
             dumpAST(unit);
         }
@@ -335,6 +655,14 @@ int main(int argc, char* argv[]) {
                     field.type ? field.type->toString() : "?",
                     field.offset, field.size);
             }
+        }
+
+        // ── 诊断可视化输出（--dump-* 触发）──
+        if (dump.hierarchy) {
+            semaAnalyzer.dumpHierarchy(classTypes);
+        }
+        if (dump.layout) {
+            semaAnalyzer.dumpLayout(classTypes);
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -445,21 +773,49 @@ int main(int argc, char* argv[]) {
         CodeGen codegen;
         std::string assembly = codegen.generate(unit, classTypes, functions);
 
-        // 写入汇编文件
-        writeFile(outputFile, assembly);
-        std::cout << std::format("  Assembly written to: {}\n", outputFile);
+        // 写入汇编文件（-S 模式写到 -o 目标；默认模式写临时 .s 供阶段 6 链接）
+        if (emitAsmOnly) {
+            writeFile(outputFile, assembly);
+            std::cout << std::format("  Assembly written to: {}\n", outputFile);
+        }
 
         // ═══════════════════════════════════════════════════════════════
-        // 阶段 6：链接（简化：输出提示信息）
+        // 阶段 6：链接（系统 as + 内置 mini-ld → 可执行文件）
         // ═══════════════════════════════════════════════════════════════
-        // 教学版到此为止：汇编落盘后把链接委托给系统工具链（后续计划：自动链接）
         printPhase("Phase 6: Linking (链接)");
-        std::cout << "  Assembly file ready for system assembler/linker.\n";
-        std::cout << std::format("  To assemble and link:\n");
-        std::cout << std::format("    gcc -o output {} -lstdc++\n", outputFile);
-        std::cout << std::format("    # 或:\n");
-        std::cout << std::format("    as -o output.o {} && ld -o output output.o -lc\n",
-            outputFile);
+
+        if (emitAsmOnly) {
+            // -S：止步于汇编（等价 gcc -S），链接器不出场
+            std::cout << "  -S 已指定：只输出汇编，跳过链接。\n";
+            printPhase("Compilation Complete! 编译完成!");
+            return 0;
+        }
+
+        // 中间文件放系统临时目录，不污染用户目录
+        std::string stem = std::filesystem::path(outputFile).filename().string();
+        auto tmpDir = std::filesystem::temp_directory_path();
+        std::string asmPath = (tmpDir / ("minicc_" + stem + ".s")).string();
+        std::string objPath = (tmpDir / ("minicc_" + stem + ".o")).string();
+        writeFile(asmPath, assembly);
+
+        // ① 汇编：借用系统 as（汇编器只做机械翻译，见 docs/learn/09）
+        std::cout << std::format("  [as] {} → {}\n", asmPath, objPath);
+        int rc = std::system(("as -o " + objPath + " " + asmPath).c_str());
+        if (rc != 0) {
+            std::cerr << std::format("[ERROR] 汇编失败 (as 退出码 {})\n", rc);
+            return 1;
+        }
+
+        // ② 链接：内置 MiniLinker（符号决议 + 重定位回填 + 写可执行 ELF）
+        MiniLinker linker;
+        LinkResult lr = linker.link({objPath}, outputFile);
+        if (!lr.ok) {
+            std::cerr << std::format("\n[LINK ERROR] {}\n", lr.errorMsg);
+            return 1;
+        }
+        std::cout << std::format("  链接成功：{} 个符号决议, {} 条重定位回填, 入口 {:#x}\n",
+            lr.inputSymbols, lr.resolvedRelocs, lr.entryAddr);
+        std::cout << std::format("  可执行文件: {}   （直接运行: {}）\n", outputFile, outputFile);
 
         printPhase("Compilation Complete! 编译完成!");
         return 0;
