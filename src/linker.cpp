@@ -72,7 +72,8 @@ constexpr uint16_t ET_REL  = 1, ET_EXEC = 2;
 constexpr uint16_t EM_X86_64 = 62;
 constexpr uint32_t PT_LOAD = 1;
 constexpr uint32_t PF_X = 1, PF_W = 2, PF_R = 4;
-constexpr uint32_t SHT_PROGBITS = 1, SHT_SYMTAB = 2;
+constexpr uint32_t SHT_PROGBITS [[maybe_unused]] = 1;   // 本项目节头按序号取，暂未按类型筛
+constexpr uint32_t SHT_SYMTAB = 2;
 constexpr uint32_t SHT_RELA = 4, SHT_NOBITS = 8;
 constexpr uint16_t SHN_UNDEF = 0;
 constexpr uint8_t  STT_SECTION = 3;
