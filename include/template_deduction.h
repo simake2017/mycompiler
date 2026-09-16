@@ -41,6 +41,7 @@
 
 #include "ast.h"
 #include "type.h"
+#include "template_instantiation.h"   // DecltypeEvaluator / SubstitutionFailure
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,6 +69,9 @@ struct DeductionResult {
     std::vector<DeductionStep> trace;
 };
 
+// 替换表：模板形参名 → 已推出的类型（合一算法的「解」）
+using Subst = std::unordered_map<std::string, TypePtr>;
+
 class TemplateDeducer {
 public:
     // 【做什么】对一次函数模板调用执行完整推导：S3 显式前缀 → S2 逐对合一 → S4 收尾检查
@@ -87,17 +91,67 @@ public:
                            const std::vector<bool>& argIsLValue,
                            const std::vector<TypePtr>& explicitArgs = {});
 
-private:
-    using Subst = std::unordered_map<std::string, TypePtr>;
+    // 【做什么】偏特化匹配（[temp.class.spec.match]）：用使用点实参 args 去推导
+    //           偏特化模式 pattern 中的模板参数，逐位合一。
+    // 【理论】与函数模板实参推导是同一个合一算法——都复用下面的 deducePair。
+    //         偏特化 Box<T*, T> 对实参 Box<double*, double> ⇒ {T := double}
+    // 【demo】pattern=[T*, T]、args=[double*, double] → 成功，subst={T→double}
+    //         pattern=[T*, T]、args=[int, int]      → 失败（指针结构失配）
+    // 返回：全部位匹配成功 → true；任一位失败 → false 并填 failReason
+    // 注：不做 [temp.class.order] 偏序裁决（多偏特化同时匹配时取先成功者）。
+    bool matchPattern(const std::vector<TypePtr>& pattern,
+                      const std::vector<TypePtr>& args,
+                      const std::vector<std::string>& paramNames,
+                      std::unordered_map<std::string, TypePtr>& subst,
+                      std::string& failReason);
+
+    // decltype / void_t 的求值回调（见 DecltypeEvaluator）。
+    // nullptr（默认，单元测试路径）→ 模式中的 void_t 不求值。
+    void setDecltypeEvaluator(DecltypeEvaluator* ev) { m_decltypeEval = ev; }
+    // 成员类型查表回调：reducePattern 里临时建的 instantiator 要用它
+    // （void_t<typename T::type> 这类模式位要靠它在替换阶段查表）。
+    void setMemberTypeResolver(MemberTypeResolver* r) { m_memberResolver = r; }
+    // 别名模板展开回调：同样给 reducePattern 里那个临时 instantiator 用
+    // （偏特化模式位写成别名模板 id 时，靠它在替换阶段解糖）。
+    void setAliasTemplateResolver(AliasTemplateResolver* r) { m_aliasResolver = r; }
 
     // 逐对 P/A 推导（对应 TemplateDeductionCallback::Deduce）
     // 【做什么】对单个 (P, A) 做结构化合一：自外向内递归剥壳
     //   （const → 引用 → 指针），直到 P 中出现裸模板参数（绑定）
     //   或 P 完全非依赖（要求 P == A 恒等）。
     // 【标准】[temp.deduct.call]（引用/const/值传递调整）、[temp.deduct.type]（类型等价）
+    // 【为什么是 public】CTAD（[dcl.type.class.deduct]）要拿**构造函数形参**
+    //   当模式、构造实参当被推项，直接调它做逐位合一 —— 见
+    //   SemanticAnalyzer::deduceClassTemplateArgs。CTAD 与函数模板推导
+    //   共用这一个核心，正是"同一套合一算法换个方向用"的落地点。
     bool deducePair(const TypePtr& P, const TypePtr& A, bool argIsLValue,
                     const std::vector<std::string>& paramNames,
                     Subst& subst, DeductionResult& out);
+
+private:
+    // 模式位里的别名模板 id 解糖：`Vec<T>` → `MyPtr<T>`（[temp.alias]/1）。
+    // 名字不是别名模板（或没挂解析器）时原样返回。见实现处的详细说明。
+    TypePtr desugarAlias(const TypePtr& P,
+                         const std::unordered_map<std::string, TypePtr>& subst);
+
+    DecltypeEvaluator* m_decltypeEval = nullptr;
+    MemberTypeResolver* m_memberResolver = nullptr;
+    AliasTemplateResolver* m_aliasResolver = nullptr;
+
+    // 【做什么】模式归约：把模式中"需要求值才能变成具体类型"的位置先算出来。
+    // 【为什么需要】匹配 is_range<T, void_t<decltype(declval<T>().begin())>>
+    //   这类模式时，模式第 2 位不是一个类型，而是"一个待求值的表达式工厂"。
+    //   必须先用【已经积累到的】替换表（第 1 位刚推出的 T := vector<int>）
+    //   把它算成 void，才能与实参第 2 位的 void 比较。
+    //   求值失败 → 抛 SubstitutionFailure → 由 matchPattern 捕获为"不匹配"。
+    // 【demo】P=void_t<decltype(declval<T>().begin())>，subst={T→vector<int>}
+    //           → 替换：declval<vector<int>>().begin()
+    //           → 求值：int（合法）→ 归约为 void
+    //         若 subst={T→int} → declval<int>().begin() 不合法 → 抛 → 不匹配 ✓
+    // 对照 clang：DeduceTemplateArguments 中模式侧先走 SubstType（含 SFINAE guard），
+    //   失败即返回 TDK_SubstitutionFailure，调用方据此移除候选。
+    TypePtr reducePattern(const TypePtr& P,
+                          const std::unordered_map<std::string, TypePtr>& subst);
 
     // 绑定模板参数（一致性检查 = 替换合成）
     // 【做什么】把 paramName := type 写入替换表；若 paramName 已有绑定，

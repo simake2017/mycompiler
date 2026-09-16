@@ -4,310 +4,310 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Animal_speak
-    Animal_speak:
+        .globl Animal_speak             # 导出函数符号，使链接器可见
+    Animal_speak:                       # 函数入口标签
     # Function: speak (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_Animal
-    Animal_Animal:
+        .globl Animal_Animal             # 导出函数符号，使链接器可见
+    Animal_Animal:                       # 函数入口标签
     # Function: Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV6Animal(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV6Animal(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_dtor
-    Animal_dtor:
+        .globl Animal_dtor             # 导出函数符号，使链接器可见
+    Animal_dtor:                       # 函数入口标签
     # Function: ~Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_speak
-    Dog_speak:
+        .globl Dog_speak             # 导出函数符号，使链接器可见
+    Dog_speak:                       # 函数入口标签
     # Function: speak (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_Dog
-    Dog_Dog:
+        .globl Dog_Dog             # 导出函数符号，使链接器可见
+    Dog_Dog:                       # 函数入口标签
     # Function: Dog (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV3Dog(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV3Dog(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_dtor
-    Dog_dtor:
+        .globl Dog_dtor             # 导出函数符号，使链接器可见
+    Dog_dtor:                       # 函数入口标签
     # Function: ~Dog (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var d = ...
     # new Dog()
-    movq $24, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    leaq _ZTV3Dog(%rip), %rcx    # vtable address
-    addq $16, %rcx              # skip to vtable[0]
-    movq (%rsp), %rax           # load objPtr
-    movq %rcx, (%rax)           # obj._vptr = vtable (primary)
-    movq (%rsp), %rdi             # this pointer
-    callq Dog_Dog              # call constructor
-    popq %rax                     # return objPtr
+    movq $24, %rdi             # malloc 分配大小：24 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    leaq _ZTV3Dog(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq (%rsp), %rax           # 从栈上取回对象指针
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Dog_Dog                 # 调用构造函数 Dog_Dog
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Dog()
-    movq %rax, -16(%rbp)    # store to d
-    movq $30, %rax           # int literal
+    movq %rax, -16(%rbp)       # 存储到局部变量 d
+    movq $30, %rax           # 整数字面量载入 rax
     # member assign: .speed = ...
-    movq -16(%rbp), %rax    # load d
-    movq %rax, %rcx                # object address
-    movq $30, %rax           # int literal
-    movl %eax, 16(%rcx)    # .speed (offset 16)
+    movq -16(%rbp), %rax    # 加载局部变量 d 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $30, %rax           # 整数字面量载入 rax
+    movl %eax, 16(%rcx)    # 写入字段 .speed（偏移 +16）
     # var a = ...
     # dynamic_cast<Animal*>(operand) —— 运行时 RTTI 检查
-    movq -16(%rbp), %rax    # load d
-    movq %rax, %rdi              # arg1: object pointer
-    leaq _ZTI6Animal(%rip), %rsi    # arg2: target typeinfo
-    callq __minicc_dynamic_cast  # runtime RTTI walk
+    movq -16(%rbp), %rax    # 加载局部变量 d 到 rax
+    movq %rax, %rdi              # 参数 1：源对象指针
+    leaq _ZTI6Animal(%rip), %rsi    # 参数 2：目标 typeinfo
+    callq __minicc_dynamic_cast  # 调用运行时 RTTI 遍历检查类型兼容性
     # %rax = 成功:原指针 / 失败:0 (Animal) 
-    movq %rax, -24(%rbp)    # store to a
+    movq %rax, -24(%rbp)       # 存储到局部变量 a
     # if condition
     # binary expr
-    movq -24(%rbp), %rax    # load a
-    pushq %rax
-    xorq %rax, %rax                # nullptr = 0
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_1
+    movq -24(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    xorq %rax, %rax             # nullptr = 0（x86 惯用自异或清零）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_1                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
-    endif_1:
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_1:                        # endif 标签
     # var d2 = ...
     # dynamic_cast<Dog*>(operand) —— 运行时 RTTI 检查
-    movq -24(%rbp), %rax    # load a
-    movq %rax, %rdi              # arg1: object pointer
-    leaq _ZTI3Dog(%rip), %rsi    # arg2: target typeinfo
-    callq __minicc_dynamic_cast  # runtime RTTI walk
+    movq -24(%rbp), %rax    # 加载局部变量 a 到 rax
+    movq %rax, %rdi              # 参数 1：源对象指针
+    leaq _ZTI3Dog(%rip), %rsi    # 参数 2：目标 typeinfo
+    callq __minicc_dynamic_cast  # 调用运行时 RTTI 遍历检查类型兼容性
     # %rax = 成功:原指针 / 失败:0 (Dog) 
-    movq %rax, -32(%rbp)    # store to d2
+    movq %rax, -32(%rbp)       # 存储到局部变量 d2
     # if condition
     # binary expr
-    movq -32(%rbp), %rax    # load d2
-    pushq %rax
-    xorq %rax, %rax                # nullptr = 0
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_3
+    movq -32(%rbp), %rax    # 加载局部变量 d2 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    xorq %rax, %rax             # nullptr = 0（x86 惯用自异或清零）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_3                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $2, %rax           # int literal
-    leave
-    ret
-    endif_3:
+    movq $2, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_3:                        # endif 标签
     # if condition
     # binary expr
     # member access: .speed
-    movq -32(%rbp), %rax    # load d2
-    movl 16(%rax), %eax    # .speed (offset 16, 4B)
-    pushq %rax
-    movq $30, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    setne %al                    # !=
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_5
+    movq -32(%rbp), %rax    # 加载局部变量 d2 到 rax
+    movl 16(%rax), %eax    # 读取字段 .speed（偏移 +16，4B int）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $30, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    setne %al                   # 不等时 al = 1（ZF=0）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_5                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $3, %rax           # int literal
-    leave
-    ret
-    endif_5:
+    movq $3, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_5:                        # endif 标签
     # if condition
     # binary expr
     # function call
-    movq -32(%rbp), %rax    # load d2
-    movq %rax, %rdi            # this = object address
+    movq -32(%rbp), %rax    # 加载局部变量 d2 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Dog::speak (vtable[0])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 0(%rax), %rax       # rax = vtable[0] (offset 0)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 0(%rax), %rax       # 从 vtable[0] 读出函数地址（偏移 0）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Dog::speak
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    setne %al                    # !=
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_7
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    setne %al                   # 不等时 al = 1（ZF=0）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_7                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $4, %rax           # int literal
-    leave
-    ret
-    endif_7:
+    movq $4, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_7:                        # endif 标签
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
     # __minicc_dynamic_cast(obj, target_typeinfo) —— DFS RTTI 树匹配（多继承版）
-    __minicc_dynamic_cast:
-    testq %rdi, %rdi             # 空对象直接失败
-    je .Ldc_fail
-    movq (%rdi), %rcx            # vptr
-    movq -16(%rcx), %rdx         # offset-to-top (vptr[-2])
-    leaq (%rdi,%rdx), %rdi       # top = obj + ott (归顶到最派生对象)
-    movq -8(%rcx), %rdx          # most-derived typeinfo (vptr[-1])
-    xorq %rcx, %rcx              # acc_offset = 0
-    callq .Ldc_dfs               # DFS(ti, target, top, acc)
-    ret
-    .Ldc_dfs:
-    cmpq %rsi, %rdx              # ti == target?
-    je .Ldc_dfs_hit              # 命中 → return top + acc
-    movq 16(%rdx), %rax          # N = base count
-    testq %rax, %rax
-    je .Ldc_dfs_ret0             # 叶子节点（无基类）→ 失败
-    pushq %rbp
-    movq %rsp, %rbp
-    pushq %rdi                   # save top
-    pushq %rsi                   # save target
-    pushq %rdx                   # save current ti
-    pushq %rcx                   # save acc_offset
-    xorq %r12, %r12              # i = 0
-    movq 16(%rdx), %r13          # N = base count (r13 callee-saved)
-    .Ldc_dfs_loop:
-    cmpq %r13, %r12              # i >= N?
-    jge .Ldc_dfs_end
-    movq -24(%rbp), %rdx         # reload current ti
-    leaq 24(%rdx), %rax          # &bases[0]
-    imulq $16, %r12, %r14        # i * 16
-    addq %r14, %rax              # &bases[i]
-    movq (%rax), %rdx            # bases[i].typeinfo
-    movq 8(%rax), %rcx           # bases[i].offset
-    addq -32(%rbp), %rcx         # acc = parent_acc + bases[i].offset
-    callq .Ldc_dfs               # 递归搜索
-    testq %rax, %rax
-    jne .Ldc_dfs_found           # 子树命中！
-    incq %r12                    # i++
-    jmp .Ldc_dfs_loop
-    .Ldc_dfs_end:
-    xorq %rax, %rax
-    addq $32, %rsp               # pop acc, ti, target, top
-    popq %rbp
-    ret
-    .Ldc_dfs_hit:
-    movq %rdi, %rax
-    addq %rcx, %rax              # return top + acc_offset
-    ret
-    .Ldc_dfs_found:
-    addq $32, %rsp
-    popq %rbp
-    ret
-    .Ldc_dfs_ret0:
-    xorq %rax, %rax
-    ret
-    .Ldc_fail:
+    __minicc_dynamic_cast:        # 运行时助手入口：rdi=对象指针，rsi=目标 typeinfo
+    testq %rdi, %rdi             # 检测对象指针是否为空
+    je .Ldc_fail                 # 空指针直接走失败路径
+    movq (%rdi), %rcx            # 从对象首 8 字节读出 vptr
+    movq -16(%rcx), %rdx         # vptr[-2] = offset-to-top（次表偏移量）
+    leaq (%rdi,%rdx), %rdi       # top = obj + ott（归顶到最派生对象）
+    movq -8(%rcx), %rdx          # vptr[-1] = 最派生 typeinfo 地址
+    xorq %rcx, %rcx              # acc_offset = 0（累积偏移清零）
+    callq .Ldc_dfs               # 进入 DFS：DFS(ti, target, top, acc)
+    ret                          # 助手返回（rax = 转型结果或 0）
+    .Ldc_dfs:                    # DFS 递归入口：rdx=当前 ti，rsi=目标
+    cmpq %rsi, %rdx              # 当前 typeinfo 是否 == 目标？
+    je .Ldc_dfs_hit              # 命中：返回 top + acc
+    movq 16(%rdx), %rax          # 读取基类计数 N = ti[+16]
+    testq %rax, %rax             # N == 0 表示无基类（叶子节点）
+    je .Ldc_dfs_ret0             # 叶子节点直接返回 0
+    pushq %rbp                   # 保存旧栈帧基址
+    movq %rsp, %rbp              # 建立新栈帧
+    pushq %rdi                   # 保存 top（最派生对象地址）
+    pushq %rsi                   # 保存 target（目标 typeinfo）
+    pushq %rdx                   # 保存 current ti（当前 typeinfo）
+    pushq %rcx                   # 保存 acc_offset（累积偏移）
+    xorq %r12, %r12              # i = 0（基类遍历下标）
+    movq 16(%rdx), %r13          # N = base count（callee-saved 保存计数）
+    .Ldc_dfs_loop:               # 基类遍历循环开始
+    cmpq %r13, %r12              # i >= N？检查是否遍历完所有基类
+    jge .Ldc_dfs_end             # 遍历完成，跳到收尾
+    movq -24(%rbp), %rdx         # 从栈帧恢复 current ti
+    leaq 24(%rdx), %rax          # 计算 &bases[0]（ti + 24）
+    imulq $16, %r12, %r14        # i * 16（每个 base 条目 16 字节）
+    addq %r14, %rax              # &bases[i] = &bases[0] + i*16
+    movq (%rax), %rdx            # 加载 bases[i].typeinfo
+    movq 8(%rax), %rcx           # 加载 bases[i].offset
+    addq -32(%rbp), %rcx         # acc = parent_acc + bases[i].offset（累积偏移）
+    callq .Ldc_dfs               # 递归搜索子树
+    testq %rax, %rax             # 检测递归结果是否为 0
+    jne .Ldc_dfs_found           # 子树命中！直接透传
+    incq %r12                    # i++（继续下一个基类）
+    jmp .Ldc_dfs_loop            # 循环继续
+    .Ldc_dfs_end:                # 所有基类都没命中，返回 0
+    xorq %rax, %rax              # 结果清零
+    addq $32, %rsp               # 释放 4 个保存槽（acc, ti, target, top）
+    popq %rbp                    # 恢复栈帧基址
+    ret                          # 返回失败
+    .Ldc_dfs_hit:                # 当前 ti == target，命中路径
+    movq %rdi, %rax              # rax = top（最派生对象地址）
+    addq %rcx, %rax              # rax = top + acc_offset（调整后指针）
+    ret                          # 返回转型成功
+    .Ldc_dfs_found:              # 子树递归命中，透传结果
+    addq $32, %rsp               # 释放 4 个保存槽
+    popq %rbp                    # 恢复栈帧基址
+    ret                          # 返回命中结果
+    .Ldc_dfs_ret0:               # 叶子节点（无基类）失败路径
+    xorq %rax, %rax              # 结果清零
+    ret                          # 返回 0
+    .Ldc_fail:                   # 入口空指针失败路径
     xorq %rax, %rax              # 失败：返回 0
-    ret
+    ret                          # 返回
     
 
     .data
-    .globl _ZTV3Dog
-    .align 8
-_ZTV3Dog:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI3Dog       # RTTI type_info pointer (vtable[-1])
-    .quad Dog_speak   # vtable[0]: Dog_speak
+    .globl _ZTV6Animal             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV6Animal:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI6Animal       # RTTI type_info 指针（vtable[-1]）
+    .quad Animal_speak   # vtable[0]: 虚函数 Animal_speak
 
-    .globl _ZTI3Dog
-    .align 8
-_ZTI3Dog:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Dog                 # type name string
-    .quad 1                 # base class count (MI counting-style)
-    .quad _ZTI6Animal                 # base[Animal] typeinfo
-    .quad 0                 # base[Animal] subobject offset
+    .globl _ZTI6Animal             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI6Animal:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Animal                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
-    .globl _ZTV6Animal
-    .align 8
-_ZTV6Animal:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI6Animal       # RTTI type_info pointer (vtable[-1])
-    .quad Animal_speak   # vtable[0]: Animal_speak
+    .globl _ZTV3Dog             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV3Dog:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI3Dog       # RTTI type_info 指针（vtable[-1]）
+    .quad Dog_speak   # vtable[0]: 虚函数 Dog_speak
 
-    .globl _ZTI6Animal
-    .align 8
-_ZTI6Animal:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Animal                 # type name string
-    .quad 0                 # no base classes
+    .globl _ZTI3Dog             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI3Dog:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Dog                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI6Animal                 # base[Animal] typeinfo 指针
+    .quad 0                 # base[Animal] 子对象偏移（字节）
 
 
     .section .rodata
-.Ltype_name_Dog:
-    .string "Dog"           # type name
-.Ltype_name_Animal:
-    .string "Animal"           # type name
+.Ltype_name_Animal:                     # 类型名称标签
+    .string "Animal"           # 类型名称字符串
+.Ltype_name_Dog:                     # 类型名称标签
+    .string "Dog"           # 类型名称字符串

@@ -38,6 +38,11 @@
 //   #if 常量表达式求值    lib/Lex/PPExpressions.cpp
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <cstddef>     // size_t —— readWord 的签名里用到（见下）。
+                       // 不写也能过（<string> 会传递地带上），但那是依赖传递包含：
+                       // IDE 索引器单独解析本头文件时可能解不出 size_t，于是签名
+                       // 与 src/preprocessor.cpp 里的定义对不上，跨文件跳转失效。
+                       // 同类问题在 include/sfinae.h 上已实证过一次。
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -92,7 +97,7 @@ private:
     std::unordered_set<std::string> m_pragmaOnce;   // 已 pragma once 的 canonical 路径
     std::vector<std::string> m_includeStack;        // 循环 include 检测
     int m_includeCount = 0;
-    // wangyang 调试：expand 递归深度（仅用于日志缩进，不影响逻辑）
+    // 调试：expand 递归深度（仅用于日志缩进，不影响逻辑）
     int m_expandDepth = 0;
 
     // 处理一段源文本（主文件或某个被包含文件）

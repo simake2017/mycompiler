@@ -4,64 +4,60 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Math::scale
-    Math::scale:
+        .globl Math__scale             # 导出函数符号，使链接器可见
+    Math__scale:                       # 函数入口标签
     # Function: Math::scale (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)    # param: x
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load x
-    pushq %rax
-    movq $2, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $2, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var a = ...
-    movq $5, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to a
+    movq $5, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 a
     # var b = ...
     # function call
-    movq -16(%rbp), %rax    # load a
-    pushq %rax
-    popq %rdi
-    callq Math::scale               # function call
-    movq %rax, -24(%rbp)    # store to b
+    movq -16(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq Math__scale                  # 调用函数 Math__scale
+    movq %rax, -24(%rbp)       # 存储到局部变量 b
     # return expr
     # binary expr
-    movq g_total(%rip), %rax    # load global g_total
-    pushq %rax
-    movq -24(%rbp), %rax    # load b
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq g_total(%rip), %rax    # 加载全局变量 g_total 到 rax（RIP 相对寻址）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -24(%rbp), %rax    # 加载局部变量 b 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
 
     .data
-    .globl Math::g_factor
-    .align 8
-Math::g_factor:
-    .quad 2
+    .globl Math__g_factor             # 导出全局变量符号
+    .align 8                # 8 字节对齐
+Math__g_factor:                    # 全局变量标签
+    .quad 2              # 初始化值：2
 
-    .globl g_total
-    .align 8
-g_total:
-    .quad 10
+    .globl g_total             # 导出全局变量符号
+    .align 8                # 8 字节对齐
+g_total:                    # 全局变量标签
+    .quad 10              # 初始化值：10
 

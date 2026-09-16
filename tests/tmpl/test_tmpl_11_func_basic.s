@@ -4,25 +4,23 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var a = ...
-    movq $21, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to a
+    movq $21, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 a
     # return expr
     # binary expr
-    movq -16(%rbp), %rax    # load a
-    pushq %rax
-    movq $21, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
-    leave
-    ret
+    movq -16(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $21, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

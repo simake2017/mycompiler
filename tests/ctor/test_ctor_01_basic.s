@@ -4,88 +4,84 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Point_Point
-    Point_Point:
+        .globl Point_Point_2             # 导出函数符号，使链接器可见
+    Point_Point_2:                       # 函数入口标签
     # Function: Point (params: 2)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: px
-    movq %rdx, -24(%rbp)    # param: py
-    movq -16(%rbp), %rax    # load px
-    movq -8(%rbp), %rcx    # load this
-    movq %rax, 0(%rcx)    # init field x
-    movq -24(%rbp), %rax    # load py
-    movq -8(%rbp), %rcx    # load this
-    movq %rax, 4(%rcx)    # init field y
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 px 从寄存器 spill 到栈
+    movq %rdx, -24(%rbp)         # 形参 py 从寄存器 spill 到栈
+    movq -16(%rbp), %rax    # 加载局部变量 px 到 rax
+    movq -8(%rbp), %rcx       # 加载 this 指针
+    movl %eax, 0(%rcx)    # 初始化字段 x（偏移 0，4B）
+    movq -24(%rbp), %rax    # 加载局部变量 py 到 rax
+    movq -8(%rbp), %rcx       # 加载 this 指针
+    movl %eax, 4(%rcx)    # 初始化字段 y（偏移 4，4B）
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Point_sum
-    Point_sum:
+        .globl Point_sum             # 导出函数符号，使链接器可见
+    Point_sum:                       # 函数入口标签
     # Function: sum (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load this
-    movl 0(%rax), %eax    # load .x (offset 0)
-    pushq %rax
-    movq -8(%rbp), %rax    # load this
-    movl 4(%rax), %eax    # load .y (offset 4)
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 0(%rax), %eax    # 读取字段 .x（偏移 +0 字节）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 4(%rax), %eax    # 读取字段 .y（偏移 +4 字节）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Point_dtor
-    Point_dtor:
+        .globl Point_dtor             # 导出函数符号，使链接器可见
+    Point_dtor:                       # 函数入口标签
     # Function: ~Point (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var p = ...
     # new Point()
-    movq $8, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    movq $10, %rax           # int literal
-    pushq %rax
-    movq $20, %rax           # int literal
-    pushq %rax
-    popq %rdx
-    popq %rsi
-    movq (%rsp), %rdi             # this pointer
-    callq Point_Point              # call constructor
-    popq %rax                     # return objPtr
+    movq $8, %rdi             # malloc 分配大小：8 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    movq $10, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 构造实参压栈暂存
+    movq $20, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 构造实参压栈暂存
+    popq %rdx                   # 逆序弹出实参到寄存器
+    popq %rsi                   # 逆序弹出实参到寄存器
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Point_Point_2                 # 调用构造函数 Point_Point_2
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Point()
-    movq %rax, -16(%rbp)    # store to p
+    movq %rax, -16(%rbp)       # 存储到局部变量 p
     # return expr
     # function call
-    movq -16(%rbp), %rax    # load p
-    pushq %rax                   # save this pointer
-    popq %rdi                    # this pointer
-    callq Point_sum               # method call
-    leave
-    ret
-    leave
-    ret
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    pushq %rax                   # 暂存 this 指针到栈上
+    popq %rdi                   # 弹出 this 指针到 rdi（第 0 参数）
+    callq Point_sum                  # 调用方法 Point_sum
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

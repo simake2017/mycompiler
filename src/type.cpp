@@ -15,6 +15,18 @@
 namespace minicc {
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TemplateArg：模板实参的人读形态
+// ─────────────────────────────────────────────────────────────────────────────
+// 按 kind 分派：类型实参取类型名，非类型实参（NTTP）取十进制数字。
+// 这一步是"值 vs 类型"在字符串层面的体现——Buf<4> 打印成 "Buf<4>"，
+// 而若把 4 当成类型打印会得到无意义的 "?"。
+// demo：ofType(makeInt()).toString() → "int"；ofValue(4).toString() → "4"
+std::string TemplateArg::toString() const {
+    if (kind == TemplateArgKind::Type) return type ? type->toString() : "?";
+    return std::to_string(value);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 工厂方法：创建各种类型实例
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -86,7 +98,12 @@ TypePtr Type::makeRValueReference(TypePtr referenced) {
 // const 限定 const T。入参 inner = 被限定的内层类型。
 // demo：makeConst(Int) → Const(Int)，toString="const int"，encodeType→"Ki"
 //       makeConst(LValueReference(Int)) → const int&，encodeType→"KRi"
-// 本项目 const 总包在最外层（见 type.h"组合规则"）。
+// ★ const 落在哪一层由【源码位置】决定（[dcl.type.cv]，见 type.h"组合规则"）：
+//   makeConst(Int)               → Const(Int)            "const int"
+//   makeConst(Pointer(Int))      → Const(Pointer(Int))   "int* const"   （声明符侧）
+//   makePointer(makeConst(Int))  → Pointer(Const(Int))   "const int*"   （说明符侧）
+//   两种结构打印不同、mangling 不同、偏特化匹配结果也不同 —— 不可互换。
+// ※ 旧注释写"本项目 const 总包在最外层"，那是 ⑨ 修复前的实情，2026-09-14 更正。
 TypePtr Type::makeConst(TypePtr inner) {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Const;
@@ -126,6 +143,19 @@ TypePtr Type::makeAuto() {
     return t;
 }
 
+// decltype(expr) 半成品类型。入参 expr = 操作数；paren = 原文是否写成 decltype((e))。
+// demo：decltype(x) → Type{kind=Decltype, decltypeExpr=VarExpr{x}, decltypeParen=false}
+// 【不立即求值】：表达式原样留存，等 substituteType 阶段再求
+// （模板模式里 T 未知，此刻无法求）。对照 clang：DecltypeType。
+TypePtr Type::makeDecltype(DecltypeExprPtr expr, bool paren) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Decltype;
+    t->name = "decltype";          // 占位名；求值后整个节点被具体类型取代
+    t->decltypeExpr = std::move(expr);
+    t->decltypeParen = paren;
+    return t;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // sizeInBytes：获取类型占用的字节数
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,6 +181,7 @@ uint32_t Type::sizeInBytes() const {
         case TypeKind::Class:  return classLayout.totalSize;
         case TypeKind::TemplateParam: return 0; // 模板参数大小未知
         case TypeKind::Auto:   return 0; // auto 大小未知，等待推导
+        case TypeKind::Decltype: return 0; // decltype 未求值，大小未知
     }
     return 0;
 }
@@ -188,6 +219,14 @@ bool Type::equals(const TypePtr& other) const {
                 && innerType->equals(other->innerType);
 
         case TypeKind::Class:
+            // ★ 嵌套类型名（S<int>::type / T::type）不能只比 name ——
+            //   两个不同限定者的 "type" 会撞成相等（Box<int>::type 与
+            //   Box<double>::type 是不同类型）。必须连限定者一起递归比。
+            if (isNestedName() != other->isNestedName()) return false;
+            if (isNestedName()) {
+                return name == other->name
+                    && nestedQualifier->equals(other->nestedQualifier);
+            }
             return name == other->name; // 类类型按名字比较
 
         case TypeKind::TemplateParam:
@@ -195,6 +234,12 @@ bool Type::equals(const TypePtr& other) const {
 
         case TypeKind::Auto:
             return true; // auto 与 auto 相等
+
+        case TypeKind::Decltype:
+            // 未求值的 decltype 之间无从比较（操作数是表达式，不是类型）。
+            // 正常流程下不该走到这里：substituteType / resolveType 之后
+            // Decltype 节点应已被求值成具体类型并整体替换掉。
+            return false;
     }
     return false;
 }
@@ -217,20 +262,60 @@ std::string Type::toString() const {
             return referencedType ? referencedType->toString() + "&" : "?&";
         case TypeKind::RValueReference:
             return referencedType ? referencedType->toString() + "&&" : "?&&";
-        case TypeKind::Const:
-            return innerType ? "const " + innerType->toString() : "const ?";
+        case TypeKind::Const: {
+            if (!innerType) return "const ?";
+            // ★ 'const' 印在【哪一侧】由它限定的东西决定（[dcl.type.cv]）：
+            //     Const(Int)          → "const int"     限定基类型
+            //     Pointer(Const(Int)) → "const int*"    指针【指向】const
+            //     Const(Pointer(Int)) → "int* const"    const 的【指针】
+            //   此前一律输出 "const " + inner->toString()，于是
+            //   Pointer(Const(Int)) 与 Const(Pointer(Int)) 都印成 "const int*"
+            //   —— 两种不同结构拿到同一个字符串。危害不止是日志难读：
+            //   ① getOrInstantiateClass 的【缓存键】以 toString 为输入
+            //      ⇒ C<const int*>（指针指向 const）与 C<int* const>（const 指针）
+            //        共用一条缓存，后者的实例被前者的实例顶掉；
+            //   ② 实例名清洗（template_instantiation.cpp Step 2）同样吃 toString。
+            //   即"类型树的形状"与"人读串"必须是单射 —— 这是 ⑩ 那条教训的
+            //   同族问题：名字是另一层的键。
+            //   对照 clang：TypePrinter::printQualifiedType 按 TypeClass 分派，
+            //   指针的 const 走 printPointer 输出 "int *const"。
+            if (innerType->isPointer()) {
+                return (innerType->pointeeType ? innerType->pointeeType->toString() : "?")
+                       + "* const";
+            }
+            if (innerType->isLValueReference()) {
+                return (innerType->referencedType ? innerType->referencedType->toString() : "?")
+                       + "& const";
+            }
+            if (innerType->isRValueReference()) {
+                return (innerType->referencedType ? innerType->referencedType->toString() : "?")
+                       + "&& const";
+            }
+            return "const " + innerType->toString();
+        }
         case TypeKind::Class: {
-            // P3：模板 id（Box<int>）带上实参打印——人读形态对齐源码书写
+            // 嵌套类型名：印成限定者::成员（S<int>::type），与源码书写一致。
+            // 必须与普通类名区分开 —— 否则 S<int>::type 与类 "type" 同名，
+            // 又要重演 docs/learn/23 里"人读串不单射"的老问题。
+            if (isNestedName()) {
+                return (nestedQualifier ? nestedQualifier->toString() : "?")
+                       + "::" + name;
+            }
+            // P3 / NTTP：模板 id（Box<int>、Buf<4>）带上实参打印——人读形态对齐源码书写
+            // TemplateArg::toString 已按 kind 分派：类型实参取类型名，值实参取数字。
             if (templateArgs.empty()) return name;
             std::string s = name + "<";
             for (size_t i = 0; i < templateArgs.size(); i++) {
                 if (i > 0) s += ", ";
-                s += templateArgs[i] ? templateArgs[i]->toString() : "?";
+                s += templateArgs[i].toString();
             }
             return s + ">";
         }
         case TypeKind::TemplateParam: return templateParamName;
         case TypeKind::Auto:   return "auto";
+        case TypeKind::Decltype:
+            // 未求值形态：打印成 decltype(...)，括号数按原文还原，便于日志观察
+            return decltypeParen ? "decltype((...))" : "decltype(...)";
     }
     return "?";
 }

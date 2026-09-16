@@ -36,6 +36,7 @@ endif()
 # ─── 源文件 ────────────────────────────────────────────
 set(SOURCES
     src/preprocessor.cpp
+    src/sfinae.cpp
     src/lexer.cpp
     src/parser.cpp
     src/type.cpp
@@ -71,9 +72,13 @@ add_executable(unit_tests
     tests/unit/test_expr_parser.cpp
     tests/unit/test_expressions.cpp
     tests/unit/test_ast_nodes.cpp
+    tests/unit/test_decltype_sfinae.cpp
     tests/unit/test_rtti_layout.cpp
     tests/unit/test_typeinfo_suite.cpp
+    tests/unit/test_codegen_frame.cpp
+    tests/unit/test_ast_visitor.cpp
     src/preprocessor.cpp
+    src/sfinae.cpp
     src/lexer.cpp
     src/parser.cpp
     src/semantic_analyzer.cpp

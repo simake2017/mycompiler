@@ -4,65 +4,61 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl twice
-    twice:
+        .globl twice             # 导出函数符号，使链接器可见
+    twice:                       # 函数入口标签
     # Function: twice (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: x
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load x
-    pushq %rax
-    movq $3, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $3, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var r = ...
     # function call
-    movq $2, %rax           # int literal
-    pushq %rax
-    popq %rdi
-    callq twice               # function call
-    movq %rax, -16(%rbp)    # store to r
+    movq $2, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq twice                  # 调用函数 twice
+    movq %rax, -16(%rbp)       # 存储到局部变量 r
     # function call
-    xorq %rax, %rax                # nullptr = 0
-    pushq %rax
-    popq %rdi
-    callq _Z2poIvE               # function call
+    xorq %rax, %rax             # nullptr = 0（x86 惯用自异或清零）
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq _Z2poIvE                  # 调用函数 _Z2poIvE
     # return expr
     # binary expr
-    movq -16(%rbp), %rax    # load r
-    pushq %rax
-    movq $6, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
-    leave
-    ret
+    movq -16(%rbp), %rax    # 加载局部变量 r 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $6, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl _Z2poIvE
-    _Z2poIvE:
+        .globl _Z2poIvE             # 导出函数符号，使链接器可见
+    _Z2poIvE:                       # 函数入口标签
     # Function: po (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: x
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

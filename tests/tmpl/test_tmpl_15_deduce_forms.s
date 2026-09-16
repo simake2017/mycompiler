@@ -4,100 +4,92 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var a = ...
-    movq $35, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to a
+    movq $35, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 a
     # var r1 = ...
     # function call
-    movq -16(%rbp), %rax    # load a
-    pushq %rax
-    popq %rdi
-    callq _Z4echoIiE               # function call
-    movq %rax, -24(%rbp)    # store to r1
+    movq -16(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq _Z4echoIiE                  # 调用函数 _Z4echoIiE
+    movq %rax, -24(%rbp)       # 存储到局部变量 r1
     # var r2 = ...
     # function call
-    movq -16(%rbp), %rax    # load a
-    pushq %rax
-    popq %rdi
-    callq _Z3tagIiE               # function call
-    movq %rax, -32(%rbp)    # store to r2
+    movq -16(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq _Z3tagIiE                  # 调用函数 _Z3tagIiE
+    movq %rax, -32(%rbp)       # 存储到局部变量 r2
     # var r3 = ...
     # function call
-    movq $0, %rax           # int literal
-    pushq %rax
-    popq %rdi
-    callq _Z3fwdIiE               # function call
-    movq %rax, -40(%rbp)    # store to r3
+    movq $0, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq _Z3fwdIiE                  # 调用函数 _Z3fwdIiE
+    movq %rax, -40(%rbp)       # 存储到局部变量 r3
     # return expr
     # binary expr
     # binary expr
     # binary expr
-    movq -24(%rbp), %rax    # load r1
-    pushq %rax
-    movq -32(%rbp), %rax    # load r2
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
-    movq -40(%rbp), %rax    # load r3
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
-    movq $42, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
-    leave
-    ret
+    movq -24(%rbp), %rax    # 加载局部变量 r1 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -32(%rbp), %rax    # 加载局部变量 r2 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -40(%rbp), %rax    # 加载局部变量 r3 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $42, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl _Z4echoIiE
-    _Z4echoIiE:
+        .globl _Z4echoIiE             # 导出函数符号，使链接器可见
+    _Z4echoIiE:                       # 函数入口标签
     # Function: echo (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: x
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
     # return expr
-    movq -8(%rbp), %rax    # load x
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl _Z3tagIiE
-    _Z3tagIiE:
+        .globl _Z3tagIiE             # 导出函数符号，使链接器可见
+    _Z3tagIiE:                       # 函数入口标签
     # Function: tag (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: v
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 v 从寄存器 spill 到栈
     # return expr
-    movq $7, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $7, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl _Z3fwdIiE
-    _Z3fwdIiE:
+        .globl _Z3fwdIiE             # 导出函数符号，使链接器可见
+    _Z3fwdIiE:                       # 函数入口标签
     # Function: fwd (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: x
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
     # return expr
-    movq -8(%rbp), %rax    # load x
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

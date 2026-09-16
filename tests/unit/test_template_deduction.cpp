@@ -1065,3 +1065,274 @@ TEST(Instantiate, DifferentArgsDifferentSymbols) {
     std::printf("   twice<int>    → %s\n", funcs[0]->mangledName.c_str());
     std::printf("   twice<double> → %s\n", funcs[1]->mangledName.c_str());
 }
+
+// =============================================================================
+// NTTP（非类型模板参数）—— [temp.param]/6 + [temp.arg.nontype]
+// =============================================================================
+// 考察「类型 vs 值」两形态能否被区分：形参侧靠 TemplateParamKind，
+// 实参侧靠 TemplateArg 的 tag，替换侧靠 substituteType/cloneExpr 两层分工。
+
+// 30. NTTP 形参被 Parser 正确登记为 NonType（不是 Type）
+TEST(Nttp, ParamKindIsNonType) {
+    TemplateDeclPtr tmpl;
+    {
+        StdoutCapture cap;
+        tmpl = parseClassTmpl("template<int N> class Buf { public: int cap; };");
+    }
+
+    ASSERT_EQ(tmpl->templateParams.size(), 1u);
+    EXPECT_EQ(tmpl->templateParams[0].kind, TemplateParamKind::NonType);
+    EXPECT_EQ(tmpl->templateParams[0].name, "N");
+    ASSERT_NE(tmpl->templateParams[0].nonType, nullptr);
+    EXPECT_TRUE(tmpl->templateParams[0].nonType->isInt());
+
+    // ★ 同时盯住历史陷阱：typeParams 是退化的名字列表，
+    //   它把 NTTP 的 N 也当"类型形参名"收着——所以形态判定绝不能用它。
+    //   本断言把这个退化行为【固定】下来，防止有人误以为 typeParams 可靠。
+    ASSERT_EQ(tmpl->typeParams.size(), 1u);
+    EXPECT_EQ(tmpl->typeParams[0], "N");
+    std::printf("── NTTP 形参: kind=NonType name=N nonType=int "
+                "（而 typeParams[0]=\"N\" 已丢形态）\n");
+}
+
+// 31. 类型形参 vs 非类型形参：同一位置两种声明，kind 必须不同
+TEST(Nttp, TypeVsNonTypeDistinguished) {
+    TemplateDeclPtr typeTmpl, nttpTmpl;
+    {
+        StdoutCapture cap;
+        typeTmpl = parseClassTmpl("template<class T> class Box { public: T v; };");
+        nttpTmpl = parseClassTmpl("template<int N> class Buf { public: int c; };");
+    }
+
+    ASSERT_EQ(typeTmpl->templateParams.size(), 1u);
+    ASSERT_EQ(nttpTmpl->templateParams.size(), 1u);
+    EXPECT_EQ(typeTmpl->templateParams[0].kind, TemplateParamKind::Type);
+    EXPECT_EQ(nttpTmpl->templateParams[0].kind, TemplateParamKind::NonType);
+    // 两者的 typeParams 长得一样（都只有名字）——差别只在 templateParams
+    EXPECT_EQ(typeTmpl->typeParams[0], "T");
+    EXPECT_EQ(nttpTmpl->typeParams[0], "N");
+    std::printf("── 区分依据: templateParams[i].kind，而非 typeParams\n");
+}
+
+// 32. NTTP 的 Itanium 编码：<expr-primary> = L <type> <value> E
+TEST(Mangle, NttpInteger) {
+    auto m1 = NameMangler::mangleTemplateInstance("Buf", {TemplateArg::ofValue(4)});
+    EXPECT_EQ(m1, "_Z3BufILi4EE");
+    std::printf("── Mangle: Buf<4> → %s\n", m1.c_str());
+}
+
+// 33. NTTP 负数编码：n 表负（'-' 不是合法 mangling 字符）
+TEST(Mangle, NttpNegative) {
+    auto m = NameMangler::mangleTemplateInstance("Buf", {TemplateArg::ofValue(-3)});
+    EXPECT_EQ(m, "_Z3BufILin3EE");
+    std::printf("── Mangle: Buf<-3> → %s   （clang: _ZN3BufILin3EE4sizeEv）\n",
+                m.c_str());
+}
+
+// 34. 类型实参与值实参混排编码
+TEST(Mangle, NttpMixedWithType) {
+    auto m = NameMangler::mangleTemplateInstance(
+        "Pair", {TemplateArg::ofType(Type::makeInt()), TemplateArg::ofValue(8)});
+    EXPECT_EQ(m, "_Z4PairIiLi8EE");
+    std::printf("── Mangle: Pair<int, 8> → %s   （clang: _ZN4PairIiLi8EE5countEv）\n",
+                m.c_str());
+}
+
+// 35. 类型位置收到值实参 → 报错（NTTP 名被当类型用）
+//     对照 clang: err_nontype_template_parameter_used_as_type
+TEST(Nttp, ValueUsedAsTypeThrows) {
+    TemplateInstantiator inst;
+    TemplateInstantiator::TypeSubstitution subst = {
+        {"N", TemplateArg::ofValue(4)},
+    };
+
+    {
+        StdoutCapture cap;
+        EXPECT_THROW(inst.substituteType(Type::makeTemplateParam("N"), subst),
+                     std::runtime_error);
+    }
+    {
+        // Parser 在模板形参作用域外的兜底路径会把裸 N 建成 Class("N")，
+        // 同样必须拦下，不能把值当成类型返回。
+        StdoutCapture cap;
+        EXPECT_THROW(inst.substituteType(Type::makeClass("N"), subst),
+                     std::runtime_error);
+    }
+    std::printf("── NTTP 名出现在类型位置 → 抛错（不得静默当成类型）\n");
+}
+
+// 36. 值替换落在表达式树：clone 出的实体方法体里 N 变成整数字面量 4
+TEST(Nttp, ValueSubstitutionReachesExprTree) {
+    TemplateDeclPtr tmpl;
+    TemplateInstantiator inst;
+    {
+        StdoutCapture cap;
+        tmpl = parseClassTmpl(
+            "template<int N> class Buf { public: int size() { return N; } };");
+        inst.instantiate(tmpl, {TemplateArg::ofValue(4)});
+    }
+
+    auto& classes = inst.getInstantiatedClasses();
+    ASSERT_EQ(classes.size(), 1u);
+    EXPECT_EQ(classes[0]->name, "Buf_4");
+    ASSERT_EQ(classes[0]->methods.size(), 1u);
+
+    // 方法体应已被改写为 `return 4;` —— VarExpr{N} 被换成 IntLiteralExpr{4}
+    auto body = classes[0]->methods[0]->body;
+    ASSERT_NE(body, nullptr);
+    ASSERT_EQ(body->statements.size(), 1u);
+    auto ret = std::dynamic_pointer_cast<ReturnStmt>(body->statements[0]);
+    ASSERT_NE(ret, nullptr);
+    auto lit = std::dynamic_pointer_cast<IntLiteralExpr>(ret->value);
+    ASSERT_NE(lit, nullptr) << "N 应已被值替换为整数字面量，而非留着 VarExpr";
+    EXPECT_EQ(lit->value, 4);
+
+    std::printf("── 值替换落到表达式树: method body → return %lld\n",
+                static_cast<long long>(lit->value));
+}
+
+// 37. 不同值 → 不同实例与不同符号（缓存键须区分值实参）
+TEST(Nttp, DifferentValuesDifferentInstances) {
+    TemplateDeclPtr tmpl;
+    TemplateInstantiator inst;
+    {
+        StdoutCapture cap;
+        tmpl = parseClassTmpl(
+            "template<int N> class Buf { public: int size() { return N; } };");
+        inst.instantiate(tmpl, {TemplateArg::ofValue(4)});
+        inst.instantiate(tmpl, {TemplateArg::ofValue(8)});
+    }
+
+    auto& classes = inst.getInstantiatedClasses();
+    ASSERT_EQ(classes.size(), 2u);
+    EXPECT_EQ(classes[0]->name, "Buf_4");
+    EXPECT_EQ(classes[1]->name, "Buf_8");
+    EXPECT_NE(classes[0]->name, classes[1]->name);
+    std::printf("── 不同值 → 不同实例: %s / %s\n",
+                classes[0]->name.c_str(), classes[1]->name.c_str());
+}
+
+// 38. 实参个数不符 → 报错
+TEST(Nttp, ArityMismatchThrows) {
+    TemplateDeclPtr tmpl;
+    TemplateInstantiator inst;
+    {
+        StdoutCapture cap;
+        tmpl = parseClassTmpl(
+            "template<class T, int N> class Pair { public: T first; };");
+        EXPECT_THROW(inst.instantiate(tmpl, {TemplateArg::ofType(Type::makeInt())}),
+                     std::runtime_error);
+    }
+    std::printf("── 实参个数不符（2 形参收 1 实参）→ 抛错\n");
+}
+
+// 39. 形态不符 → 报错（template<int N> 收到类型实参）
+TEST(Nttp, KindMismatchThrows) {
+    TemplateDeclPtr tmpl;
+    TemplateInstantiator inst;
+    {
+        StdoutCapture cap;
+        tmpl = parseClassTmpl("template<int N> class Buf { public: int cap; };");
+        EXPECT_THROW(inst.instantiate(tmpl, {TemplateArg::ofType(Type::makeInt())}),
+                     std::runtime_error);
+    }
+    std::printf("── 形态不符（NonType 形参收到 Type 实参）→ 抛错\n");
+}
+
+// =============================================================================
+// 偏特化匹配（[temp.class.spec.match]）—— 与函数模板推导共用 deducePair
+// =============================================================================
+
+// 40. 模式 [T*, T] 匹配实参 [double*, double] → T := double
+TEST(PartialSpec, PatternMatchSucceeds) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TypePtr> pattern = {
+        Type::makePointer(Type::makeTemplateParam("T")),
+        Type::makeTemplateParam("T"),
+    };
+    std::vector<TypePtr> args = {
+        Type::makePointer(Type::makeDouble()),
+        Type::makeDouble(),
+    };
+
+    bool ok = false;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_TRUE(ok) << "reason: " << reason;
+    ASSERT_EQ(subst.count("T"), 1u);
+    EXPECT_TRUE(subst["T"]->isDouble());
+    std::printf("── 偏特化匹配: Box<T*, T> 对 Box<double*, double> ⇒ T := %s\n",
+                subst["T"]->toString().c_str());
+}
+
+// 41. 模式 [T*, T] 匹配实参 [int, int] → 指针结构失配，失败
+TEST(PartialSpec, PatternMatchFailsOnNonPointer) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TypePtr> pattern = {
+        Type::makePointer(Type::makeTemplateParam("T")),
+        Type::makeTemplateParam("T"),
+    };
+    std::vector<TypePtr> args = { Type::makeInt(), Type::makeInt() };
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_FALSE(ok) << "int 不是指针，T* 不该匹配成功";
+    EXPECT_FALSE(reason.empty());
+    std::printf("── 偏特化不匹配: Box<T*, T> 对 Box<int, int> ⇒ %s\n", reason.c_str());
+}
+
+// 42. 模式 [T*, T] 匹配实参 [int*, void] → T 绑定冲突（int vs void），失败
+//     —— 这是 test_tmpl_31 中 Box<int*,void> 回落主模板的原因
+TEST(PartialSpec, PatternMatchFailsOnConflictingBindings) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TypePtr> pattern = {
+        Type::makePointer(Type::makeTemplateParam("T")),
+        Type::makeTemplateParam("T"),
+    };
+    std::vector<TypePtr> args = {
+        Type::makePointer(Type::makeInt()),
+        Type::makeVoid(),
+    };
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_FALSE(ok) << "T 先绑 int 再绑 void，应冲突";
+    std::printf("── 偏特化不匹配: Box<T*, T> 对 Box<int*, void> ⇒ %s\n", reason.c_str());
+}
+
+// 43. 模式与实参个数不符 → 失败
+TEST(PartialSpec, PatternMatchFailsOnArityMismatch) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern({Type::makeTemplateParam("T")},
+                                  {Type::makeInt(), Type::makeDouble()},
+                                  {"T"}, subst, reason);
+    }
+    EXPECT_FALSE(ok);
+    std::printf("── 偏特化模式/实参个数不符 ⇒ %s\n", reason.c_str());
+}

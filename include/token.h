@@ -64,6 +64,7 @@ enum class TokenType : uint8_t {
     KwBool,           // bool
     KwClass,          // class
     KwConst,          // const
+    KwDecltype,       // decltype
     KwDelete,         // delete
     KwDouble,         // double
     KwDynamicCast,    // dynamic_cast
@@ -147,6 +148,7 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"bool",      TokenType::KwBool},
     {"class",     TokenType::KwClass},
     {"const",     TokenType::KwConst},
+    {"decltype",  TokenType::KwDecltype},
     {"delete",    TokenType::KwDelete},
     {"double",    TokenType::KwDouble},
     {"dynamic_cast", TokenType::KwDynamicCast},
@@ -228,12 +230,20 @@ struct Token {
     // Parser 识别声明（"类型 + 名字"）时用。
     // 示例：Token{KwInt}.isTypeKeyword() → true；Token{KwClass} → false
     //       （class 引入的是类定义而非内置类型名，故不在此列）
+    // ★ KwConst 必须在此列：const 是【类型说明符】的开头（[dcl.type]：
+    //   type-specifier-seq 可为 `const` + 类型），`const int x = 1;` 是一条
+    //   正经的声明。此前缺了它，语句层的 const 声明会掉进表达式分支，
+    //   报出误导性的 "Unexpected token 'const' in expression"。
+    //   顶层之所以没暴露：parseTopLevelDecl 用的是"试探性 parseType + 回滚"，
+    //   不看 isTypeKeyword —— 同一个语义在两条路径上判定不一致，正是漏点来源。
     bool isTypeKeyword() const {
         return type == TokenType::KwInt
             || type == TokenType::KwDouble
             || type == TokenType::KwBool
             || type == TokenType::KwVoid
-            || type == TokenType::KwAuto;
+            || type == TokenType::KwAuto
+            || type == TokenType::KwConst      // const int x; —— [dcl.type] 类型说明符
+            || type == TokenType::KwDecltype;   // decltype(e) 也是类型说明符 [dcl.type.decltype]
     }
 
     // 判断是否为访问修饰符
