@@ -13,3 +13,22 @@ cmake-build-debug/
 .vscode/
 
 compile_commands.json
+
+# 重构安全网：日志基线（logdiff.sh 生成，3.3M，不入库）
+.logbaseline/
+
+# 编译器本体与其它构建目录
+/minicc
+/.build/
+/Testing/
+
+# tests 下由 .cpp 直接编译出的可执行文件（与源文件同名、无扩展名）
+# 白名单把源文件/期望汇编/文档救回来 —— 它们和产物前缀相同，只能这么区分。
+/tests/**/test_*
+/tests/**/test[0-9]*
+/tests/**/dump_*
+/tests/**/mini_*
+!/tests/**/*.cpp
+!/tests/**/*.s
+!/tests/**/*.md
+!/tests/**/*.h
