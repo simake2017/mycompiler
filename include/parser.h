@@ -92,15 +92,40 @@ private:
     // base-type := 'int'|'double'|'bool'|'void'|'auto' | IDENT(类名/模板参数名)
     TypePtr parseType();
 
+    // ── 模板实参解析（[temp.arg]）──
+    // template-argument-list := '<' template-argument (',' template-argument)* '>'
+    // template-argument      := type-id | constant-expression
+    //   类型实参（Box<int>）  → TemplateArg{kind=Type,     type}
+    //   非类型实参（Buf<4>）  → TemplateArg{kind=Integral, value}   ★ NTTP
+    // 只处理"尖括号已在手上"的调用方：本函数自己消费 '<' 与 '>'。
+    // 调用前不消费 '<'，调用后整段实参表已吃掉。
+    // 对照 clang：Parser::ParseTemplateArgumentList（ParseTemplate.cpp）
+    //   真实现里 constant-expression 要走完整表达式解析 + 常量求值
+    //   （Sema::ActOnNonTypeTemplateArgument）。本项目教学简化：只认整数字面量，
+    //   不做常量折叠（如 Buf<2+2> 不支持，见 ROADMAP 主线 D）。
+    std::vector<TemplateArg> parseTemplateArgumentList();
+
     // ── 声明解析 ──
     // declaration := template-decl | class-decl | enum-decl | namespace-decl
     //              | type-alias-decl | global-var-decl | ['virtual'] function-decl
     DeclPtr            parseDeclaration();
     TemplateDeclPtr    parseTemplateDecl();
-    ClassDeclPtr       parseClassDecl();
+    // outSpecPattern 非空时，若类名后紧跟模板 id（Box<T*, T>），
+    // 把尖括号里的模式写回该向量 —— 供 parseTemplateDecl 判定偏特化/全特化。
+    ClassDeclPtr       parseClassDecl(std::vector<TypePtr>* outSpecPattern = nullptr);
     EnumDeclPtr        parseEnumDecl();
     NamespaceDeclPtr   parseNamespaceDecl();
     TypeAliasDeclPtr   parseTypeAliasDecl();
+    // ── 推导指引（[temp.deduct.guide]）──
+    // 文法：Name '(' params ')' '->' Name '<' args '>' ';'
+    // 两种形态：
+    //   template<class T> MyPtr(T) -> MyPtr<T>;   （模板指引，形参由外层 template<> 给）
+    //   Box(int)          -> Box<int>;            （非模板指引，写死映射）
+    // 【为什么要前瞻】`MyPtr(T) -> MyPtr<T>;` 与函数声明 `MyPtr f(T);` 前两个
+    //   Token 完全一样（标识符 + '('），只能靠"配对右括号之后是不是 '->'"区分。
+    // 对照 clang：TryParseDeductionGuide / isDeductionGuide。
+    bool               looksLikeDeductionGuide() const;
+    DeductionGuideDeclPtr parseDeductionGuide();
     GlobalVarDeclPtr   parseGlobalVarDecl();
     FuncDeclPtr        parseFunctionDecl(bool isVirtual = false,
                                          const std::string& ownerClass = "");

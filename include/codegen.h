@@ -63,6 +63,7 @@
 // =============================================================================
 
 #include "ast.h"
+#include "ast_visitor.h"
 #include "type.h"
 #include <string>
 #include <sstream>
@@ -71,7 +72,9 @@
 
 namespace minicc {
 
-class CodeGen {
+// CodeGen 是一个 AST 访问者：分发交给 accept 的虚表分派（见 ast_visitor.h），
+// 本类只重写关心的 visit 重载，不再有 if-else + dynamic_pointer_cast 链。
+class CodeGen : public AstVisitor {
 public:
     // 默认构造即可用：所有状态（输出缓冲、计数器、偏移量表）均有类内默认值
     CodeGen();
@@ -162,54 +165,57 @@ private:
     void emitStringLiterals();
 
     // ── 语句生成 ──
-    // 语句分发器：按节点动态类型派发到具体 emit（"lowering 降级"的入口）
-    void emitStmt(StmtPtr stmt);
+    // 语句分发器：accept 走虚表分派到下方对应的 visit 重载（"lowering 降级"的入口）。
+    // 改造前这里是 8 级 if-else + dynamic_pointer_cast 链，见 include/ast_visitor.h。
+    void emitStmt(const StmtPtr& stmt);
     // 复合语句：顺序发射子语句
-    void emitBlockStmt(std::shared_ptr<BlockStmt> block);
+    void visit(BlockStmt& block) override;
     // 局部变量声明：分配 8B 栈槽 + 发射初始化式（无初始化式则零初始化）
-    void emitVarDecl(std::shared_ptr<VarDeclStmt> decl);
+    void visit(VarDeclStmt& decl) override;
     // 赋值：普通变量 / obj.field（字段名在此降级为数字偏移量）
-    void emitAssign(std::shared_ptr<AssignStmt> stmt);
+    void visit(AssignStmt& stmt) override;
     // return：结果算进 rax 后直接 leave/ret 撤销栈帧
-    void emitReturn(std::shared_ptr<ReturnStmt> stmt);
+    void visit(ReturnStmt& stmt) override;
     // delete 语句
-    void emitDelete(std::shared_ptr<DeleteStmt> stmt);
+    void visit(DeleteStmt& stmt) override;
     // if/else：testq + je 条件跳转的结构化降级
-    void emitIf(std::shared_ptr<IfStmt> stmt);
+    void visit(IfStmt& stmt) override;
     // while：条件跳出 + 回边 jmp 的循环降级
-    void emitWhile(std::shared_ptr<WhileStmt> stmt);
+    void visit(WhileStmt& stmt) override;
     // 表达式语句：只求值（价值在副作用），结果 rax 丢弃
-    void emitExprStmt(std::shared_ptr<ExprStmt> stmt);
+    void visit(ExprStmt& stmt) override;
 
     // ── 表达式生成 ──
-    // 每个 emit 函数将表达式的值计算到 rax 寄存器中
-    // （单累加器约定）emitExpr 是表达式分发器（与 emitStmt 同构，按节点动态类型派发）
-    void emitExpr(ExprPtr expr);
+    // 每个 visit 把表达式的值算进 rax（单累加器约定）。
+    // emitExpr 是表达式分发器（与 emitStmt 同构，走 accept 虚表分派）。
+    void emitExpr(const ExprPtr& expr);
     // 整数字面量 → movq $v, %rax
-    void emitIntLiteral(std::shared_ptr<IntLiteralExpr> expr);
+    void visit(IntLiteralExpr& expr) override;
     // 布尔字面量 → movq $0/1, %rax
-    void emitBoolLiteral(std::shared_ptr<BoolLiteralExpr> expr);
+    void visit(BoolLiteralExpr& expr) override;
     // 字符串字面量 → leaq str_N(%rip), %rax（RIP 相对寻址）
-    void emitStringLiteral(std::shared_ptr<StringLiteralExpr> expr);
+    void visit(StringLiteralExpr& expr) override;
     // 局部变量/类字段加载（两级查找）
-    void emitVar(std::shared_ptr<VarExpr> expr);
+    void visit(VarExpr& expr) override;
     // 左值压栈 → 右值 → 运算
-    void emitBinary(std::shared_ptr<BinaryExpr> expr);
+    void visit(BinaryExpr& expr) override;
     // negq / 逻辑非
-    void emitUnary(std::shared_ptr<UnaryExpr> expr);
+    void visit(UnaryExpr& expr) override;
     // 普通/方法/虚调用三路分发
-    void emitCall(std::shared_ptr<CallExpr> expr);
+    void visit(CallExpr& expr) override;
     // obj.field → [addr+偏移]（字段名降级为偏移量）
-    void emitMember(std::shared_ptr<MemberExpr> expr);
+    void visit(MemberExpr& expr) override;
     // v[i]（读值）→ 降级为 v.at(i) 成员调用
     // （[expr.sub] 糖化：约定方法 at()，见 ast.h IndexExpr 注释）
-    void emitIndex(std::shared_ptr<IndexExpr> expr);
+    void visit(IndexExpr& expr) override;
     // malloc + 安装 _vptr
-    void emitNew(std::shared_ptr<NewExpr> expr);
+    void visit(NewExpr& expr) override;
     // 从栈槽加载 this
-    void emitThis(std::shared_ptr<ThisExpr> expr);
+    void visit(ThisExpr&) override;
+    // nullptr 字面量：无独立 helper，就地发射 xorq
+    void visit(NullptrLiteralExpr&) override;
     // dynamic_cast<T*>(e)：操作数进 %rax → 装参 → 调运行时助手，结果回 %rax
-    void emitDynamicCast(std::shared_ptr<DynamicCastExpr> expr);
+    void visit(DynamicCastExpr& expr) override;
     // 发射 RTTI 运行时助手 __minicc_dynamic_cast（沿 typeinfo 基类链匹配）
     void emitDynamicCastHelper();
 

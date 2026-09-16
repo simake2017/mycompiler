@@ -4,19 +4,17 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var x = ...
-    movq $1, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to x
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 x
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

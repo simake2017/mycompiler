@@ -51,6 +51,11 @@ namespace minicc {
 // 前向声明
 struct Type;
 using TypePtr = std::shared_ptr<Type>;
+// decltype 的操作数（见 TypeKind::Decltype）。
+// ★ 此处只前置声明、不 include ast.h：ast.h 反过来依赖 type.h，
+//   互相 include 会成环。只存指针，不需要完整类型。
+struct Expression;
+using DecltypeExprPtr = std::shared_ptr<Expression>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TypeKind：类型的种类
@@ -67,6 +72,7 @@ enum class TypeKind : uint8_t {
     Class,          // 类类型（含内存布局信息）
     TemplateParam,  // 模板参数占位符（如 T）
     Auto,           // auto 占位符（等待推导）
+    Decltype,       // decltype(expr) —— 半成品类型，替换后才求值（见下方"两段式"说明）
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +155,75 @@ struct BaseSubobject {
     std::vector<VTableEntry> entries;     // 次表槽位（仅非主多态基类有意义）
 };
 
+// =============================================================================
+// TemplateArg：模板实参的 tagged 值（[temp.arg]）
+// =============================================================================
+// 【为什么需要它】模板实参不只有"类型"一种形态。C++20 允许四类：
+//     template<class T>  → 类型实参        Box<int>
+//     template<int N>    → 非类型实参 NTTP  Buf<4>       ★ 本结构新增的形态
+//     template<template<class> class TT> → 模板模板实参（本项目未实现）
+//     包展开 ...                                                        （未实现）
+//
+// 旧实现把实参一律存成 TypePtr，于是 template<int N> 的实参 4 **无处安放**
+// ——4 是一个值，不是类型，TypePtr 结构上就表达不了。这里用一个 tagged union
+// 把"类型 or 值"这一对形态装进同一个槽位。
+//
+// 【对照 clang】clang::TemplateArgument（clang/AST/TemplateBase.h）
+//   是一个真正四形态的 tagged union：
+//     struct TemplateArgument {
+//       enum ArgKind { Null, Type, Declaration, NullPtr, Integral,
+//                      Template, TemplateExpansion, Expression, Pack };
+//       union { TypeSourceInfo *TypeInfo; ValueDecl *Decl; ... };
+//       llvm::APSInt Integer;   // ← Integral 形态用
+//     };
+//   本实现只取其中两形态（Type / Integral），够讲清"值 vs 类型"这条主线。
+//   形参侧对应 clang 的 TemplateTypeParmDecl / NonTypeTemplateParmDecl
+//   （clang/AST/DeclTemplate.h），本项目对应 ast.h 的 TemplateParamKind。
+//
+// 【demo】template<int N> class Buf → Buf<4>
+//     TemplateParam{kind=NonType, name="N", nonType=int}
+//     TemplateArg  {kind=Integral, value=4}
+//     ⇒ 替换表 { "N" → TemplateArg{Integral, 4} }
+// =============================================================================
+enum class TemplateArgKind : uint8_t {
+    Type,     // 类型实参：Box<int>         →  payload 在 type 字段
+    Integral, // 非类型实参：Buf<4>（NTTP） →  payload 在 value 字段
+};
+
+struct TemplateArg {
+    TemplateArgKind kind = TemplateArgKind::Type;
+    TypePtr         type  = nullptr; // kind == Type     时有效
+    int64_t         value = 0;       // kind == Integral 时有效
+
+    TemplateArg() = default;
+
+    // 隐式转换：TypePtr → 类型实参。
+    // 对照 clang：clang::TemplateArgument 同样有非 explicit 的转换构造
+    //（TemplateArgument(QualType, TypeSourceInfo*) / (ValueDecl*) 等），
+    // 因此 clang 代码里处处能写 `TemplateArgument(Ty)`。
+    // 本实现只对【类型】开这个口子，【值】实参必须显式写 ofValue(4) ——
+    // 于是 `{{"T", Type::makeInt()}}` 读起来自然，而写 NTTP 实参时
+    // 必须显式表态，刻意保留"这是值不是类型"的书写摩擦。
+    TemplateArg(TypePtr t)  // NOLINT(*-explicit-constructor)
+        : kind(TemplateArgKind::Type), type(std::move(t)) {}
+
+    static TemplateArg ofType(TypePtr t) {
+        TemplateArg a; a.kind = TemplateArgKind::Type; a.type = std::move(t); return a;
+    }
+    static TemplateArg ofValue(int64_t v) {
+        TemplateArg a; a.kind = TemplateArgKind::Integral; a.value = v; return a;
+    }
+
+    bool isType()  const { return kind == TemplateArgKind::Type; }
+    bool isValue() const { return kind == TemplateArgKind::Integral; }
+
+    // 人读形态：类型实参取类型名，值实参取十进制数字
+    // demo：ofType(makeInt()) → "int"；ofValue(4) → "4"
+    // 定义放 src/type.cpp —— 此处置于 Type 定义之前，Type 尚不完整，
+    // 无法内联调用 Type::toString()。
+    std::string toString() const;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ClassLayout：类的完整内存布局
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,12 +295,21 @@ struct ClassLayout {
 //   const int      Const(Int)                           Ki
 //   int**          Pointer(Pointer(Int))                PPi
 //   const int*     Const(Pointer(Int))                  KPi   ← const 在最外层
-//   const int&     Const(LValueReference(Int))          KRi   ← const 在最外层
+//   const int&     LValueReference(Const(Int))          KRi   ← const 在【内层】
+//   int* const     Const(Pointer(Int))                  KPi   ← const 在【外层】
 //
-//   ASCII：const int& 的嵌套（外 → 内）
+//   ASCII：const int& 的嵌套（外 → 内）——说明符侧的 const 修饰的是【基类型】
+//        LValueReference
+//         └─ referencedType ──► Const
+//                                 └─ innerType ──► Int
+//
+//   ASCII：int* const 的嵌套（外 → 内）——声明符侧的 const 修饰的是【指针本身】
 //        Const
-//         └─ innerType ──► LValueReference
-//                             └─ referencedType ──► Int
+//         └─ innerType ──► Pointer
+//                            └─ pointeeType ──► Int
+//
+//   ★ 两者不可混淆：const 写在哪一侧，就修饰谁（[dcl.type.cv]）。
+//     详见 docs/learn/23 与 tests/tmpl/test_tmpl_47_cv_position.cpp。
 //
 // 【引用折叠（Reference Collapsing）】 标准依据：[dcl.ref]/6；
 //   模板实参推导产生嵌套引用时见 [temp.deduct.call] / [temp.deduct.type]。
@@ -259,16 +343,64 @@ struct Type {
     // ── 类类型特有 ──
     ClassLayout classLayout;    // 类的内存布局（仅 Class 类型使用）
 
-    // ── 类模板实参（P3）──
-    // Box<int> 解析为 Class(name="Box", templateArgs=[int])。
+    // ── 类模板实参（P3 / NTTP）──
+    // Box<int> 解析为 Class(name="Box", templateArgs=[Type:int])；
+    // Buf<4>   解析为 Class(name="Buf", templateArgs=[Integral:4])。
+    // ★ 用 TemplateArg（tagged 值）而非 TypePtr —— 见上方 TemplateArg 注释：
+    //    类型实参与非类型实参（NTTP 的值）必须共存于同一槽位，
+    //    否则 template<int N> 的 4 无处安放。
     // 语义阶段 resolveType 见到非空实参 → 触发按需实例化（见
     // SemanticAnalyzer::getOrInstantiateClass），产出具体实例类型
     // （如 Box_int）后整体替换本节点——即"模板 id 是半成品类型，
     // 实例化后才成为完整类型"（[temp.inst] 的落地形态）。
-    std::vector<TypePtr> templateArgs;
+    std::vector<TemplateArg> templateArgs;
+
+    // ── 嵌套/依赖类型名（`S<int>::type`、`T::type`）──
+    // 【表示】qualifier 非空 ⇒ 本节点表示"qualifier 所指数类型里的成员类型别名"：
+    //     nestedQualifier = S<int>（半成品，交给 resolveType 按需实例化）
+    //     name            = "type"（成员名）
+    //   `T::type` 里 qualifier 就是 TemplateParam 节点（依赖情形，见 docs/learn/24）。
+    // 【为什么单列一组字段】它既不是"类名"（不能拿去查 m_classTypes），
+    //   也不是"模板 id"（没有实参可实例化）—— 而是一个【待解析的路径】：
+    //   先把 qualifier 解析成具体类，再去那个类的 typeAliases 里取成员。
+    //   对照 clang：DependentNameType / ElaboratedType 的 qualifier + NamedDecl。
+    TypePtr     nestedQualifier;    // 限定部分（如 S<int> 或 T）
+    bool isNestedName() const { return nestedQualifier != nullptr; }
+
+    // ── 实例"出身"（模板实例类型专有）──
+    // 【要解决什么】实例化后的类型叫 `MyPtr_int`，模板 id 时代的信息
+    //   （哪个模板、哪些实参）在改名的那一刻就丢了。而函数模板实参推导
+    //   必须回答："`MyPtr_int` 是 `MyPtr<T>` 对 T 的一次成功绑定吗？"
+    //   —— 只靠名字 `MyPtr_int` 反推是不可靠的（名字是清洗过的可读串，
+    //   不是单射）。故在实例化时把出身显式记下来。
+    // 【demo】MyPtr<int> 实例化后：
+    //     name = "MyPtr_int"（实例类型名，参与布局与 mangling）
+    //     templateOriginName = "MyPtr"        ← 出身模板
+    //     templateOriginArgs = [Type:int]     ← 实例化用的实参
+    //   推导时对 P=MyPtr<T> 与 A=MyPtr_int：出身同名 + 实参个数相等
+    //   ⇒ 逐位合一 ⇒ T := int。
+    // 【为什么不复用上面的 templateArgs】那个字段的语义是"待实例化的半成品"
+    //   ——resolveType 见到非空 templateArgs 就会去触发实例化。实例类型若也
+    //   填这个字段，每次解析它都会重走一遍实例化分支。出身字段是【只读记录】，
+    //   不参与任何解析决策，故必须分开。
+    // 对照 clang：ClassTemplateSpecializationDecl 自身就带着 TemplateArgumentList
+    //   （clang 不存在"改名后丢实参"的问题，因为实例类型仍是一个 Decl）。
+    std::string              templateOriginName;
+    std::vector<TemplateArg> templateOriginArgs;
+    bool isTemplateInstance() const { return !templateOriginName.empty(); }
 
     // ── 模板参数类型特有 ──
     std::string templateParamName; // 模板参数名（如 "T"）
+
+    // ── decltype 类型特有（TypeKind::Decltype）──
+    // ★ 两段式：decltype 出现时不立刻求值，先原样留存表达式，
+    //   等【替换】（substituteType）阶段再求。
+    //   原因：is_range<T, void_t<decltype(declval<T>().begin())>> 这种写法里
+    //   decltype 位于【模板模式】中，此刻 T 未知 —— 立即求值无从下手。
+    //   对照 clang：DecltypeType 在依赖上下文中就是依赖类型，
+    //   直到 Sema::SubstType 才被 Instantiator 求值成具体类型。
+    DecltypeExprPtr decltypeExpr;              // 操作数表达式（半成品，替换后求值）
+    bool            decltypeParen = false;     // 是否多套了一层括号，见 [dcl.type.decltype]
 
     // ── 工厂方法 ──
     // 每个 make* 返回一个新构造的 Type 节点；组合规则见上方"洋葱式"说明。
@@ -284,6 +416,8 @@ struct Type {
     static TypePtr makeClass(const std::string& name);
     static TypePtr makeTemplateParam(const std::string& paramName);
     static TypePtr makeAuto();
+    // decltype(expr)：paren 表示原文是否写成 decltype((e))，见 [dcl.type.decltype]
+    static TypePtr makeDecltype(DecltypeExprPtr expr, bool paren);
 
     // ── 类型查询 ──
     bool isVoid()             const { return kind == TypeKind::Void; }
@@ -298,6 +432,7 @@ struct Type {
     bool isClass()            const { return kind == TypeKind::Class; }
     bool isTemplateParam()    const { return kind == TypeKind::TemplateParam; }
     bool isAuto()             const { return kind == TypeKind::Auto; }
+    bool isDecltype()         const { return kind == TypeKind::Decltype; }
     bool isNumeric()          const { return isInt() || isDouble(); }
 
     // 去除引用和 const 的"裸类型"（用于类型比较和推导）

@@ -4,102 +4,96 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Animal_getAge
-    Animal_getAge:
+        .globl Animal_getAge             # 导出函数符号，使链接器可见
+    Animal_getAge:                       # 函数入口标签
     # Function: getAge (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 0(%rax), %eax    # load .age (offset 0)
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 0(%rax), %eax    # 读取字段 .age（偏移 +0 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_setAge
-    Animal_setAge:
+        .globl Animal_setAge_1             # 导出函数符号，使链接器可见
+    Animal_setAge_1:                       # 函数入口标签
     # Function: setAge (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: a
-    movq -16(%rbp), %rax    # load a
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 0(%rcx)    # .age = ... (offset 0)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 a 从寄存器 spill 到栈
+    movq -16(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 0(%rcx)    # .age = ...（偏移 0，4 字节写入）
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_Animal
-    Animal_Animal:
+        .globl Animal_Animal             # 导出函数符号，使链接器可见
+    Animal_Animal:                       # 函数入口标签
     # Function: Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_dtor
-    Animal_dtor:
+        .globl Animal_dtor             # 导出函数符号，使链接器可见
+    Animal_dtor:                       # 函数入口标签
     # Function: ~Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl add
-    add:
+        .globl add             # 导出函数符号，使链接器可见
+    add:                       # 函数入口标签
     # Function: add (params: 2)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: a
-    movq %rsi, -16(%rbp)    # param: b
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 a 从寄存器 spill 到栈
+    movq %rsi, -16(%rbp)         # 形参 b 从寄存器 spill 到栈
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load a
-    pushq %rax
-    movq -16(%rbp), %rax    # load b
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -16(%rbp), %rax    # 加载局部变量 b 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var result = ...
     # function call
-    movq $10, %rax           # int literal
-    pushq %rax
-    movq $20, %rax           # int literal
-    pushq %rax
-    popq %rsi
-    popq %rdi
-    callq add               # function call
-    movq %rax, -16(%rbp)    # store to result
+    movq $10, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    movq $20, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rsi                   # 逆序弹出实参到寄存器
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq add                  # 调用函数 add
+    movq %rax, -16(%rbp)       # 存储到局部变量 result
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

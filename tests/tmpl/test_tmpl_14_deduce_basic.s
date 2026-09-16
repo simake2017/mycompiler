@@ -4,46 +4,42 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # return expr
     # binary expr
     # function call
-    movq $21, %rax           # int literal
-    pushq %rax
-    popq %rdi
-    callq _Z5twiceIiE               # function call
-    pushq %rax
-    movq $42, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
-    leave
-    ret
+    movq $21, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq _Z5twiceIiE                  # 调用函数 _Z5twiceIiE
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $42, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl _Z5twiceIiE
-    _Z5twiceIiE:
+        .globl _Z5twiceIiE             # 导出函数符号，使链接器可见
+    _Z5twiceIiE:                       # 函数入口标签
     # Function: twice (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)    # param: x
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 x 从寄存器 spill 到栈
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load x
-    pushq %rax
-    movq -8(%rbp), %rax    # load x
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载局部变量 x 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

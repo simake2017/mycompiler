@@ -4,313 +4,307 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl IntVec_at
-    IntVec_at:
+        .globl IntVec_at_1             # 导出函数符号，使链接器可见
+    IntVec_at_1:                       # 函数入口标签
     # Function: at (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: i
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 i 从寄存器 spill 到栈
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $0, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_1
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $0, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_1                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 0(%rax), %eax    # load .a0 (offset 0)
-    leave
-    ret
-    endif_1:
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 0(%rax), %eax    # 读取字段 .a0（偏移 +0 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_1:                        # endif 标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_3
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_3                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 4(%rax), %eax    # load .a1 (offset 4)
-    leave
-    ret
-    endif_3:
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 4(%rax), %eax    # 读取字段 .a1（偏移 +4 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_3:                        # endif 标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $2, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_5
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $2, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_5                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 8(%rax), %eax    # load .a2 (offset 8)
-    leave
-    ret
-    endif_5:
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 8(%rax), %eax    # 读取字段 .a2（偏移 +8 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_5:                        # endif 标签
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 12(%rax), %eax    # load .a3 (offset 12)
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 12(%rax), %eax    # 读取字段 .a3（偏移 +12 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl IntVec_set
-    IntVec_set:
+        .globl IntVec_set_2             # 导出函数符号，使链接器可见
+    IntVec_set_2:                       # 函数入口标签
     # Function: set (params: 2)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: i
-    movq %rdx, -24(%rbp)    # param: v
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 i 从寄存器 spill 到栈
+    movq %rdx, -24(%rbp)         # 形参 v 从寄存器 spill 到栈
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $0, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_7
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $0, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_7                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
-    movq -24(%rbp), %rax    # load v
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 0(%rcx)    # .a0 = ... (offset 0)
-    endif_7:
+    movq -24(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 0(%rcx)    # .a0 = ...（偏移 0，4 字节写入）
+    endif_7:                        # endif 标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_9
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_9                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
-    movq -24(%rbp), %rax    # load v
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 4(%rcx)    # .a1 = ... (offset 4)
-    endif_9:
+    movq -24(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 4(%rcx)    # .a1 = ...（偏移 4，4 字节写入）
+    endif_9:                        # endif 标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $2, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_11
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $2, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_11                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
-    movq -24(%rbp), %rax    # load v
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 8(%rcx)    # .a2 = ... (offset 8)
-    endif_11:
+    movq -24(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 8(%rcx)    # .a2 = ...（偏移 8，4 字节写入）
+    endif_11:                        # endif 标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax
-    movq $3, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    sete %al                     # ==
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_13
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $3, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    sete %al                    # 相等时 al = 1（ZF=1）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_13                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
-    movq -24(%rbp), %rax    # load v
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 12(%rcx)    # .a3 = ... (offset 12)
-    endif_13:
+    movq -24(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 12(%rcx)    # .a3 = ...（偏移 12，4 字节写入）
+    endif_13:                        # endif 标签
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl IntVec_IntVec
-    IntVec_IntVec:
+        .globl IntVec_IntVec             # 导出函数符号，使链接器可见
+    IntVec_IntVec:                       # 函数入口标签
     # Function: IntVec (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl IntVec_dtor
-    IntVec_dtor:
+        .globl IntVec_dtor             # 导出函数符号，使链接器可见
+    IntVec_dtor:                       # 函数入口标签
     # Function: ~IntVec (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # stack object v : IntVec (16 bytes, RAII)
-    movq $0, -24(%rbp)    # zero-init v +0
-    movq $0, -16(%rbp)    # zero-init v +8
-    leaq -24(%rbp), %rdi    # this = &v
-    callq IntVec_IntVec          # call constructor
-    movq $10, %rax           # int literal
+    movq $0, -24(%rbp)    # 零初始化 v 偏移 +0
+    movq $0, -16(%rbp)    # 零初始化 v 偏移 +8
+    leaq -24(%rbp), %rdi       # this = 栈对象地址 &v
+    callq IntVec_IntVec               # 调用构造函数
+    movq $10, %rax           # 整数字面量载入 rax
     # subscript assign v[i] = ... → desugar to v.set(i, value)
-    pushq %rax                   # stash value
-    movq $0, %rax           # int literal
-    pushq %rax                   # stash index
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    movq %rax, %rdi              # this
-    popq %rsi                    # arg1: index
-    popq %rdx                    # arg2: value
-    callq IntVec_set             # v.set(i, value)
-    movq $20, %rax           # int literal
+    pushq %rax                  # 暂存右值（待写入的值）到栈上
+    movq $0, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 暂存下标值到栈上
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    movq %rax, %rdi             # this = 容器对象地址（第 0 参数）
+    popq %rsi                   # arg1: 弹出下标 i 到 rsi
+    popq %rdx                   # arg2: 弹出右值 value 到 rdx
+    callq IntVec_set              # 调用 v.set(i, value) 完成写入
+    movq $20, %rax           # 整数字面量载入 rax
     # subscript assign v[i] = ... → desugar to v.set(i, value)
-    pushq %rax                   # stash value
-    movq $1, %rax           # int literal
-    pushq %rax                   # stash index
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    movq %rax, %rdi              # this
-    popq %rsi                    # arg1: index
-    popq %rdx                    # arg2: value
-    callq IntVec_set             # v.set(i, value)
+    pushq %rax                  # 暂存右值（待写入的值）到栈上
+    movq $1, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 暂存下标值到栈上
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    movq %rax, %rdi             # this = 容器对象地址（第 0 参数）
+    popq %rsi                   # arg1: 弹出下标 i 到 rsi
+    popq %rdx                   # arg2: 弹出右值 value 到 rdx
+    callq IntVec_set              # 调用 v.set(i, value) 完成写入
     # binary expr
     # binary expr
     # subscript v[i] → desugar to v.at(i)
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    pushq %rax                   # save this pointer
-    movq $0, %rax           # int literal
-    pushq %rax
-    popq %rsi                    # arg1: index
-    popq %rdi                    # this pointer
-    callq IntVec_at              # v.at(i)
-    pushq %rax
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    pushq %rax                  # 保存 this 指针（容器对象地址）
+    movq $0, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 下标值压栈暂存
+    popq %rsi                   # arg1: 弹出下标到 rsi
+    popq %rdi                   # this: 弹出容器地址到 rdi
+    callq IntVec_at                # 调用 v.at(i) 读取元素
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # subscript v[i] → desugar to v.at(i)
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    pushq %rax                   # save this pointer
-    movq $1, %rax           # int literal
-    pushq %rax
-    popq %rsi                    # arg1: index
-    popq %rdi                    # this pointer
-    callq IntVec_at              # v.at(i)
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    pushq %rax                  # 保存 this 指针（容器对象地址）
+    movq $1, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 下标值压栈暂存
+    popq %rsi                   # arg1: 弹出下标到 rsi
+    popq %rdi                   # this: 弹出容器地址到 rdi
+    callq IntVec_at                # 调用 v.at(i) 读取元素
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
     # subscript assign v[i] = ... → desugar to v.set(i, value)
-    pushq %rax                   # stash value
-    movq $2, %rax           # int literal
-    pushq %rax                   # stash index
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    movq %rax, %rdi              # this
-    popq %rsi                    # arg1: index
-    popq %rdx                    # arg2: value
-    callq IntVec_set             # v.set(i, value)
+    pushq %rax                  # 暂存右值（待写入的值）到栈上
+    movq $2, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 暂存下标值到栈上
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    movq %rax, %rdi             # this = 容器对象地址（第 0 参数）
+    popq %rsi                   # arg1: 弹出下标 i 到 rsi
+    popq %rdx                   # arg2: 弹出右值 value 到 rdx
+    callq IntVec_set              # 调用 v.set(i, value) 完成写入
     # var x = ...
     # binary expr
     # binary expr
     # subscript v[i] → desugar to v.at(i)
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    pushq %rax                   # save this pointer
-    movq $0, %rax           # int literal
-    pushq %rax
-    popq %rsi                    # arg1: index
-    popq %rdi                    # this pointer
-    callq IntVec_at              # v.at(i)
-    pushq %rax
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    pushq %rax                  # 保存 this 指针（容器对象地址）
+    movq $0, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 下标值压栈暂存
+    popq %rsi                   # arg1: 弹出下标到 rsi
+    popq %rdi                   # this: 弹出容器地址到 rdi
+    callq IntVec_at                # 调用 v.at(i) 读取元素
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # subscript v[i] → desugar to v.at(i)
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    pushq %rax                   # save this pointer
-    movq $1, %rax           # int literal
-    pushq %rax
-    popq %rsi                    # arg1: index
-    popq %rdi                    # this pointer
-    callq IntVec_at              # v.at(i)
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    pushq %rax                  # 保存 this 指针（容器对象地址）
+    movq $1, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 下标值压栈暂存
+    popq %rsi                   # arg1: 弹出下标到 rsi
+    popq %rdi                   # this: 弹出容器地址到 rdi
+    callq IntVec_at                # 调用 v.at(i) 读取元素
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # subscript v[i] → desugar to v.at(i)
-    leaq -24(%rbp), %rax    # &v (stack object address)
-    pushq %rax                   # save this pointer
-    movq $2, %rax           # int literal
-    pushq %rax
-    popq %rsi                    # arg1: index
-    popq %rdi                    # this pointer
-    callq IntVec_at              # v.at(i)
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    movq %rax, -32(%rbp)    # store to x
+    leaq -24(%rbp), %rax    # 取栈对象地址 &v
+    pushq %rax                  # 保存 this 指针（容器对象地址）
+    movq $2, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 下标值压栈暂存
+    popq %rsi                   # arg1: 弹出下标到 rsi
+    popq %rdi                   # this: 弹出容器地址到 rdi
+    callq IntVec_at                # 调用 v.at(i) 读取元素
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    movq %rax, -32(%rbp)       # 存储到局部变量 x
     # return expr
     # binary expr
-    movq -32(%rbp), %rax    # load x
-    pushq %rax
-    movq $61, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
+    movq -32(%rbp), %rax    # 加载局部变量 x 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $61, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     # ~IntVec() auto at function end (RAII)
-    leaq -24(%rbp), %rdi    # this = &stack object
-    callq IntVec_dtor          # call destructor
-    leave
-    ret
+    leaq -24(%rbp), %rdi       # this = 栈上对象地址（直接取址，无指针变量）
+    callq IntVec_dtor            # 静态调用析构函数（非虚析构路径）
     

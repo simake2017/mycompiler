@@ -45,6 +45,7 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwBool:        return "bool";
         case TokenType::KwClass:       return "class";
         case TokenType::KwConst:       return "const";
+        case TokenType::KwDecltype:    return "decltype";
         case TokenType::KwDelete:      return "delete";
         case TokenType::KwDouble:      return "double";
         case TokenType::KwDynamicCast: return "dynamic_cast";
@@ -118,7 +119,7 @@ const char* tokenTypeName(TokenType t) {
 // 左值实参最多拷贝一次——一个签名覆盖两种情况。
 // 示例：Lexer lex("int x = 42;"); → m_source 持有该串，m_pos=0，m_line=m_col=1。
 Lexer::Lexer(std::string source)
-    : m_source(std::move(source)) {} // wangyang 这里会设置相应的值
+    : m_source(std::move(source)) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 字符级操作
@@ -145,7 +146,7 @@ char Lexer::peekNext() const {
 // 所有 token 的 SourceLocation 都由这里积累而来。
 // 示例："a\nb" → advance()=='a'；再 advance()=='\n'（行号 1→2、列号归 1）。
 char Lexer::advance() {
-    char c = m_source[m_pos++]; // wangyang 指针会移动
+    char c = m_source[m_pos++];
     if (c == '\n') { // 在这里面会标识行号和  和 列号
         m_line++;
         m_col = 1;
@@ -271,7 +272,7 @@ Token Lexer::scanIdentifierOrKeyword() {
 
     while (!isAtEnd() && (std::isalnum(static_cast<unsigned char>(peek())) // 字母数字
                           || peek() == '_')) { // 下划线
-        text += advance(); //wangyang 每个标识符或者关键字都是用字母或者下划线开头
+        text += advance();
     }
 
     // 查关键字表
@@ -298,8 +299,8 @@ Token Lexer::scanString() {
 
     std::string text;
     while (!isAtEnd() && peek() != '"') {
-        if (peek() == '\\') { // wangyang 这里是读取到内容是 \(反斜线)的意思
-            advance(); // 消费反斜杠 wangyang 这里只是往前推进，但是不添加到text 当中
+        if (peek() == '\\') {
+            advance(); // 消费反斜杠：只推进游标，不并入 text
             char escaped = advance();
             // 转义翻译表：n→换行  t→制表符  \\→反斜杠  \"→双引号；
             // default 原样保留（真实 C++ 对未知转义报错，本项目宽容处理）
@@ -438,7 +439,7 @@ Token Lexer::nextToken() {
         return makeToken(TokenType::Eof, "", currentLocation());
     }
 
-    char c = peek(); // wangyang peek 指针不会移动
+    char c = peek();
 
     // 数字开头 → 数字字面量
     if (std::isdigit(static_cast<unsigned char>(c))) {

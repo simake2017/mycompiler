@@ -4,558 +4,555 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl add
-    add:
+        .globl add             # 导出函数符号，使链接器可见
+    add:                       # 函数入口标签
     # Function: add (params: 2)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)    # param: a
-    movq %rsi, -16(%rbp)    # param: b
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 a 从寄存器 spill 到栈
+    movq %rsi, -16(%rbp)         # 形参 b 从寄存器 spill 到栈
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load a
-    pushq %rax
-    movq -16(%rbp), %rax    # load b
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -16(%rbp), %rax    # 加载局部变量 b 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl factorial
-    factorial:
+        .globl factorial             # 导出函数符号，使链接器可见
+    factorial:                       # 函数入口标签
     # Function: factorial (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)    # param: n
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 形参 n 从寄存器 spill 到栈
     # if condition
     # binary expr
-    movq -8(%rbp), %rax    # load n
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    setle %al                    # <=
-    movzbq %al, %rax
-    testq %rax, %rax
-    je endif_1
+    movq -8(%rbp), %rax    # 加载局部变量 n 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    setle %al                   # 小于等于时 al = 1（ZF=1 或 SF≠OF）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je endif_1                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
-    endif_1:
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_1:                        # endif 标签
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load n
-    pushq %rax
+    movq -8(%rbp), %rax    # 加载局部变量 n 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # function call
     # binary expr
-    movq -8(%rbp), %rax    # load n
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    pushq %rax
-    popq %rdi
-    callq factorial               # function call
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载局部变量 n 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq factorial                  # 调用函数 factorial
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl testAuto
-    testAuto:
+        .globl testAuto             # 导出函数符号，使链接器可见
+    testAuto:                       # 函数入口标签
     # Function: testAuto (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var x = ...
-    movq $10, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to x
+    movq $10, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 x
     # var y = ...
-    movq $20, %rax           # int literal
-    movq %rax, -24(%rbp)    # store to y
+    movq $20, %rax           # 整数字面量载入 rax
+    movq %rax, -24(%rbp)       # 存储到局部变量 y
     # var sum = ...
     # binary expr
-    movq -16(%rbp), %rax    # load x
-    pushq %rax
-    movq -24(%rbp), %rax    # load y
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    movq %rax, -32(%rbp)    # store to sum
+    movq -16(%rbp), %rax    # 加载局部变量 x 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -24(%rbp), %rax    # 加载局部变量 y 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    movq %rax, -32(%rbp)       # 存储到局部变量 sum
     # var flag = ...
-    movq $1, %rax           # bool literal
-    movq %rax, -40(%rbp)    # store to flag
+    movq $1, %rax           # 布尔字面量
+    movq %rax, -40(%rbp)       # 存储到局部变量 flag
     # return expr
-    movq -32(%rbp), %rax    # load sum
-    leave
-    ret
-    leave
-    ret
+    movq -32(%rbp), %rax    # 加载局部变量 sum 到 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_area
-    Shape_area:
+        .globl Shape_area             # 导出函数符号，使链接器可见
+    Shape_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_perimeter
-    Shape_perimeter:
+        .globl Shape_perimeter             # 导出函数符号，使链接器可见
+    Shape_perimeter:                       # 函数入口标签
     # Function: perimeter (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_Shape
-    Shape_Shape:
+        .globl Shape_Shape             # 导出函数符号，使链接器可见
+    Shape_Shape:                       # 函数入口标签
     # Function: Shape (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV5Shape(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV5Shape(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_dtor
-    Shape_dtor:
+        .globl Shape_dtor             # 导出函数符号，使链接器可见
+    Shape_dtor:                       # 函数入口标签
     # Function: ~Shape (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_area
-    Rectangle_area:
+        .globl Rectangle_area             # 导出函数符号，使链接器可见
+    Rectangle_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
     # binary expr
-    movq -8(%rbp), %rax    # load this
-    movl 16(%rax), %eax    # load .width (offset 16)
-    pushq %rax
-    movq -8(%rbp), %rax    # load this
-    movl 20(%rax), %eax    # load .height (offset 20)
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 16(%rax), %eax    # 读取字段 .width（偏移 +16 字节）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 20(%rax), %eax    # 读取字段 .height（偏移 +20 字节）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_perimeter
-    Rectangle_perimeter:
+        .globl Rectangle_perimeter             # 导出函数符号，使链接器可见
+    Rectangle_perimeter:                       # 函数入口标签
     # Function: perimeter (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
     # binary expr
     # binary expr
-    movq -8(%rbp), %rax    # load this
-    movl 16(%rax), %eax    # load .width (offset 16)
-    pushq %rax
-    movq -8(%rbp), %rax    # load this
-    movl 20(%rax), %eax    # load .height (offset 20)
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
-    movq $2, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 16(%rax), %eax    # 读取字段 .width（偏移 +16 字节）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 20(%rax), %eax    # 读取字段 .height（偏移 +20 字节）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $2, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_Rectangle
-    Rectangle_Rectangle:
+        .globl Rectangle_Rectangle             # 导出函数符号，使链接器可见
+    Rectangle_Rectangle:                       # 函数入口标签
     # Function: Rectangle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV9Rectangle(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV9Rectangle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_dtor
-    Rectangle_dtor:
+        .globl Rectangle_dtor             # 导出函数符号，使链接器可见
+    Rectangle_dtor:                       # 函数入口标签
     # Function: ~Rectangle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Circle_area
-    Circle_area:
+        .globl Circle_area             # 导出函数符号，使链接器可见
+    Circle_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
     # binary expr
     # binary expr
-    movq $3, %rax           # int literal
-    pushq %rax
-    movq -8(%rbp), %rax    # load this
-    movl 16(%rax), %eax    # load .radius (offset 16)
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    pushq %rax
-    movq -8(%rbp), %rax    # load this
-    movl 16(%rax), %eax    # load .radius (offset 16)
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    leave
-    ret
-    leave
-    ret
+    movq $3, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 16(%rax), %eax    # 读取字段 .radius（偏移 +16 字节）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 16(%rax), %eax    # 读取字段 .radius（偏移 +16 字节）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Circle_Circle
-    Circle_Circle:
+        .globl Circle_Circle             # 导出函数符号，使链接器可见
+    Circle_Circle:                       # 函数入口标签
     # Function: Circle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV6Circle(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV6Circle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Circle_dtor
-    Circle_dtor:
+        .globl Circle_dtor             # 导出函数符号，使链接器可见
+    Circle_dtor:                       # 函数入口标签
     # Function: ~Circle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl testPolymorphism
-    testPolymorphism:
+        .globl testPolymorphism             # 导出函数符号，使链接器可见
+    testPolymorphism:                       # 函数入口标签
     # Function: testPolymorphism (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var shape = ...
     # new Rectangle()
-    movq $24, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    leaq _ZTV9Rectangle(%rip), %rcx    # vtable address
-    addq $16, %rcx              # skip to vtable[0]
-    movq (%rsp), %rax           # load objPtr
-    movq %rcx, (%rax)           # obj._vptr = vtable
-    movq (%rsp), %rdi             # this pointer
-    callq Rectangle_Rectangle              # call constructor
-    popq %rax                     # return objPtr
+    movq $24, %rdi             # malloc 分配大小：24 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    leaq _ZTV9Rectangle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq (%rsp), %rax           # 从栈上取回对象指针
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Rectangle_Rectangle                 # 调用构造函数 Rectangle_Rectangle
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Rectangle()
-    movq %rax, -16(%rbp)    # store to shape
+    movq %rax, -16(%rbp)       # 存储到局部变量 shape
     # var a = ...
     # function call
+    movq -16(%rbp), %rax    # 加载局部变量 shape 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Shape::area (vtable[0])
-    movq %rdi, %rbx              # save object pointer
-    movq %rbx, %rdi              # this pointer
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 0(%rax), %rax       # rax = vtable[0] (offset 0)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 0(%rax), %rax       # 从 vtable[0] 读出函数地址（偏移 0）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Shape::area
-    movq %rax, -24(%rbp)    # store to a
+    movq %rax, -24(%rbp)       # 存储到局部变量 a
     # var p = ...
     # function call
+    movq -16(%rbp), %rax    # 加载局部变量 shape 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Shape::perimeter (vtable[1])
-    movq %rdi, %rbx              # save object pointer
-    movq %rbx, %rdi              # this pointer
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 8(%rax), %rax       # rax = vtable[1] (offset 8)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 8(%rax), %rax       # 从 vtable[1] 读出函数地址（偏移 8）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Shape::perimeter
-    movq %rax, -32(%rbp)    # store to p
+    movq %rax, -32(%rbp)       # 存储到局部变量 p
     # return expr
     # binary expr
-    movq -24(%rbp), %rax    # load a
-    pushq %rax
-    movq -32(%rbp), %rax    # load p
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
-    leave
-    ret
+    movq -24(%rbp), %rax    # 加载局部变量 a 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -32(%rbp), %rax    # 加载局部变量 p 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl testFieldAccess
-    testFieldAccess:
+        .globl testFieldAccess             # 导出函数符号，使链接器可见
+    testFieldAccess:                       # 函数入口标签
     # Function: testFieldAccess (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
-    movq $0, -16(%rbp)    # zero init rect
-    movq $10, %rax           # int literal
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    # stack object rect : Rectangle (24 bytes, RAII)
+    movq $0, -32(%rbp)    # 零初始化 rect 偏移 +0
+    movq $0, -24(%rbp)    # 零初始化 rect 偏移 +8
+    movq $0, -16(%rbp)    # 零初始化 rect 偏移 +16
+    leaq _ZTV9Rectangle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, -32(%rbp)    # 安装主 _vptr 到栈对象
+    leaq -32(%rbp), %rdi       # this = 栈对象地址 &rect
+    callq Rectangle_Rectangle               # 调用构造函数
+    movq $10, %rax           # 整数字面量载入 rax
     # member assign: .width = ...
-    movq -16(%rbp), %rax    # load rect
-    movq %rax, %rcx                # object address
-    movq $10, %rax           # int literal
-    movl %eax, 16(%rcx)    # .width (offset 16)
-    movq $20, %rax           # int literal
+    leaq -32(%rbp), %rax    # 取栈对象地址 &rect
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $10, %rax           # 整数字面量载入 rax
+    movl %eax, 16(%rcx)    # 写入字段 .width（偏移 +16）
+    movq $20, %rax           # 整数字面量载入 rax
     # member assign: .height = ...
-    movq -16(%rbp), %rax    # load rect
-    movq %rax, %rcx                # object address
-    movq $20, %rax           # int literal
-    movl %eax, 20(%rcx)    # .height (offset 20)
+    leaq -32(%rbp), %rax    # 取栈对象地址 &rect
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $20, %rax           # 整数字面量载入 rax
+    movl %eax, 20(%rcx)    # 写入字段 .height（偏移 +20）
     # var a = ...
     # binary expr
     # member access: .width
-    movq -16(%rbp), %rax    # load rect
-    movq 16(%rax), %rax    # .width (offset 16)
-    pushq %rax
+    leaq -32(%rbp), %rax    # 取栈对象地址 &rect
+    movl 16(%rax), %eax    # 读取字段 .width（偏移 +16，4B int）
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # member access: .height
-    movq -16(%rbp), %rax    # load rect
-    movq 20(%rax), %rax    # .height (offset 20)
-    movq %rax, %rcx
-    popq %rax
-    imulq %rcx, %rax             # *
-    movq %rax, -24(%rbp)    # store to a
+    leaq -32(%rbp), %rax    # 取栈对象地址 &rect
+    movl 20(%rax), %eax    # 读取字段 .height（偏移 +20，4B int）
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    imulq %rcx, %rax            # 乘法：rax = rax * rcx（有符号）
+    movq %rax, -40(%rbp)       # 存储到局部变量 a
     # return expr
-    movq -24(%rbp), %rax    # load a
-    leave
-    ret
-    leave
-    ret
+    movq -40(%rbp), %rax    # 加载局部变量 a 到 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    # ~Rectangle() auto at function end (RAII)
+    leaq -32(%rbp), %rdi       # this = 栈上对象地址（直接取址，无指针变量）
+    callq Rectangle_dtor            # 静态调用析构函数（非虚析构路径）
     
-        .globl testControlFlow
-    testControlFlow:
+        .globl testControlFlow             # 导出函数符号，使链接器可见
+    testControlFlow:                       # 函数入口标签
     # Function: testControlFlow (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var sum = ...
-    movq $0, %rax           # int literal
-    movq %rax, -16(%rbp)    # store to sum
+    movq $0, %rax           # 整数字面量载入 rax
+    movq %rax, -16(%rbp)       # 存储到局部变量 sum
     # var i = ...
-    movq $1, %rax           # int literal
-    movq %rax, -24(%rbp)    # store to i
-    while_begin_2:
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, -24(%rbp)       # 存储到局部变量 i
+    while_begin_2:                        # while 循环开始标签
     # while condition
     # binary expr
-    movq -24(%rbp), %rax    # load i
-    pushq %rax
-    movq $10, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    setle %al                    # <=
-    movzbq %al, %rax
-    testq %rax, %rax
-    je while_end_3
+    movq -24(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $10, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    setle %al                   # 小于等于时 al = 1（ZF=1 或 SF≠OF）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je while_end_3                     # 条件为假（ZF=1）跳出循环
     # while body
     # binary expr
-    movq -16(%rbp), %rax    # load sum
-    pushq %rax
-    movq -24(%rbp), %rax    # load i
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    movq %rax, -16(%rbp)    # sum = ...
+    movq -16(%rbp), %rax    # 加载局部变量 sum 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq -24(%rbp), %rax    # 加载局部变量 i 到 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    movq %rax, -16(%rbp)       # 赋值局部变量 sum
     # binary expr
-    movq -24(%rbp), %rax    # load i
-    pushq %rax
-    movq $1, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    movq %rax, -24(%rbp)    # i = ...
-    jmp while_begin_2
-    while_end_3:
+    movq -24(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $1, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    movq %rax, -24(%rbp)       # 赋值局部变量 i
+    jmp while_begin_2                    # 无条件跳回循环开始（回边）
+    while_end_3:                        # while 循环结束标签
     # if condition
     # binary expr
-    movq -16(%rbp), %rax    # load sum
-    pushq %rax
-    movq $50, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    cmpq %rcx, %rax
-    setg %al                     # >
-    movzbq %al, %rax
-    testq %rax, %rax
-    je else_4
+    movq -16(%rbp), %rax    # 加载局部变量 sum 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $50, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    cmpq %rcx, %rax             # 比较：rax - rcx 设置标志位
+    setg %al                    # 大于时 al = 1（ZF=0 且 SF=OF）
+    movzbq %al, %rax            # 零扩展 al 到 64 位 rax
+    testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位
+    je else_4                     # 条件为假（ZF=1）跳转到 else/endif
     # then branch
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
-    jmp endif_5
-    else_4:
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    jmp endif_5                    # then 分支结束，无条件跳转到 endif
+    else_4:                        # else 分支标签
     # else branch
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    endif_5:
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
+    endif_5:                        # endif 标签
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var result1 = ...
     # function call
-    movq $3, %rax           # int literal
-    pushq %rax
-    movq $4, %rax           # int literal
-    pushq %rax
-    popq %rsi
-    popq %rdi
-    callq add               # function call
-    movq %rax, -16(%rbp)    # store to result1
+    movq $3, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    movq $4, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rsi                   # 逆序弹出实参到寄存器
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq add                  # 调用函数 add
+    movq %rax, -16(%rbp)       # 存储到局部变量 result1
     # var result2 = ...
     # function call
-    movq $5, %rax           # int literal
-    pushq %rax
-    popq %rdi
-    callq factorial               # function call
-    movq %rax, -24(%rbp)    # store to result2
+    movq $5, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rdi                   # 逆序弹出实参到寄存器
+    callq factorial                  # 调用函数 factorial
+    movq %rax, -24(%rbp)       # 存储到局部变量 result2
     # var result3 = ...
     # function call
-    callq testAuto               # function call
-    movq %rax, -32(%rbp)    # store to result3
+    callq testAuto                  # 调用函数 testAuto
+    movq %rax, -32(%rbp)       # 存储到局部变量 result3
     # var result4 = ...
     # function call
-    callq testFieldAccess               # function call
-    movq %rax, -40(%rbp)    # store to result4
+    callq testFieldAccess                  # 调用函数 testFieldAccess
+    movq %rax, -40(%rbp)       # 存储到局部变量 result4
     # var result5 = ...
     # function call
-    callq testControlFlow               # function call
-    movq %rax, -48(%rbp)    # store to result5
+    callq testControlFlow                  # 调用函数 testControlFlow
+    movq %rax, -48(%rbp)       # 存储到局部变量 result5
     # var result6 = ...
     # function call
-    callq testPolymorphism               # function call
-    movq %rax, -56(%rbp)    # store to result6
+    callq testPolymorphism                  # 调用函数 testPolymorphism
+    movq %rax, -56(%rbp)       # 存储到局部变量 result6
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
 
     .data
-    .globl _ZTV9Rectangle
-    .align 8
-_ZTV9Rectangle:
-    .quad 0                    # offset to top
-    .quad _ZTI9Rectangle       # RTTI type_info pointer (vtable[-1])
-    .quad Rectangle_area   # vtable[0]: Rectangle_area
-    .quad Rectangle_perimeter   # vtable[1]: Rectangle_perimeter
+    .globl _ZTV9Rectangle             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV9Rectangle:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI9Rectangle       # RTTI type_info 指针（vtable[-1]）
+    .quad Rectangle_area   # vtable[0]: 虚函数 Rectangle_area
+    .quad Rectangle_perimeter   # vtable[1]: 虚函数 Rectangle_perimeter
 
-    .globl _ZTI9Rectangle
-    .align 8
-_ZTI9Rectangle:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Rectangle                 # type name string
-    .quad _ZTI5Shape                 # base class typeinfo
+    .globl _ZTI9Rectangle             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI9Rectangle:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Rectangle                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI5Shape                 # base[Shape] typeinfo 指针
+    .quad 0                 # base[Shape] 子对象偏移（字节）
 
-    .globl _ZTV6Circle
-    .align 8
-_ZTV6Circle:
-    .quad 0                    # offset to top
-    .quad _ZTI6Circle       # RTTI type_info pointer (vtable[-1])
-    .quad Circle_area   # vtable[0]: Circle_area
-    .quad Shape_perimeter   # vtable[1]: Shape_perimeter
+    .globl _ZTV6Circle             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV6Circle:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI6Circle       # RTTI type_info 指针（vtable[-1]）
+    .quad Circle_area   # vtable[0]: 虚函数 Circle_area
+    .quad Shape_perimeter   # vtable[1]: 虚函数 Shape_perimeter
 
-    .globl _ZTI6Circle
-    .align 8
-_ZTI6Circle:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Circle                 # type name string
-    .quad _ZTI5Shape                 # base class typeinfo
+    .globl _ZTI6Circle             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI6Circle:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Circle                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI5Shape                 # base[Shape] typeinfo 指针
+    .quad 0                 # base[Shape] 子对象偏移（字节）
 
-    .globl _ZTV5Shape
-    .align 8
-_ZTV5Shape:
-    .quad 0                    # offset to top
-    .quad _ZTI5Shape       # RTTI type_info pointer (vtable[-1])
-    .quad Shape_area   # vtable[0]: Shape_area
-    .quad Shape_perimeter   # vtable[1]: Shape_perimeter
+    .globl _ZTV5Shape             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV5Shape:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI5Shape       # RTTI type_info 指针（vtable[-1]）
+    .quad Shape_area   # vtable[0]: 虚函数 Shape_area
+    .quad Shape_perimeter   # vtable[1]: 虚函数 Shape_perimeter
 
-    .globl _ZTI5Shape
-    .align 8
-_ZTI5Shape:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Shape                 # type name string
-    .quad 0                    # no base class
+    .globl _ZTI5Shape             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI5Shape:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Shape                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
 
     .section .rodata
-.Ltype_name_Rectangle:
-    .string "Rectangle"           # type name
-.Ltype_name_Circle:
-    .string "Circle"           # type name
-.Ltype_name_Shape:
-    .string "Shape"           # type name
+.Ltype_name_Rectangle:                     # 类型名称标签
+    .string "Rectangle"           # 类型名称字符串
+.Ltype_name_Circle:                     # 类型名称标签
+    .string "Circle"           # 类型名称字符串
+.Ltype_name_Shape:                     # 类型名称标签
+    .string "Shape"           # 类型名称字符串

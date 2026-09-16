@@ -140,7 +140,7 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
     std::string spliced;
     spliced.reserve(src.size());
     for (size_t i = 0; i < src.size(); i++) {
-        // wangyang 这里 \ 后面必须立刻就是换行，不能有空格
+        // 这里 \ 后面必须立刻就是换行，不能有空格
         if (src[i] == '\\' && i + 1 < src.size() && src[i + 1] == '\n') { i++; continue; } // 这里i++,上面又i++,相当于i+2
         spliced += src[i];
     }
@@ -181,7 +181,7 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
         std::string clean = stripComment(line);
         std::string t = trim(clean);
 
-        // wangyang 调试：每行源文本单独打一个 [src-line] 块标记，
+        // 调试：每行源文本单独打一个 [src-line] 块标记
         // 让测试里的 dumpWithExplanation 把它当作"分块锚点"插 === 分隔。
         // 用特殊分隔符 <SRC>...</SRC> 包裹原文，避免原文中的方括号干扰切串。
         std::cout << std::format("  [pp] {}:{} [src-line] <SRC>{}</SRC>\n",
@@ -210,7 +210,7 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
                 if (parent) {  // 外层不活跃时不求值（表达式可能依赖未定义宏）
                     if (dir == "ifdef") {
                         std::string name; readWord(rest, 0, name);
-                        cond = m_macros.count(name) > 0; // wangyang存在该定义
+                        cond = m_macros.count(name) > 0;
                     } else if (dir == "ifndef") {
                         std::string name; readWord(rest, 0, name);
                         cond = m_macros.count(name) == 0;
@@ -228,13 +228,13 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
             // && 的短路求值保证：前面分支已取真时表达式根本不被求值（[cpp.cond]）。
             // demo：#if 0 / A 段 / #elif 1 / B 段 / #endif
             //       → A 段跳过；#elif 1 激活（takenBranch 置真）→ B 段输出。
-            if (dir == "elif") { // wangyang ** 这里不需要是 每个 if 都进入vector，只要将活跃的if 分支标记就行
+            if (dir == "elif") {
                 if (condStack.empty()) ppError("#elif without #if", fileName, lineNo);
                 auto& st = condStack.back();
                 if (st.sawElse) ppError("#elif after #else", fileName, lineNo);
                 bool cond = st.parentActive && !st.takenBranch &&
                             evalConstantExpr(rest, fileName, lineNo) != 0;
-                st.active = cond; // wangyang **这里就是代表了当前 if 分支
+                st.active = cond;
                 if (cond) st.takenBranch = true;
                 out += '\n'; continue;
             }
@@ -257,7 +257,7 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
             }
 
             // 其余指令仅在活跃分支有效
-            // 死分支里的 #define/#include 等一律跳过——这正是 wangyang**
+            // 死分支里的 #define/#include 等一律跳过
             // "#if 0 ... #endif 可以整段注释掉代码"的原理。
             if (!enclosingActive()) { out += '\n'; continue; } // 死分支里面的 语句一律无效
 
@@ -458,7 +458,7 @@ std::string Preprocessor::resolveInclude(const std::string& name, bool angled,
 void Preprocessor::handlePragma(const std::string& rest, const std::string& fileName, int line) {
     if (trim(rest) == "once") {
         std::string canon = fs::weakly_canonical(fileName).string();
-        m_pragmaOnce.insert(canon); // wangyang 这里会检测插入一条
+        m_pragmaOnce.insert(canon);
         std::cout << std::format("  [pp] {}:{} #pragma once → registered {}\n",
             fileName, line, canon);
     } else {
@@ -481,7 +481,7 @@ void Preprocessor::handlePragma(const std::string& rest, const std::string& file
 std::string Preprocessor::expand(const std::string& text,
                                  const std::unordered_set<std::string>& hide,
                                  const std::string& fileName, int line) {
-    // wangyang 调试：递归深度 + 缩进，让 trace 视觉上分层。
+    // 调试：递归深度 + 缩进，让 trace 视觉上分层。
     int d = m_expandDepth++;
     std::string indent(d * 2, ' ');
     std::string enterArrow = (d == 0 ? "┌─" : "├─");
@@ -607,7 +607,7 @@ std::string Preprocessor::expand(const std::string& text,
         //       → 实参 "N" 先展开为 "10" → 替换得 "((10)>(x)?(10):(x))"。
         std::vector<std::string> expandedArgs;
         for (auto& a : args)
-            expandedArgs.push_back(expand(a, hide, fileName, line)); //wangyang **这里在参数解构的时候，直接就解开，语义更
+            expandedArgs.push_back(expand(a, hide, fileName, line)); // 实参各自完整展开后再代入宏体
 
         // 打印实参展开后结果
         { std::string as; for (auto& a : expandedArgs) { if (!as.empty()) as += " | "; as += a; }
@@ -682,7 +682,7 @@ long Preprocessor::evalConstantExpr(const std::string& expr,
     // ── ① defined 处理 ──
     std::string s;
     size_t i = 0;
-    while (i < expr.size()) { // wangyang ** 这一部分是用于解析defined 部分内容
+    while (i < expr.size()) { // 这一部分用于解析 defined 运算符
         if (isWordStart(expr[i])) {
             std::string w;
             size_t after = readWord(expr, i, w);
@@ -701,7 +701,7 @@ long Preprocessor::evalConstantExpr(const std::string& expr,
                         ppError("expected ')' after defined(name", fileName, line);
                     j++;
                 }
-                s += m_macros.count(name) ? " 1 " : " 0 "; // wangyang ** 就是将条件置为真
+                s += m_macros.count(name) ? " 1 " : " 0 ";
                 i = j;
                 continue;
             }
@@ -710,7 +710,7 @@ long Preprocessor::evalConstantExpr(const std::string& expr,
         s += expr[i]; i++;
     }
 
-    // ── ② 宏展开 ── wangyang** 宏展开
+    // ── ② 宏展开 ── 宏展开
     s = expand(s, {}, fileName, line);
 
     // ── ③ 分词 + 递归下降求值 ──

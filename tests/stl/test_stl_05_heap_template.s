@@ -4,115 +4,111 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var p = ...
     # new Box_int()
-    movq $4, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    movq (%rsp), %rdi             # this pointer
-    callq Box_int_Box_int              # call constructor
-    popq %rax                     # return objPtr
+    movq $4, %rdi             # malloc 分配大小：4 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Box_int_Box_int                 # 调用构造函数 Box_int_Box_int
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Box_int()
-    movq %rax, -16(%rbp)    # store to p
+    movq %rax, -16(%rbp)       # 存储到局部变量 p
     # function call
-    movq -16(%rbp), %rax    # load p
-    pushq %rax                   # save this pointer
-    movq $9, %rax           # int literal
-    pushq %rax
-    popq %rsi
-    popq %rdi                    # this pointer
-    callq Box_int_set               # method call
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    pushq %rax                   # 暂存 this 指针到栈上
+    movq $9, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 实参值压栈暂存
+    popq %rsi                   # 逆序弹出实参到寄存器
+    popq %rdi                   # 弹出 this 指针到 rdi（第 0 参数）
+    callq Box_int_set                  # 调用方法 Box_int_set
     # var v = ...
     # function call
-    movq -16(%rbp), %rax    # load p
-    pushq %rax                   # save this pointer
-    popq %rdi                    # this pointer
-    callq Box_int_get               # method call
-    movq %rax, -24(%rbp)    # store to v
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    pushq %rax                   # 暂存 this 指针到栈上
+    popq %rdi                   # 弹出 this 指针到 rdi（第 0 参数）
+    callq Box_int_get                  # 调用方法 Box_int_get
+    movq %rax, -24(%rbp)       # 存储到局部变量 v
     # delete pointer
-    movq -16(%rbp), %rax    # load p
-    movq %rax, %rdi               # pointer to delete
-    pushq %rdi                    # save pointer
-    callq Box_int_dtor         # call destructor
-    popq %rdi                     # restore pointer for free
-    callq free                    # free memory
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    movq %rax, %rdi             # 待删除指针传入第 0 参数寄存器
+    pushq %rdi                  # 暂存指针（析构后还要 free）
+    callq Box_int_dtor           # 静态调用析构函数
+    popq %rdi                   # 恢复指针准备 free
+    callq free                  # 释放堆内存
     # return expr
     # binary expr
-    movq -24(%rbp), %rax    # load v
-    pushq %rax
-    movq $9, %rax           # int literal
-    movq %rax, %rcx
-    popq %rax
-    subq %rcx, %rax              # -
-    leave
-    ret
-    leave
-    ret
+    movq -24(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
+    movq $9, %rax           # 整数字面量载入 rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    subq %rcx, %rax             # 减法：rax = rax - rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Box_int_Box_int
-    Box_int_Box_int:
+        .globl Box_int_Box_int             # 导出函数符号，使链接器可见
+    Box_int_Box_int:                       # 函数入口标签
     # Function: Box_int (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax           # int literal
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 0(%rcx)    # .value = ... (offset 0)
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 0(%rcx)    # .value = ...（偏移 0，4 字节写入）
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Box_int_set
-    Box_int_set:
+        .globl Box_int_set_1             # 导出函数符号，使链接器可见
+    Box_int_set_1:                       # 函数入口标签
     # Function: set (params: 1)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: v
-    movq -16(%rbp), %rax    # load v
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 0(%rcx)    # .value = ... (offset 0)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 v 从寄存器 spill 到栈
+    movq -16(%rbp), %rax    # 加载局部变量 v 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 0(%rcx)    # .value = ...（偏移 0，4 字节写入）
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Box_int_get
-    Box_int_get:
+        .globl Box_int_get             # 导出函数符号，使链接器可见
+    Box_int_get:                       # 函数入口标签
     # Function: get (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 0(%rax), %eax    # load .value (offset 0)
-    leave
-    ret
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 0(%rax), %eax    # 读取字段 .value（偏移 +0 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Box_int_dtor
-    Box_int_dtor:
+        .globl Box_int_dtor             # 导出函数符号，使链接器可见
+    Box_int_dtor:                       # 函数入口标签
     # Function: ~Box_int (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     

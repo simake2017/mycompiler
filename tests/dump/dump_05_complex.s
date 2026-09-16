@@ -5,431 +5,431 @@
 
     .text
     # thunk Middle_getB2_thunk16 → Middle_getB2 (adjust=-16)
-    .globl Middle_getB2_thunk16
-    Middle_getB2_thunk16:
-    movq  (%rdi), %rax         # vptr
-    movq  -16(%rax), %rcx      # vptr[-2] = offset-to-top
-    addq  %rcx, %rdi           # this 归顶
-    jmp   Middle_getB2              # 跳真实函数
+    .globl Middle_getB2_thunk16             # 导出 thunk 符号供链接器可见
+    Middle_getB2_thunk16:                   # thunk 跳板入口标签
+    movq  (%rdi), %rax         # 从 this 首 8 字节读出 _vptr
+    movq  -16(%rax), %rcx      # vptr[-2] = offset-to-top（次基类→最派生偏移）
+    addq  %rcx, %rdi           # this += offset-to-top，归顶到最派生对象
+    jmp   Middle_getB2              # 无条件跳转到真实函数（已归顶的 this 直入）
     
-        .globl Base1_getB1
-    Base1_getB1:
+        .globl Base1_getB1             # 导出函数符号，使链接器可见
+    Base1_getB1:                       # 函数入口标签
     # Function: getB1 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 8(%rax), %eax    # load .b1 (offset 8)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 8(%rax), %eax    # 读取字段 .b1（偏移 +8 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base1_Base1
-    Base1_Base1:
+        .globl Base1_Base1             # 导出函数符号，使链接器可见
+    Base1_Base1:                       # 函数入口标签
     # Function: Base1 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV5Base1(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV5Base1(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base1_dtor
-    Base1_dtor:
+        .globl Base1_dtor             # 导出函数符号，使链接器可见
+    Base1_dtor:                       # 函数入口标签
     # Function: ~Base1 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base2_getB2
-    Base2_getB2:
+        .globl Base2_getB2             # 导出函数符号，使链接器可见
+    Base2_getB2:                       # 函数入口标签
     # Function: getB2 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 8(%rax), %eax    # load .b2 (offset 8)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 8(%rax), %eax    # 读取字段 .b2（偏移 +8 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base2_Base2
-    Base2_Base2:
+        .globl Base2_Base2             # 导出函数符号，使链接器可见
+    Base2_Base2:                       # 函数入口标签
     # Function: Base2 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV5Base2(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV5Base2(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base2_dtor
-    Base2_dtor:
+        .globl Base2_dtor             # 导出函数符号，使链接器可见
+    Base2_dtor:                       # 函数入口标签
     # Function: ~Base2 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Middle_getMid
-    Middle_getMid:
+        .globl Middle_getMid             # 导出函数符号，使链接器可见
+    Middle_getMid:                       # 函数入口标签
     # Function: getMid (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 32(%rax), %eax    # load .mid (offset 32)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 32(%rax), %eax    # 读取字段 .mid（偏移 +32 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Middle_getB1
-    Middle_getB1:
+        .globl Middle_getB1             # 导出函数符号，使链接器可见
+    Middle_getB1:                       # 函数入口标签
     # Function: getB1 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 8(%rax), %eax    # load .b1 (offset 8)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 8(%rax), %eax    # 读取字段 .b1（偏移 +8 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Middle_getB2
-    Middle_getB2:
+        .globl Middle_getB2             # 导出函数符号，使链接器可见
+    Middle_getB2:                       # 函数入口标签
     # Function: getB2 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 24(%rax), %eax    # load .b2 (offset 24)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 24(%rax), %eax    # 读取字段 .b2（偏移 +24 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Middle_Middle
-    Middle_Middle:
+        .globl Middle_Middle             # 导出函数符号，使链接器可见
+    Middle_Middle:                       # 函数入口标签
     # Function: Middle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV6Middle(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    leaq _ZTV6Middle(%rip), %rcx    # secondary vtable for 'Base2'
-    addq $48, %rcx    # skip to secondary[0]
-    movq %rcx, 16(%rax)    # install secondary _vptr for 'Base2'
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV6Middle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    leaq _ZTV6Middle(%rip), %rcx    # 取次表首地址（基类 'Base2'）
+    addq $48, %rcx          # 跳过次表头，指向 secondary[0]
+    movq %rcx, 16(%rax)     # 安装次 _vptr（偏移 Base2 处）
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Middle_dtor
-    Middle_dtor:
+        .globl Middle_dtor             # 导出函数符号，使链接器可见
+    Middle_dtor:                       # 函数入口标签
     # Function: ~Middle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_getFinal
-    Final_getFinal:
+        .globl Final_getFinal             # 导出函数符号，使链接器可见
+    Final_getFinal:                       # 函数入口标签
     # Function: getFinal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 40(%rax), %eax    # load .final_val (offset 40)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 40(%rax), %eax    # 读取字段 .final_val（偏移 +40 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_getB1
-    Final_getB1:
+        .globl Final_getB1             # 导出函数符号，使链接器可见
+    Final_getB1:                       # 函数入口标签
     # Function: getB1 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 8(%rax), %eax    # load .b1 (offset 8)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 8(%rax), %eax    # 读取字段 .b1（偏移 +8 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_getB2
-    Final_getB2:
+        .globl Final_getB2             # 导出函数符号，使链接器可见
+    Final_getB2:                       # 函数入口标签
     # Function: getB2 (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 24(%rax), %eax    # load .b2 (offset 24)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 24(%rax), %eax    # 读取字段 .b2（偏移 +24 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_getMid
-    Final_getMid:
+        .globl Final_getMid             # 导出函数符号，使链接器可见
+    Final_getMid:                       # 函数入口标签
     # Function: getMid (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq -8(%rbp), %rax    # load this
-    movl 32(%rax), %eax    # load .mid (offset 32)
-    leave
-    ret
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movl 32(%rax), %eax    # 读取字段 .mid（偏移 +32 字节）
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_Final
-    Final_Final:
+        .globl Final_Final             # 导出函数符号，使链接器可见
+    Final_Final:                       # 函数入口标签
     # Function: Final (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV5Final(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install primary _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV5Final(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Final_dtor
-    Final_dtor:
+        .globl Final_dtor             # 导出函数符号，使链接器可见
+    Final_dtor:                       # 函数入口标签
     # Function: ~Final (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var obj = ...
     # new Final()
-    movq $48, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    leaq _ZTV5Final(%rip), %rcx    # vtable address
-    addq $16, %rcx              # skip to vtable[0]
-    movq (%rsp), %rax           # load objPtr
-    movq %rcx, (%rax)           # obj._vptr = vtable (primary)
-    movq (%rsp), %rdi             # this pointer
-    callq Final_Final              # call constructor
-    popq %rax                     # return objPtr
+    movq $48, %rdi             # malloc 分配大小：48 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    leaq _ZTV5Final(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq (%rsp), %rax           # 从栈上取回对象指针
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Final_Final                 # 调用构造函数 Final_Final
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Final()
-    movq %rax, -16(%rbp)    # store to obj
-    movq $1, %rax           # int literal
+    movq %rax, -16(%rbp)       # 存储到局部变量 obj
+    movq $1, %rax           # 整数字面量载入 rax
     # member assign: .b1 = ...
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rcx                # object address
-    movq $1, %rax           # int literal
-    movl %eax, 8(%rcx)    # .b1 (offset 8)
-    movq $2, %rax           # int literal
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $1, %rax           # 整数字面量载入 rax
+    movl %eax, 8(%rcx)    # 写入字段 .b1（偏移 +8）
+    movq $2, %rax           # 整数字面量载入 rax
     # member assign: .b2 = ...
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rcx                # object address
-    movq $2, %rax           # int literal
-    movl %eax, 24(%rcx)    # .b2 (offset 24)
-    movq $10, %rax           # int literal
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $2, %rax           # 整数字面量载入 rax
+    movl %eax, 24(%rcx)    # 写入字段 .b2（偏移 +24）
+    movq $10, %rax           # 整数字面量载入 rax
     # member assign: .mid = ...
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rcx                # object address
-    movq $10, %rax           # int literal
-    movl %eax, 32(%rcx)    # .mid (offset 32)
-    movq $100, %rax           # int literal
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $10, %rax           # 整数字面量载入 rax
+    movl %eax, 32(%rcx)    # 写入字段 .mid（偏移 +32）
+    movq $100, %rax           # 整数字面量载入 rax
     # member assign: .final_val = ...
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rcx                # object address
-    movq $100, %rax           # int literal
-    movl %eax, 40(%rcx)    # .final_val (offset 40)
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $100, %rax           # 整数字面量载入 rax
+    movl %eax, 40(%rcx)    # 写入字段 .final_val（偏移 +40）
     # return expr
     # binary expr
     # binary expr
     # binary expr
     # function call
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rdi            # this = object address
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Final::getB1 (vtable[0])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 0(%rax), %rax       # rax = vtable[0] (offset 0)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 0(%rax), %rax       # 从 vtable[0] 读出函数地址（偏移 0）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Final::getB1
-    pushq %rax
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # function call
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rdi            # this = object address
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Final::getB2 (vtable[3])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 24(%rax), %rax       # rax = vtable[3] (offset 24)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 24(%rax), %rax       # 从 vtable[3] 读出函数地址（偏移 24）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Final::getB2
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # function call
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rdi            # this = object address
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Final::getMid (vtable[1])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 8(%rax), %rax       # rax = vtable[1] (offset 8)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 8(%rax), %rax       # 从 vtable[1] 读出函数地址（偏移 8）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Final::getMid
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    pushq %rax
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）
     # function call
-    movq -16(%rbp), %rax    # load obj
-    movq %rax, %rdi            # this = object address
+    movq -16(%rbp), %rax    # 加载局部变量 obj 到 rax
+    movq %rax, %rdi            # this = 对象地址（第 0 参数）
     # VIRTUAL CALL: Final::getFinal (vtable[2])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 16(%rax), %rax       # rax = vtable[2] (offset 16)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 16(%rax), %rax       # 从 vtable[2] 读出函数地址（偏移 16）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Final::getFinal
-    movq %rax, %rcx
-    popq %rax
-    addq %rcx, %rax              # +
-    leave
-    ret
+    movq %rax, %rcx             # 右操作数从 rax 转移到 rcx
+    popq %rax                   # 弹出左操作数回到 rax
+    addq %rcx, %rax             # 加法：rax = rax + rcx
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
 
     .data
-    .globl _ZTV5Final
-    .align 8
-_ZTV5Final:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI5Final       # RTTI type_info pointer (vtable[-1])
-    .quad Final_getB1   # vtable[0]: Final_getB1
-    .quad Final_getMid   # vtable[1]: Final_getMid
-    .quad Final_getFinal   # vtable[2]: Final_getFinal
-    .quad Final_getB2   # vtable[3]: Final_getB2
+    .globl _ZTV5Final             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV5Final:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI5Final       # RTTI type_info 指针（vtable[-1]）
+    .quad Final_getB1   # vtable[0]: 虚函数 Final_getB1
+    .quad Final_getMid   # vtable[1]: 虚函数 Final_getMid
+    .quad Final_getFinal   # vtable[2]: 虚函数 Final_getFinal
+    .quad Final_getB2   # vtable[3]: 虚函数 Final_getB2
 
-    .globl _ZTI5Final
-    .align 8
-_ZTI5Final:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Final                 # type name string
-    .quad 1                 # base class count (MI counting-style)
-    .quad _ZTI6Middle                 # base[Middle] typeinfo
-    .quad 0                 # base[Middle] subobject offset
+    .globl _ZTI5Final             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI5Final:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Final                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI6Middle                 # base[Middle] typeinfo 指针
+    .quad 0                 # base[Middle] 子对象偏移（字节）
 
-    .globl _ZTV6Middle
-    .align 8
-_ZTV6Middle:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI6Middle       # RTTI type_info pointer (vtable[-1])
-    .quad Middle_getB1   # vtable[0]: Middle_getB1
-    .quad Middle_getMid   # vtable[1]: Middle_getMid
+    .globl _ZTV6Middle             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV6Middle:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI6Middle       # RTTI type_info 指针（vtable[-1]）
+    .quad Middle_getB1   # vtable[0]: 虚函数 Middle_getB1
+    .quad Middle_getMid   # vtable[1]: 虚函数 Middle_getMid
     # ── secondary vtable for 'Base2' @ offset 16 ──
-    .quad -16                   # offset to top (secondary 'Base2')
-    .quad _ZTI6Middle       # RTTI type_info pointer
-    .quad Middle_getB2_thunk16   # secondary[0]: Middle_getB2 (via thunk, adjust=-16)
+    .quad -16                   # offset-to-top = -16（次基类 'Base2' 子对象偏移取反）
+    .quad _ZTI6Middle       # RTTI type_info 指针（次表段的 typeinfo 与主表相同）
+    .quad Middle_getB2_thunk16   # secondary[0]: Middle_getB2（经 thunk 跳板，this 调整量=-16）
 
-    .globl _ZTI6Middle
-    .align 8
-_ZTI6Middle:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Middle                 # type name string
-    .quad 2                 # base class count (MI counting-style)
-    .quad _ZTI5Base1                 # base[Base1] typeinfo
-    .quad 0                 # base[Base1] subobject offset
-    .quad _ZTI5Base2                 # base[Base2] typeinfo
-    .quad 16                 # base[Base2] subobject offset
+    .globl _ZTI6Middle             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI6Middle:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Middle                 # 指向类型名称字符串
+    .quad 2                 # 基类计数（MI 计数风格）
+    .quad _ZTI5Base1                 # base[Base1] typeinfo 指针
+    .quad 0                 # base[Base1] 子对象偏移（字节）
+    .quad _ZTI5Base2                 # base[Base2] typeinfo 指针
+    .quad 16                 # base[Base2] 子对象偏移（字节）
 
-    .globl _ZTV5Base2
-    .align 8
-_ZTV5Base2:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI5Base2       # RTTI type_info pointer (vtable[-1])
-    .quad Base2_getB2   # vtable[0]: Base2_getB2
+    .globl _ZTV5Base2             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV5Base2:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI5Base2       # RTTI type_info 指针（vtable[-1]）
+    .quad Base2_getB2   # vtable[0]: 虚函数 Base2_getB2
 
-    .globl _ZTI5Base2
-    .align 8
-_ZTI5Base2:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Base2                 # type name string
-    .quad 0                 # no base classes
+    .globl _ZTI5Base2             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI5Base2:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Base2                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
-    .globl _ZTV5Base1
-    .align 8
-_ZTV5Base1:
-    .quad 0                    # offset to top (primary)
-    .quad _ZTI5Base1       # RTTI type_info pointer (vtable[-1])
-    .quad Base1_getB1   # vtable[0]: Base1_getB1
+    .globl _ZTV5Base1             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV5Base1:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI5Base1       # RTTI type_info 指针（vtable[-1]）
+    .quad Base1_getB1   # vtable[0]: 虚函数 Base1_getB1
 
-    .globl _ZTI5Base1
-    .align 8
-_ZTI5Base1:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Base1                 # type name string
-    .quad 0                 # no base classes
+    .globl _ZTI5Base1             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI5Base1:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Base1                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
 
     .section .rodata
-.Ltype_name_Final:
-    .string "Final"           # type name
-.Ltype_name_Middle:
-    .string "Middle"           # type name
-.Ltype_name_Base2:
-    .string "Base2"           # type name
-.Ltype_name_Base1:
-    .string "Base1"           # type name
+.Ltype_name_Final:                     # 类型名称标签
+    .string "Final"           # 类型名称字符串
+.Ltype_name_Middle:                     # 类型名称标签
+    .string "Middle"           # 类型名称字符串
+.Ltype_name_Base2:                     # 类型名称标签
+    .string "Base2"           # 类型名称字符串
+.Ltype_name_Base1:                     # 类型名称标签
+    .string "Base1"           # 类型名称字符串

@@ -478,7 +478,10 @@ TEST(ExprParserTemplateId, ExplicitArgsAndComparisonRollback) {
     auto callee1 = asVar(e1->callee, "foo");
     ASSERT_NE(callee1, nullptr);
     ASSERT_EQ(callee1->explicitTemplateArgs.size(), 1u);
-    EXPECT_TRUE(callee1->explicitTemplateArgs[0]->isInt());
+    // 显式模板实参是 tagged 的 TemplateArg（[temp.arg]），取值前先看 kind：
+    // 这里是类型实参，再取 .type 判类型。
+    ASSERT_TRUE(callee1->explicitTemplateArgs[0].isType());
+    EXPECT_TRUE(callee1->explicitTemplateArgs[0].type->isInt());
     ASSERT_EQ(e1->arguments.size(), 1u);
     asVar(e1->arguments[0], "x");
 
@@ -489,8 +492,10 @@ TEST(ExprParserTemplateId, ExplicitArgsAndComparisonRollback) {
     auto callee2 = asVar(e2->callee, "foo");
     ASSERT_NE(callee2, nullptr);
     ASSERT_EQ(callee2->explicitTemplateArgs.size(), 2u);
-    EXPECT_TRUE(callee2->explicitTemplateArgs[0]->isInt());
-    EXPECT_TRUE(callee2->explicitTemplateArgs[1]->isDouble());
+    ASSERT_TRUE(callee2->explicitTemplateArgs[0].isType());
+    ASSERT_TRUE(callee2->explicitTemplateArgs[1].isType());
+    EXPECT_TRUE(callee2->explicitTemplateArgs[0].type->isInt());
+    EXPECT_TRUE(callee2->explicitTemplateArgs[1].type->isDouble());
 
     // foo<>(x)：空显参列表也算 template-id
     auto e3 = std::dynamic_pointer_cast<CallExpr>(

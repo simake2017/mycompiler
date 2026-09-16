@@ -4,152 +4,152 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Base_dtor
-    Base_dtor:
+        .globl Base_dtor             # 导出函数符号，使链接器可见
+    Base_dtor:                       # 函数入口标签
     # Function: ~Base (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Base_Base
-    Base_Base:
+        .globl Base_Base             # 导出函数符号，使链接器可见
+    Base_Base:                       # 函数入口标签
     # Function: Base (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV4Base(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV4Base(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Derived_Derived
-    Derived_Derived:
+        .globl Derived_Derived_2             # 导出函数符号，使链接器可见
+    Derived_Derived_2:                       # 函数入口标签
     # Function: Derived (params: 2)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)    # param: i
-    movq %rdx, -24(%rbp)    # param: s
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV7Derived(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -16(%rbp), %rax    # load i
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 8(%rcx)    # .id = ... (offset 8)
-    movq -24(%rbp), %rax    # load s
-    pushq %rax                   # stash value
-    movq -8(%rbp), %rax    # load this
-    movq %rax, %rcx                # this address
-    popq %rax                    # restore value
-    movl %eax, 12(%rcx)    # .score = ... (offset 12)
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq %rsi, -16(%rbp)         # 形参 i 从寄存器 spill 到栈
+    movq %rdx, -24(%rbp)         # 形参 s 从寄存器 spill 到栈
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV7Derived(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -16(%rbp), %rax    # 加载局部变量 i 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 8(%rcx)    # .id = ...（偏移 8，4 字节写入）
+    movq -24(%rbp), %rax    # 加载局部变量 s 到 rax
+    pushq %rax                  # 暂存右值到栈上
+    movq -8(%rbp), %rax    # 加载 this 指针
+    movq %rax, %rcx                # this 地址存入 rcx
+    popq %rax                    # 弹出右值回 rax
+    movl %eax, 16(%rcx)    # .score = ...（偏移 16，4 字节写入）
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Derived_dtor
-    Derived_dtor:
+        .globl Derived_dtor             # 导出函数符号，使链接器可见
+    Derived_dtor:                       # 函数入口标签
     # Function: ~Derived (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var b = ...
     # new Derived()
-    movq $16, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    leaq _ZTV7Derived(%rip), %rcx    # vtable address
-    addq $16, %rcx              # skip to vtable[0]
-    movq (%rsp), %rax           # load objPtr
-    movq %rcx, (%rax)           # obj._vptr = vtable
-    movq $1, %rax           # int literal
-    pushq %rax
-    movq $100, %rax           # int literal
-    pushq %rax
-    popq %rdx
-    popq %rsi
-    movq (%rsp), %rdi             # this pointer
-    callq Derived_Derived              # call constructor
-    popq %rax                     # return objPtr
+    movq $24, %rdi             # malloc 分配大小：24 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    leaq _ZTV7Derived(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq (%rsp), %rax           # 从栈上取回对象指针
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq $1, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 构造实参压栈暂存
+    movq $100, %rax           # 整数字面量载入 rax
+    pushq %rax                  # 构造实参压栈暂存
+    popq %rdx                   # 逆序弹出实参到寄存器
+    popq %rsi                   # 逆序弹出实参到寄存器
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Derived_Derived_2                 # 调用构造函数 Derived_Derived_2
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Derived()
-    movq %rax, -16(%rbp)    # store to b
+    movq %rax, -16(%rbp)       # 存储到局部变量 b
     # delete pointer
-    movq -16(%rbp), %rax    # load b
-    movq %rax, %rdi               # pointer to delete
-    pushq %rdi                    # save pointer
+    movq -16(%rbp), %rax    # 加载局部变量 b 到 rax
+    movq %rax, %rdi             # 待删除指针传入第 0 参数寄存器
+    pushq %rdi                  # 暂存指针（析构后还要 free）
     # VIRTUAL CALL: Base::dtor (vtable[0])
-    pushq %rdi                   # save this (object address)
-    popq %rdi                    # this pointer (restored)
-    # ═══ Virtual Call Step (a): Read _vptr from object ═══
-    movq (%rdi), %rax            # rax = obj._vptr (at offset 0)
-    # ═══ Virtual Call Step (b): Load function address from vtable ═══
-    movq 0(%rax), %rax       # rax = vtable[0] (offset 0)
-    # ═══ Virtual Call Step (c): Jump to the real function ═══
-    callq *%rax                  # indirect call via vtable
+    pushq %rdi                   # 暂存 this（对象地址）到栈上保护
+    popq %rdi                   # 弹出 this 指针（恢复对象地址）
+    # ═══ 虚函数调用 (a)：从对象读出 _vptr ═══
+    movq (%rdi), %rax            # 从对象首 8 字节读出 _vptr
+    # ═══ 虚函数调用 (b)：从 vtable 加载函数地址 ═══
+    movq 0(%rax), %rax       # 从 vtable[0] 读出函数地址（偏移 0）
+    # ═══ 虚函数调用 (c)：间接跳转到真实函数 ═══
+    callq *%rax                  # 经 vtable 间接调用（跳转到 rax 所指地址）
     # END VIRTUAL CALL Base::dtor
-    popq %rdi                     # restore pointer for free
-    callq free                    # free memory
+    popq %rdi                   # 恢复指针准备 free
+    callq free                  # 释放堆内存
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
 
     .data
-    .globl _ZTV7Derived
-    .align 8
-_ZTV7Derived:
-    .quad 0                    # offset to top
-    .quad _ZTI7Derived       # RTTI type_info pointer (vtable[-1])
-    .quad Derived_dtor   # vtable[0]: Derived_dtor
+    .globl _ZTV7Derived             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV7Derived:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI7Derived       # RTTI type_info 指针（vtable[-1]）
+    .quad Derived_dtor   # vtable[0]: 虚函数 Derived_dtor
 
-    .globl _ZTI7Derived
-    .align 8
-_ZTI7Derived:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Derived                 # type name string
-    .quad _ZTI4Base                 # base class typeinfo
+    .globl _ZTI7Derived             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI7Derived:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Derived                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI4Base                 # base[Base] typeinfo 指针
+    .quad 0                 # base[Base] 子对象偏移（字节）
 
-    .globl _ZTV4Base
-    .align 8
-_ZTV4Base:
-    .quad 0                    # offset to top
-    .quad _ZTI4Base       # RTTI type_info pointer (vtable[-1])
-    .quad Base_dtor   # vtable[0]: Base_dtor
+    .globl _ZTV4Base             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV4Base:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI4Base       # RTTI type_info 指针（vtable[-1]）
+    .quad Base_dtor   # vtable[0]: 虚函数 Base_dtor
 
-    .globl _ZTI4Base
-    .align 8
-_ZTI4Base:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Base                 # type name string
-    .quad 0                    # no base class
+    .globl _ZTI4Base             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI4Base:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Base                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
 
     .section .rodata
-.Ltype_name_Derived:
-    .string "Derived"           # type name
-.Ltype_name_Base:
-    .string "Base"           # type name
+.Ltype_name_Derived:                     # 类型名称标签
+    .string "Derived"           # 类型名称字符串
+.Ltype_name_Base:                     # 类型名称标签
+    .string "Base"           # 类型名称字符串

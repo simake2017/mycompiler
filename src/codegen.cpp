@@ -103,7 +103,7 @@ std::string CodeGen::addStringLiteral(const std::string& value) {
     return label;
 }
 
-// ★ wangyang: 汇编符号净化——gas 标签只允许 [A-Za-z0-9_.$]，源码层符号
+ // 汇编符号净化——gas 标签只允许 [A-Za-z0-9_.$]，源码层符号
 // 里的 "::"（命名空间限定）、"<>&,*"（模板实参）都会让汇编器报
 // "junk at end of line"。统一替换为下划线得到合法标签，如
 // Math::scale → Math__scale。这是教学版 name mangling 的一小步；
@@ -161,14 +161,24 @@ std::string CodeGen::generate(
     std::function<void(const std::vector<DeclPtr>&)> collectBases =
         [&](const std::vector<DeclPtr>& decls) {
             for (auto& decl : decls) {
-                if (auto cls = std::dynamic_pointer_cast<ClassDecl>(decl)) {
-                    baseClassOf[cls->name] = cls->firstBase();
-                } else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
-                    collectBases(ns->declarations);
-                } else if (auto tmpl = std::dynamic_pointer_cast<TemplateDecl>(decl)) {
-                    // 模板蓝图本身不产码；实例化后的 ClassDecl 已在 functions/类型表层面处理，
-                    // 这里只登记非模板类即可。模板实例走 NameMangler 的 _ZTI 名字，
-                    // 其基类信息与普通类同样经由 ClassDecl 路径登记（若被实例化）。
+                // 按节点种类分派（需要 shared_ptr 交给递归 ⇒ 标签分派，非访问者）
+                switch (decl->kind) {
+                    case NodeKind::Class: {
+                        auto cls = std::static_pointer_cast<ClassDecl>(decl);
+                        baseClassOf[cls->name] = cls->firstBase();
+                        break;
+                    }
+                    case NodeKind::Namespace:
+                        collectBases(std::static_pointer_cast<NamespaceDecl>(decl)->declarations);
+                        break;
+                    case NodeKind::Template:
+                        // 模板蓝图本身不产码；实例化后的 ClassDecl 已在 functions/
+                        // 类型表层面处理，这里只登记非模板类即可。模板实例走
+                        // NameMangler 的 _ZTI 名字，其基类信息与普通类同样经由
+                        // ClassDecl 路径登记（若被实例化）。
+                        break;
+                    default:
+                        break;
                 }
             }
         };
@@ -204,27 +214,36 @@ std::string CodeGen::generate(
     // 为全局变量生成数据段
     std::function<void(const std::vector<DeclPtr>&)> emitGlobalVars = [&](const std::vector<DeclPtr>& decls) {
         for (auto& decl : decls) {
-            if (auto gvar = std::dynamic_pointer_cast<GlobalVarDecl>(decl)) {
+            if (decl->kind == NodeKind::Namespace) {
+                emitGlobalVars(std::static_pointer_cast<NamespaceDecl>(decl)->declarations);
+                continue;
+            }
+            if (decl->kind != NodeKind::GlobalVar) continue;
+            {
+                auto gvar = std::static_pointer_cast<GlobalVarDecl>(decl);
                 // asmSymbol：命名空间内全局变量名字带 "::"（Math::g_factor），
                 // 净化成合法标签（标签端与 %rip 引用端必须一致）
                 std::string sym = asmSymbol(gvar->name);
                 emitData(std::format("    .globl {}             # 导出全局变量符号", sym));
                 emitData("    .align 8                # 8 字节对齐");
                 emitData(std::format("{}:                    # 全局变量标签", sym));
-                if (gvar->initializer) {
-                    if (auto lit = std::dynamic_pointer_cast<IntLiteralExpr>(gvar->initializer)) {
-                        emitData(std::format("    .quad {}              # 初始化值：{}", lit->value, lit->value));
-                    } else if (auto b = std::dynamic_pointer_cast<BoolLiteralExpr>(gvar->initializer)) {
-                        emitData(std::format("    .quad {}              # 初始化值：{}", b->value ? 1 : 0, b->value ? "true" : "false"));
-                    } else {
-                        emitData("    .quad 0                # 默认零初始化");
-                    }
+                // 初始化式只支持整型/布尔字面量，其余零初始化
+                if (gvar->initializer &&
+                    gvar->initializer->kind == NodeKind::IntLiteral) {
+                    auto lit = std::static_pointer_cast<IntLiteralExpr>(gvar->initializer);
+                    emitData(std::format("    .quad {}              # 初始化值：{}",
+                                         lit->value, lit->value));
+                } else if (gvar->initializer &&
+                           gvar->initializer->kind == NodeKind::BoolLiteral) {
+                    auto b = std::static_pointer_cast<BoolLiteralExpr>(gvar->initializer);
+                    emitData(std::format("    .quad {}              # 初始化值：{}",
+                                         b->value ? 1 : 0, b->value ? "true" : "false"));
+                } else if (gvar->initializer) {
+                    emitData("    .quad 0                # 默认零初始化");
                 } else {
                     emitData("    .quad 0                # 零初始化");
                 }
                 emitData("");
-            } else if (auto ns = std::dynamic_pointer_cast<NamespaceDecl>(decl)) {
-                emitGlobalVars(ns->declarations);
             }
         }
     };
@@ -318,7 +337,7 @@ void CodeGen::emitVTable(const std::string& className, TypePtr classType) {
     // 主表虚函数条目
     for (auto& entry : classType->classLayout.vtableEntries) {
         emitData(std::format("    .quad {}   # vtable[{}]: 虚函数 {}",
-            entry.mangledName, entry.index, entry.mangledName));
+            asmSymbol(entry.mangledName), entry.index, entry.mangledName));
     }
 
     // ── 次表段（secondary vtable segments）──
@@ -338,15 +357,15 @@ void CodeGen::emitVTable(const std::string& className, TypePtr classType) {
             auto& entry = base.entries[i];
             if (entry.isOverridden && entry.thunkAdjust != 0) {
                 // 发射 thunk 跳板（简化 mangling：类名_函数名_thunk偏移）
-                std::string thunkLabel = std::format("{}_{}_thunk{}",
-                    className, entry.baseFunctionName, -entry.thunkAdjust);
-                emitThunk(thunkLabel, entry.mangledName, entry.thunkAdjust);
+                std::string thunkLabel = asmSymbol(std::format("{}_{}_thunk{}",
+                    className, entry.baseFunctionName, -entry.thunkAdjust));
+                emitThunk(thunkLabel, asmSymbol(entry.mangledName), entry.thunkAdjust);
                 emitData(std::format("    .quad {}   # secondary[{}]: {}（经 thunk 跳板，this 调整量={}）",
                     thunkLabel, i, entry.mangledName, entry.thunkAdjust));
             } else {
                 // 未覆写：直接填基类函数地址（调用方传基类 this，无需调整）
                 emitData(std::format("    .quad {}   # secondary[{}]: {}（直接引用基类函数）",
-                    entry.mangledName, i, entry.mangledName));
+                    asmSymbol(entry.mangledName), i, entry.mangledName));
             }
         }
     }
@@ -406,7 +425,7 @@ void CodeGen::emitThunk(const std::string& thunkLabel,
 void CodeGen::emitRTTI(const std::string& className, TypePtr classType,
                        const std::string& baseClassName) {
     std::string rttiLabel = NameMangler::mangleRTTI(className);
-    std::string nameLabel = std::format(".Ltype_name_{}", className);
+    std::string nameLabel = std::format(".Ltype_name_{}", asmSymbol(className));
 
     // RTTI 结构（计数式布局，统一处理 0/1/N 个基类）
     // 对照真实 __vmi_class_type_info：
@@ -582,7 +601,8 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     m_currentStackOffset = paramOffset;
 
     // 构造函数：如果是构造函数，安装所有 vptr（多继承时可能有多个），并执行初始化列表
-    if (auto ctor = std::dynamic_pointer_cast<ConstructorDecl>(func)) {
+    if (func->kind == NodeKind::Constructor) {
+        auto ctor = std::static_pointer_cast<ConstructorDecl>(func);
         std::string vtableLabel;
         if (m_currentClassType && m_currentClassType->classLayout.hasVTable) {
             vtableLabel = NameMangler::mangleVTable(m_currentClassName);
@@ -743,13 +763,13 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     // 检查最后一条语句是否是 return（避免重复 leave/ret）
     bool endsWithReturn = false;
     if (func->body && !func->body->statements.empty()) {
-        endsWithReturn = std::dynamic_pointer_cast<ReturnStmt>(
-            func->body->statements.back()) != nullptr;
+        endsWithReturn =
+            func->body->statements.back()->kind == NodeKind::Return;
     }
 
     // 如果函数没有显式 return，添加默认返回
     if (!endsWithReturn) {
-        if (std::dynamic_pointer_cast<ConstructorDecl>(func)) {
+        if (func->kind == NodeKind::Constructor) {
             emit("movq -8(%rbp), %rax         # 构造函数返回 this 指针");
         } else if (func->returnType && func->returnType->isVoid()) {
             emit("movq $0, %rax               # void 函数返回 0");
@@ -771,23 +791,10 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
 // 理论：这就是"lowering（降级）"的入口：高级结构（声明/赋值/if/while）
 //       逐层展开为线性指令序列。对应 LLVM SelectionDAG 的类型匹配与
 //       Legalize 阶段，区别是这里用 dynamic_pointer_cast 手写派发。
-void CodeGen::emitStmt(StmtPtr stmt) {
-    if (auto s = std::dynamic_pointer_cast<BlockStmt>(stmt))
-        emitBlockStmt(s);
-    else if (auto s = std::dynamic_pointer_cast<VarDeclStmt>(stmt))
-        emitVarDecl(s);
-    else if (auto s = std::dynamic_pointer_cast<AssignStmt>(stmt))
-        emitAssign(s);
-    else if (auto s = std::dynamic_pointer_cast<ReturnStmt>(stmt))
-        emitReturn(s);
-    else if (auto s = std::dynamic_pointer_cast<DeleteStmt>(stmt))
-        emitDelete(s);
-    else if (auto s = std::dynamic_pointer_cast<IfStmt>(stmt))
-        emitIf(s);
-    else if (auto s = std::dynamic_pointer_cast<WhileStmt>(stmt))
-        emitWhile(s);
-    else if (auto s = std::dynamic_pointer_cast<ExprStmt>(stmt))
-        emitExprStmt(s);
+void CodeGen::emitStmt(const StmtPtr& stmt) {
+    if (!stmt) return;
+    // 一次虚表跳转就落到对应的 visit（改造前是逐级 dynamic_pointer_cast 试探）。
+    stmt->accept(*this);
 }
 
 // 复合语句：顺序发射各子语句 + ★块尾逆序析构本块声明的类对象（RAII）★。
@@ -801,10 +808,10 @@ void CodeGen::emitStmt(StmtPtr stmt) {
 //       （与符号表 enterScope/exitScope 同构）。
 // 简化：中途 return（emitReturn 直接 leave/ret）会跳过析构——真实编译器
 //       会在每个退栈点补析构调用，教学版接受此差距并在文档中注明。
-void CodeGen::emitBlockStmt(std::shared_ptr<BlockStmt> block) {
+void CodeGen::visit(BlockStmt& block) {
     m_blockDtorStack.push_back({});   // enter scope：本块专属析构层
 
-    for (auto& stmt : block->statements) {
+    for (auto& stmt : block.statements) {
         emitStmt(stmt);
     }
 
@@ -847,7 +854,8 @@ void CodeGen::emitClassDtorCall(const std::string& className, int rbpOffset) {
             }
         }
     }
-    emit(std::format("callq {}_dtor            # 静态调用析构函数（非虚析构路径）", className));
+    emit(std::format("callq {}            # 静态调用析构函数（非虚析构路径）",
+        asmSymbol(className + "_dtor")));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -864,34 +872,73 @@ uint32_t CodeGen::estimateBlockSize(std::shared_ptr<BlockStmt> block) {
     if (!block) return 0;
     uint32_t total = 0;
     for (auto& stmt : block->statements) {
-        if (auto v = std::dynamic_pointer_cast<VarDeclStmt>(stmt)) {
-            uint32_t size = 8;
-            if (v->declaredType && !v->declaredType->isPointer() && m_classTypes) {
-                auto cit = m_classTypes->find(v->declaredType->name);
-                if (cit != m_classTypes->end() && cit->second->isClass()) {
-                    size = cit->second->classLayout.totalSize;
-                    if (size < 8) size = 8;
-                    size = (size + 7) / 8 * 8;
+        // 按节点种类分派。这是【取值型】递归（累加 total），且各分支都要
+        // shared_ptr 下钻 ⇒ NodeKind 标签分派 —— 判据同 Sema / Instantiator。
+        switch (stmt->kind) {
+            case NodeKind::VarDecl: {
+                auto v = std::static_pointer_cast<VarDeclStmt>(stmt);
+                uint32_t size = 8;
+                if (v->declaredType && !v->declaredType->isPointer() && m_classTypes) {
+                    auto cit = m_classTypes->find(v->declaredType->name);
+                    if (cit != m_classTypes->end() && cit->second->isClass()) {
+                        size = cit->second->classLayout.totalSize;
+                        if (size < 8) size = 8;
+                        size = (size + 7) / 8 * 8;
+                    }
                 }
+                total += size;
+                break;
             }
-            total += size;
-        } else if (auto b = std::dynamic_pointer_cast<BlockStmt>(stmt)) {
-            total += estimateBlockSize(b);
-        } else if (auto i = std::dynamic_pointer_cast<IfStmt>(stmt)) {
-            if (auto tb = std::dynamic_pointer_cast<BlockStmt>(i->thenBranch))
-                total += estimateBlockSize(tb);
-            if (auto eb = std::dynamic_pointer_cast<BlockStmt>(i->elseBranch))
-                total += estimateBlockSize(eb);
-        } else if (auto w = std::dynamic_pointer_cast<WhileStmt>(stmt)) {
-            if (auto wb = std::dynamic_pointer_cast<BlockStmt>(w->body))
-                total += estimateBlockSize(wb);
+            case NodeKind::Block:
+                total += estimateBlockSize(std::static_pointer_cast<BlockStmt>(stmt));
+                break;
+            case NodeKind::If: {
+                auto i = std::static_pointer_cast<IfStmt>(stmt);
+                if (i->thenBranch && i->thenBranch->kind == NodeKind::Block)
+                    total += estimateBlockSize(std::static_pointer_cast<BlockStmt>(i->thenBranch));
+                if (i->elseBranch && i->elseBranch->kind == NodeKind::Block)
+                    total += estimateBlockSize(std::static_pointer_cast<BlockStmt>(i->elseBranch));
+                break;
+            }
+            case NodeKind::While: {
+                auto w = std::static_pointer_cast<WhileStmt>(stmt);
+                if (w->body && w->body->kind == NodeKind::Block)
+                    total += estimateBlockSize(std::static_pointer_cast<BlockStmt>(w->body));
+                break;
+            }
+            default:
+                break;   // 其余语句（表达式/return/delete…）不占栈槽
         }
     }
     return total;
 }
 
+// 帧大小 = 局部变量总尺寸 + 序言区（帧基 + 形参 spill 槽）。
+//
+// ★ 为什么必须补上序言区（曾经的 bug）：
+//   局部偏移的分配从 -8 起步（emitFunction 里 paramOffset = -8），每个
+//   spill 的形参再各占 8 字节，局部变量接着往下排；而 estimateBlockSize
+//   只数了局部变量的尺寸。于是帧比实际用到的最深偏移【浅了 8~56 字节】，
+//   最深那几个槽位落在 rsp 之下，被两样东西踩掉：
+//     · 表达式求值的 `pushq %rax`（左操作数暂存）—— 正好落在 rsp-8；
+//     · `callq` 压入的返回地址 —— 同样在 rsp-8。
+//   症状极具迷惑性：变量单独读出来是对的，一旦参与"需要压栈暂存"的
+//   二元表达式、或此前发生过一次函数调用，读到的就是邻居的值
+//   （`int a..h; return a + h;` 返回 2 而不是 9）。
+//   对照真实编译器：帧大小是序言与局部布局【同一份】分配器的产物
+//   （LLVM PrologEpilogInserter / X86FrameLowering::determineFrameLayout），
+//   不存在"两处各算一份、彼此对不上"的可能。
 uint32_t CodeGen::estimateFrameSize(FuncDeclPtr func) {
-    return estimateBlockSize(func->body);
+    uint32_t total = estimateBlockSize(func->body);
+
+    uint32_t slots = 1;                            // 帧基：paramOffset 从 -8 起
+    if (!func->ownerClassName.empty()) slots++;    // this 先占 rdi，spill 一个槽
+    for (size_t i = 0; i < func->parameters.size() && i < 6; i++) {
+        size_t regIdx = func->ownerClassName.empty() ? i : i + 1;
+        if (regIdx < 6) slots++;
+    }
+    total += slots * 8;
+    return total;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -955,13 +1002,13 @@ uint32_t CodeGen::getBaseOffset(const std::string& derivedClassName,
 //                       movq $0, off(%rbp)…      # 全部清零
 //                       leaq _ZTV3Dog(%rip)+16, %rcx; movq %rcx, off(%rbp)
 //                       leaq off(%rbp), %rdi; callq Dog_Dog
-void CodeGen::emitVarDecl(std::shared_ptr<VarDeclStmt> decl) {
+void CodeGen::visit(VarDeclStmt& decl) {
     // ── 路径②：声明类型是类 → 栈对象（RAII 的地基）──
     // 判据：declaredType 的类名命中全局类表（auto 已在 Sema 阶段替换完，
     // 此处看到的必然是最终类型；指针/引用不属于此路径）。
-    if (decl->declaredType && !decl->declaredType->isPointer()
+    if (decl.declaredType && !decl.declaredType->isPointer()
         && m_classTypes) {
-        auto cit = m_classTypes->find(decl->declaredType->name);
+        auto cit = m_classTypes->find(decl.declaredType->name);
         if (cit != m_classTypes->end() && cit->second->isClass()) {
             auto& layout = cit->second->classLayout;
 
@@ -979,22 +1026,22 @@ void CodeGen::emitVarDecl(std::shared_ptr<VarDeclStmt> decl) {
             // 双表登记：m_localVars 供"名字 → 偏移"通用查询；
             // m_classLocals 额外记住"这是类对象"，供 emitVar 取址、
             // 块尾析构、清零三处使用
-            m_localVars[decl->name] = offset;
-            m_classLocals[decl->name] = ClassLocalInfo{
+            m_localVars[decl.name] = offset;
+            m_classLocals[decl.name] = ClassLocalInfo{
                 cit->second->name, offset, size};
             if (!m_blockDtorStack.empty()) {
-                m_blockDtorStack.back().push_back(decl->name);
+                m_blockDtorStack.back().push_back(decl.name);
             }
 
             emitComment(std::format("stack object {} : {} ({} bytes, RAII)",
-                decl->name, cit->second->name, size));
+                decl.name, cit->second->name, size));
 
             // ① 零初始化整个对象（8 字节一拍）——构造函数写入字段前，
             //    其余字节必须是确定的 0（对应真实编译器的"默认成员初始化
             //    + 填充清零"；int 字段若构造未写就是 0，行为可观测）
             for (uint32_t i = 0; i < size; i += 8) {
                 emit(std::format("movq $0, {}(%rbp)    # 零初始化 {} 偏移 +{}",
-                    offset + static_cast<int>(i), decl->name, i));
+                    offset + static_cast<int>(i), decl.name, i));
             }
 
             // ② 安装 _vptr（仅多态类）：与 emitNew/构造函数内部安装同一公式
@@ -1019,29 +1066,49 @@ void CodeGen::emitVarDecl(std::shared_ptr<VarDeclStmt> decl) {
             }
 
             // ③ 调用构造函数：this = 栈上对象地址（leaq 取址）
-            //    约定符号名 类名_类名（与 emitNew、registerFunction 一致）
+            //    零参：约定符号名 类名_类名（与 emitNew、registerFunction 一致）；
+            //    带参：用 Sema 选定并回填的 ctorSymbol —— mangling 是有状态的
+            //    （同名多参会追加参数个数后缀），CodeGen 自己拼不出来。
+            //    实参传递与 emitNew 同一套：先逐个求值压栈暂存，再逆序弹出
+            //    到 rsi/rdx/rcx/r8/r9（rdi 被 this 占用）。
+            if (!decl.ctorArgs.empty() && !decl.ctorSymbol.empty()) {
+                for (size_t i = 0; i < decl.ctorArgs.size() && i < 5; i++) {
+                    emitExpr(decl.ctorArgs[i]);
+                    emit("pushq %rax                  # 构造实参压栈暂存");
+                }
+                for (int i = static_cast<int>(decl.ctorArgs.size()) - 1; i >= 0 && i < 5; i--) {
+                    static const char* regs[] = {"rsi", "rdx", "rcx", "r8", "r9"};
+                    emit(std::format("popq %{}                   # 逆序弹出实参到寄存器", regs[i]));
+                }
+                emit(std::format("leaq {}(%rbp), %rdi       # this = 栈对象地址 &{}",
+                    offset, decl.name));
+                emit(std::format("callq {}               # 调用构造函数（带参重载）",
+                    asmSymbol(decl.ctorSymbol)));
+                return;
+            }
+
             emit(std::format("leaq {}(%rbp), %rdi       # this = 栈对象地址 &{}",
-                offset, decl->name));
-            emit(std::format("callq {}_{}               # 调用构造函数",
-                cit->second->name, cit->second->name));
+                offset, decl.name));
+            emit(std::format("callq {}               # 调用构造函数",
+                asmSymbol(cit->second->name + "_" + cit->second->name)));
             return;
         }
     }
 
     // ── 路径①：标量 —— 8 字节槽 ──
     m_currentStackOffset -= 8;
-    m_localVars[decl->name] = m_currentStackOffset;
+    m_localVars[decl.name] = m_currentStackOffset;
 
-    if (decl->initializer) {
-        emitComment(std::format("var {} = ...", decl->name));
-        emitExpr(decl->initializer);
+    if (decl.initializer) {
+        emitComment(std::format("var {} = ...", decl.name));
+        emitExpr(decl.initializer);
 
         // Upcast 指针调整：D* → B* 时需加偏移（多继承次基类）
-        if (decl->declaredType && decl->declaredType->isPointer() &&
-            decl->initializer->resolvedType && decl->initializer->resolvedType->isPointer()) {
+        if (decl.declaredType && decl.declaredType->isPointer() &&
+            decl.initializer->resolvedType && decl.initializer->resolvedType->isPointer()) {
 
-            std::string baseName = decl->declaredType->pointeeType->name;
-            std::string derivedName = decl->initializer->resolvedType->pointeeType->name;
+            std::string baseName = decl.declaredType->pointeeType->name;
+            std::string derivedName = decl.initializer->resolvedType->pointeeType->name;
 
             uint32_t adjust = getBaseOffset(derivedName, baseName);
 
@@ -1053,11 +1120,11 @@ void CodeGen::emitVarDecl(std::shared_ptr<VarDeclStmt> decl) {
         }
 
         emit(std::format("movq %rax, {}(%rbp)       # 存储到局部变量 {}",
-            m_currentStackOffset, decl->name));
+            m_currentStackOffset, decl.name));
     } else {
         // 零初始化
         emit(std::format("movq $0, {}(%rbp)         # {} 零初始化",
-            m_currentStackOffset, decl->name));
+            m_currentStackOffset, decl.name));
     }
 }
 
@@ -1081,99 +1148,109 @@ void CodeGen::emitVarDecl(std::shared_ptr<VarDeclStmt> decl) {
 // 注：字段路径会先算一遍右值再算对象地址、然后重新计算右值（右值被求值
 //     两次）——教学简化，假定初始化式无副作用；真实编译器用寄存器分配
 //     避免重复求值。
-void CodeGen::emitAssign(std::shared_ptr<AssignStmt> stmt) {
+void CodeGen::visit(AssignStmt& stmt) {
     // 计算右值到 rax
-    emitExpr(stmt->value);
+    emitExpr(stmt.value);
 
-    // 赋值目标
-    if (auto idx = std::dynamic_pointer_cast<IndexExpr>(stmt->target)) {
-        // ─── 下标赋值（写形态）→ 糖化为 v.set(i, value) ───
-        // 读走 at()、写走 set()，是 at()/set() 约定的另一半
-        // （[expr.ass] 左值语义的降级：赋值目标必须是函数调用形态）。
-        // 此刻 rax 已是右值（函数开头统一求值）：压栈保序，
-        // 依次取 this 与下标，再按 System V 装参 rdi/rsi/rdx。
-        emitComment("subscript assign v[i] = ... → desugar to v.set(i, value)");
-        TypePtr objType = idx->object->resolvedType;
-        if (objType && objType->isPointer()) {
-            objType = objType->pointeeType;
-        }
-        std::string className = (objType && objType->isClass()) ? objType->name : "";
-
-        emit("pushq %rax                  # 暂存右值（待写入的值）到栈上");
-        emitExpr(idx->index);
-        emit("pushq %rax                  # 暂存下标值到栈上");
-        emitExpr(idx->object);
-        emit("movq %rax, %rdi             # this = 容器对象地址（第 0 参数）");
-        emit("popq %rsi                   # arg1: 弹出下标 i 到 rsi");
-        emit("popq %rdx                   # arg2: 弹出右值 value 到 rdx");
-        emit(std::format("callq {}_set              # 调用 v.set(i, value) 完成写入", className));
-    }
-    else if (auto var = std::dynamic_pointer_cast<VarExpr>(stmt->target)) {
-        // ★ 裸字段名赋值：方法体内写 age = a; 等价于 this->age = a;
-        //   （与 emitVar 的"裸字段读"路径对称）。必须在全局兜底之前检查，
-        //   否则降级成 movq %rax, age(%rip) 全局写 → 链接期 undefined reference。
-        //   注意顺序：局部表优先（this 指针也登记在 m_localVars），
-        //   之后才是字段，最后才轮到全局。
-        bool fieldHandled = false;
-        if (m_localVars.find(var->name) == m_localVars.end()
-            && !m_currentClassName.empty() && m_currentClassType) {
-            auto field = m_currentClassType->classLayout.findField(var->name);
-            auto thisIt = m_localVars.find("this");
-            if (field && thisIt != m_localVars.end()) {
-                // rax 已是右值（emitAssign 开头统一求值）：压栈暂存 →
-                // 取 this → 弹出右值 → 写入 [this + offset]
-                emit("pushq %rax                  # 暂存右值到栈上");
-                emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
-                emit("movq %rax, %rcx                # this 地址存入 rcx");
-                emit("popq %rax                    # 弹出右值回 rax");
-                emit(std::format("movl %eax, {}(%rcx)    # .{} = ...（偏移 {}，4 字节写入）",
-                    field->offset, var->name, field->offset));
-                fieldHandled = true;
-            }
-        }
-        if (!fieldHandled) {
-            auto it = m_localVars.find(var->name);
-            if (it != m_localVars.end()) {
-                emit(std::format("movq %rax, {}(%rbp)       # 赋值局部变量 {}",
-                    it->second, var->name));
-            } else {
-                // 全局变量赋值（asmSymbol 净化 :: 等非法标签字符，
-                // 与 .data 段标签发射端一致）
-                emit(std::format("movq %rax, {}(%rip)       # 全局变量 {} = ...",
-                    asmSymbol(var->name), var->name));
-            }
-        }
-    }
-    else if (auto mem = std::dynamic_pointer_cast<MemberExpr>(stmt->target)) {
-        // ─── 字段访问的消除 ───
-        // 将 obj.field = value 转化为 [objAddr + fieldOffset] = value
-        emitComment(std::format("member assign: .{} = ...", mem->memberName));
-
-        // 先计算对象地址到 rcx
-        emitExpr(mem->object);
-        emit("movq %rax, %rcx                # 对象地址存入 rcx");
-
-        // 计算右值到 rax
-        emitExpr(stmt->value);
-
-        // 查找字段偏移量
-        if (mem->object->resolvedType) {
-            TypePtr objType = mem->object->resolvedType;
-            if (mem->isArrow && objType->isPointer()) {
+    // 赋值目标有三态：① 下标 v[i]（糖化成 v.set(i,value) 调用）
+    // ② 裸名（局部变量 / 裸字段 / 全局变量，按作用域优先级）
+    // ③ 成员访问 o.f（按 ClassLayout 查到偏移量后直接写内存）。
+    // 三者互斥 —— 按节点种类一次 switch，跳表分派替代 RTTI 试探链。
+    switch (stmt.target->kind) {
+        case NodeKind::Index: {
+            auto idx = std::static_pointer_cast<IndexExpr>(stmt.target);
+            // ─── 下标赋值（写形态）→ 糖化为 v.set(i, value) ───
+            // 读走 at()、写走 set()，是 at()/set() 约定的另一半
+            // （[expr.ass] 左值语义的降级：赋值目标必须是函数调用形态）。
+            // 此刻 rax 已是右值（函数开头统一求值）：压栈保序，
+            // 依次取 this 与下标，再按 System V 装参 rdi/rsi/rdx。
+            emitComment("subscript assign v[i] = ... → desugar to v.set(i, value)");
+            TypePtr objType = idx->object->resolvedType;
+            if (objType && objType->isPointer()) {
                 objType = objType->pointeeType;
             }
-            if (objType->isClass()) {
-                auto field = objType->classLayout.findField(mem->memberName);
-                if (field) {
-                    emit(std::format("movl %eax, {}(%rcx)    # 写入字段 .{}（偏移 +{}）",
-                        field->offset, mem->memberName, field->offset));
-                    return;
+            std::string className = (objType && objType->isClass()) ? objType->name : "";
+
+            emit("pushq %rax                  # 暂存右值（待写入的值）到栈上");
+            emitExpr(idx->index);
+            emit("pushq %rax                  # 暂存下标值到栈上");
+            emitExpr(idx->object);
+            emit("movq %rax, %rdi             # this = 容器对象地址（第 0 参数）");
+            emit("popq %rsi                   # arg1: 弹出下标 i 到 rsi");
+            emit("popq %rdx                   # arg2: 弹出右值 value 到 rdx");
+            emit(std::format("callq {}_set              # 调用 v.set(i, value) 完成写入", className));
+        } break;
+        case NodeKind::Var: {
+            auto var = std::static_pointer_cast<VarExpr>(stmt.target);
+            // ★ 裸字段名赋值：方法体内写 age = a; 等价于 this->age = a;
+            //   （与 emitVar 的"裸字段读"路径对称）。必须在全局兜底之前检查，
+            //   否则降级成 movq %rax, age(%rip) 全局写 → 链接期 undefined reference。
+            //   注意顺序：局部表优先（this 指针也登记在 m_localVars），
+            //   之后才是字段，最后才轮到全局。
+            bool fieldHandled = false;
+            if (m_localVars.find(var->name) == m_localVars.end()
+                && !m_currentClassName.empty() && m_currentClassType) {
+                auto field = m_currentClassType->classLayout.findField(var->name);
+                auto thisIt = m_localVars.find("this");
+                if (field && thisIt != m_localVars.end()) {
+                    // rax 已是右值（emitAssign 开头统一求值）：压栈暂存 →
+                    // 取 this → 弹出右值 → 写入 [this + offset]
+                    emit("pushq %rax                  # 暂存右值到栈上");
+                    emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
+                    emit("movq %rax, %rcx                # this 地址存入 rcx");
+                    emit("popq %rax                    # 弹出右值回 rax");
+                    emit(std::format("movl %eax, {}(%rcx)    # .{} = ...（偏移 {}，4 字节写入）",
+                        field->offset, var->name, field->offset));
+                    fieldHandled = true;
                 }
             }
-        }
+            if (!fieldHandled) {
+                auto it = m_localVars.find(var->name);
+                if (it != m_localVars.end()) {
+                    emit(std::format("movq %rax, {}(%rbp)       # 赋值局部变量 {}",
+                        it->second, var->name));
+                } else {
+                    // 全局变量赋值（asmSymbol 净化 :: 等非法标签字符，
+                    // 与 .data 段标签发射端一致）
+                    emit(std::format("movq %rax, {}(%rip)       # 全局变量 {} = ...",
+                        asmSymbol(var->name), var->name));
+                }
+            }
+        } break;
+        case NodeKind::Member: {
+            auto mem = std::static_pointer_cast<MemberExpr>(stmt.target);
+            // ─── 字段访问的消除 ───
+            // 将 obj.field = value 转化为 [objAddr + fieldOffset] = value
+            emitComment(std::format("member assign: .{} = ...", mem->memberName));
 
-        // 如果找不到偏移量，生成通用代码
-        emit("movq %rax, (%rcx)              # 成员赋值（偏移未知，默认偏移 0）");
+            // 先计算对象地址到 rcx
+            emitExpr(mem->object);
+            emit("movq %rax, %rcx                # 对象地址存入 rcx");
+
+            // 计算右值到 rax
+            emitExpr(stmt.value);
+
+            // 查找字段偏移量
+            if (mem->object->resolvedType) {
+                TypePtr objType = mem->object->resolvedType;
+                if (mem->isArrow && objType->isPointer()) {
+                    objType = objType->pointeeType;
+                }
+                if (objType->isClass()) {
+                    auto field = objType->classLayout.findField(mem->memberName);
+                    if (field) {
+                        emit(std::format("movl %eax, {}(%rcx)    # 写入字段 .{}（偏移 +{}）",
+                            field->offset, mem->memberName, field->offset));
+                        return;
+                    }
+                }
+            }
+
+            // 如果找不到偏移量，生成通用代码
+            emit("movq %rax, (%rcx)              # 成员赋值（偏移未知，默认偏移 0）");
+        } break;
+        default:
+            break;
     }
 }
 
@@ -1191,10 +1268,10 @@ void CodeGen::emitAssign(std::shared_ptr<AssignStmt> stmt) {
 //       addq %rcx, %rax        # 结果已在 rax
 //       leave
 //       ret
-void CodeGen::emitReturn(std::shared_ptr<ReturnStmt> stmt) {
-    if (stmt->value) {
+void CodeGen::visit(ReturnStmt& stmt) {
+    if (stmt.value) {
         emitComment("return expr");
-        emitExpr(stmt->value);
+        emitExpr(stmt.value);
         // 返回值已经在 rax 中
     } else {
         emit("movq $0, %rax               # void 返回，结果置 0");
@@ -1206,14 +1283,14 @@ void CodeGen::emitReturn(std::shared_ptr<ReturnStmt> stmt) {
 // ─────────────────────────────────────────────────────────────────────────────
 // delete 语句
 // ─────────────────────────────────────────────────────────────────────────────
-void CodeGen::emitDelete(std::shared_ptr<DeleteStmt> stmt) {
+void CodeGen::visit(DeleteStmt& stmt) {
     emitComment("delete pointer");
-    emitExpr(stmt->pointerExpr);
+    emitExpr(stmt.pointerExpr);
     emit("movq %rax, %rdi             # 待删除指针传入第 0 参数寄存器");
     emit("pushq %rdi                  # 暂存指针（析构后还要 free）");
 
     // 检查是否需要调用析构函数
-    TypePtr ptrType = stmt->pointerExpr->resolvedType;
+    TypePtr ptrType = stmt.pointerExpr->resolvedType;
     if (ptrType && ptrType->isPointer() && ptrType->pointeeType && ptrType->pointeeType->isClass()) {
         std::string className = ptrType->pointeeType->name;
         if (m_classTypes) {
@@ -1232,7 +1309,8 @@ void CodeGen::emitDelete(std::shared_ptr<DeleteStmt> stmt) {
                 if (hasVirtualDtor) {
                     emitVirtualCall(className, "dtor", {}, dtorIndex);
                 } else {
-                    emit(std::format("callq {}_dtor           # 静态调用析构函数", className));
+                    emit(std::format("callq {}           # 静态调用析构函数",
+                        asmSymbol(className + "_dtor")));
                 }
             }
         }
@@ -1269,23 +1347,23 @@ void CodeGen::emitDelete(std::shared_ptr<DeleteStmt> stmt) {
 //   else_0:
 //       <else 分支>
 //   endif_1:
-void CodeGen::emitIf(std::shared_ptr<IfStmt> stmt) {
+void CodeGen::visit(IfStmt& stmt) {
     std::string elseLabel = newLabel("else");
     std::string endLabel = newLabel("endif");
 
     emitComment("if condition");
-    emitExpr(stmt->condition);
+    emitExpr(stmt.condition);
     emit("testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位");
-    emit(std::format("je {}                     # 条件为假（ZF=1）跳转到 else/endif", stmt->elseBranch ? elseLabel : endLabel));
+    emit(std::format("je {}                     # 条件为假（ZF=1）跳转到 else/endif", stmt.elseBranch ? elseLabel : endLabel));
 
     emitComment("then branch");
-    emitStmt(stmt->thenBranch);
+    emitStmt(stmt.thenBranch);
 
-    if (stmt->elseBranch) {
+    if (stmt.elseBranch) {
         emit(std::format("jmp {}                    # then 分支结束，无条件跳转到 endif", endLabel));
         emit(std::format("{}:                        # else 分支标签", elseLabel));
         emitComment("else branch");
-        emitStmt(stmt->elseBranch);
+        emitStmt(stmt.elseBranch);
     }
 
     emit(std::format("{}:                        # endif 标签", endLabel));
@@ -1314,18 +1392,18 @@ void CodeGen::emitIf(std::shared_ptr<IfStmt> stmt) {
 //       <循环体>
 //       jmp while_begin_2         # 回边：回到条件测试
 //   while_end_3:
-void CodeGen::emitWhile(std::shared_ptr<WhileStmt> stmt) {
+void CodeGen::visit(WhileStmt& stmt) {
     std::string beginLabel = newLabel("while_begin");
     std::string endLabel = newLabel("while_end");
 
     emit(std::format("{}:                        # while 循环开始标签", beginLabel));
     emitComment("while condition");
-    emitExpr(stmt->condition);
+    emitExpr(stmt.condition);
     emit("testq %rax, %rax             # 条件值与自身按位与，设置 ZF 标志位");
     emit(std::format("je {}                     # 条件为假（ZF=1）跳出循环", endLabel));
 
     emitComment("while body");
-    emitStmt(stmt->body);
+    emitStmt(stmt.body);
     emit(std::format("jmp {}                    # 无条件跳回循环开始（回边）", beginLabel));
 
     emit(std::format("{}:                        # while 循环结束标签", endLabel));
@@ -1333,8 +1411,8 @@ void CodeGen::emitWhile(std::shared_ptr<WhileStmt> stmt) {
 
 // 表达式语句：只求值、结果（rax）丢弃；价值在求值过程产生的副作用
 // （典型如 ptr->speak() 这类调用语句）。
-void CodeGen::emitExprStmt(std::shared_ptr<ExprStmt> stmt) {
-    emitExpr(stmt->expr);
+void CodeGen::visit(ExprStmt& stmt) {
+    emitExpr(stmt.expr);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1347,48 +1425,31 @@ void CodeGen::emitExprStmt(std::shared_ptr<ExprStmt> stmt) {
 //       子表达式的中间值靠 push/pop 经栈周转（见 emitBinary）。
 // 注意：nullptr 没有单独的 emit 函数，直接内联在此——xorq 自异或清零
 //       是 x86 惯用的"置 0"写法（比 movq $0 更短且不依赖立即数）。
-void CodeGen::emitExpr(ExprPtr expr) {
-    if (auto e = std::dynamic_pointer_cast<IntLiteralExpr>(expr))
-        emitIntLiteral(e);
-    else if (auto e = std::dynamic_pointer_cast<BoolLiteralExpr>(expr))
-        emitBoolLiteral(e);
-    else if (auto e = std::dynamic_pointer_cast<StringLiteralExpr>(expr))
-        emitStringLiteral(e);
-    else if (auto e = std::dynamic_pointer_cast<VarExpr>(expr))
-        emitVar(e);
-    else if (auto e = std::dynamic_pointer_cast<BinaryExpr>(expr))
-        emitBinary(e);
-    else if (auto e = std::dynamic_pointer_cast<UnaryExpr>(expr))
-        emitUnary(e);
-    else if (auto e = std::dynamic_pointer_cast<CallExpr>(expr))
-        emitCall(e);
-    else if (auto e = std::dynamic_pointer_cast<MemberExpr>(expr))
-        emitMember(e);
-    else if (auto e = std::dynamic_pointer_cast<IndexExpr>(expr))
-        emitIndex(e);
-    else if (auto e = std::dynamic_pointer_cast<NewExpr>(expr))
-        emitNew(e);
-    else if (auto e = std::dynamic_pointer_cast<ThisExpr>(expr))
-        emitThis(e);
-    else if (auto e = std::dynamic_pointer_cast<DynamicCastExpr>(expr))
-        emitDynamicCast(e);
-    else if (std::dynamic_pointer_cast<NullptrLiteralExpr>(expr)) {
-        emit("xorq %rax, %rax             # nullptr = 0（x86 惯用自异或清零）");
-    }
+void CodeGen::emitExpr(const ExprPtr& expr) {
+    if (!expr) return;
+    // 同上：accept 虚表分派。
+    // 注意 NullptrLiteralExpr 在此就地发射（无独立 helper），故在下面以
+    // visit(NullptrLiteralExpr&) 的形式保留 —— 改造前它也在这条链的末尾。
+    expr->accept(*this);
+}
+
+// nullptr 字面量：x86 惯用自异或清零（比 movq $0 少一个字节且更快）
+void CodeGen::visit(NullptrLiteralExpr&) {
+    emit("xorq %rax, %rax             # nullptr = 0（x86 惯用自异或清零）");
 }
 
 // 整数字面量：立即数直接进 rax。
 // demo: 42 → movq $42, %rax
-void CodeGen::emitIntLiteral(std::shared_ptr<IntLiteralExpr> expr) {
-    emit(std::format("movq ${}, %rax           # 整数字面量载入 rax", expr->value));
+void CodeGen::visit(IntLiteralExpr& expr) {
+    emit(std::format("movq ${}, %rax           # 整数字面量载入 rax", expr.value));
 }
 
 // 布尔字面量：本项目 bool 按整数 0/1 表示，
 // 与比较运算 setcc/movzbq 的产出形式天然一致。
 // demo: true → movq $1, %rax      false → movq $0, %rax
-void CodeGen::emitBoolLiteral(std::shared_ptr<BoolLiteralExpr> expr) {
+void CodeGen::visit(BoolLiteralExpr& expr) {
     emit(std::format("movq ${}, %rax           # 布尔字面量",
-        expr->value ? 1 : 0));
+        expr.value ? 1 : 0));
 }
 
 // 字符串字面量：登记进常量池取标签，再用 RIP 相对寻址取地址。
@@ -1397,8 +1458,8 @@ void CodeGen::emitBoolLiteral(std::shared_ptr<BoolLiteralExpr> expr) {
 //       由重定位在汇编/链接期填回，代码段无需知道绝对地址。
 // demo: "hello" → .rodata 中 str_0: .string "hello"
 //                 此处发射 leaq str_0(%rip), %rax
-void CodeGen::emitStringLiteral(std::shared_ptr<StringLiteralExpr> expr) {
-    std::string label = addStringLiteral(expr->value);
+void CodeGen::visit(StringLiteralExpr& expr) {
+    std::string label = addStringLiteral(expr.value);
     emit(std::format("leaq {}(%rip), %rax      # 加载字符串字面量地址（PIC）", label));
 }
 
@@ -1411,38 +1472,38 @@ void CodeGen::emitStringLiteral(std::shared_ptr<StringLiteralExpr> expr) {
 //                                   movl 0(%rax), %eax    # load .age
 // 兜底：两级都查不到时输出 WARNING 注释并清零（语义阶段本应已拦截，
 //       这里是双保险，保证 .s 仍然合法可汇编）。
-void CodeGen::emitVar(std::shared_ptr<VarExpr> expr) {
+void CodeGen::visit(VarExpr& expr) {
     // ★ 栈上类对象：值语义 = 对象地址（与指针表达式的值一致）——
     //   后续 emitMember/emitCall 对 "." 的约定就是"地址已在 rax"，
     //   用 leaq 取址即可复用整套成员访问代码，无需解引用。
     //   （必须放在普通局部加载之前：类对象槽里存的是对象内容首 8 字节，
     //     直接加载会得到 _vptr 而非对象地址——虚调用碰巧也能跑，
     //     但字段访问与析构取址会错，统一按地址语义发射才自洽。）
-    auto ci = m_classLocals.find(expr->name);
+    auto ci = m_classLocals.find(expr.name);
     if (ci != m_classLocals.end()) {
         emit(std::format("leaq {}(%rbp), %rax    # 取栈对象地址 &{}",
-            ci->second.offset, expr->name));
+            ci->second.offset, expr.name));
         return;
     }
 
     // 先查局部变量
-    auto it = m_localVars.find(expr->name);
+    auto it = m_localVars.find(expr.name);
     if (it != m_localVars.end()) {
         emit(std::format("movq {}(%rbp), %rax    # 加载局部变量 {} 到 rax",
-            it->second, expr->name));
+            it->second, expr.name));
         return;
     }
 
     // 如果在类方法中，查类字段（通过 this 指针访问）
     if (!m_currentClassName.empty() && m_currentClassType) {
-        auto field = m_currentClassType->classLayout.findField(expr->name);
+        auto field = m_currentClassType->classLayout.findField(expr.name);
         if (field) {
             // 通过 this 指针访问字段
             auto thisIt = m_localVars.find("this");
             if (thisIt != m_localVars.end()) {
                 emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
                 emit(std::format("movl {}(%rax), %eax    # 读取字段 .{}（偏移 +{} 字节）",
-                    field->offset, expr->name, field->offset));
+                    field->offset, expr.name, field->offset));
                 return;
             }
         }
@@ -1450,7 +1511,7 @@ void CodeGen::emitVar(std::shared_ptr<VarExpr> expr) {
 
     // 查全局变量或常量符号（RIP 寻址；asmSymbol 净化 :: 等非法标签字符）
     emit(std::format("movq {}(%rip), %rax    # 加载全局变量 {} 到 rax（RIP 相对寻址）",
-        asmSymbol(expr->name), expr->name));
+        asmSymbol(expr.name), expr.name));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1476,21 +1537,21 @@ void CodeGen::emitVar(std::shared_ptr<VarExpr> expr) {
 //       movq %rax, %rcx
 //       popq %rax
 //       addq %rcx, %rax        # +
-void CodeGen::emitBinary(std::shared_ptr<BinaryExpr> expr) {
+void CodeGen::visit(BinaryExpr& expr) {
     emitComment("binary expr");
 
     // 左操作数 → rax → 压栈
-    emitExpr(expr->left);
+    emitExpr(expr.left);
     emit("pushq %rax                  # 左操作数压栈暂存（求右值会覆盖 rax）");
 
     // 右操作数 → rax → rcx
-    emitExpr(expr->right);
+    emitExpr(expr.right);
     emit("movq %rax, %rcx             # 右操作数从 rax 转移到 rcx");
 
     // 恢复左操作数到 rax
     emit("popq %rax                   # 弹出左操作数回到 rax");
 
-    switch (expr->op) {
+    switch (expr.op) {
         case BinaryOp::Add:
             emit("addq %rcx, %rax             # 加法：rax = rax + rcx");
             break;
@@ -1565,10 +1626,37 @@ void CodeGen::emitBinary(std::shared_ptr<BinaryExpr> expr) {
 //       Not 用 testq + sete 实现"等于 0 则为 1"的逻辑非。
 // demo: -x → <加载 x 进 rax>; negq %rax
 //       !x → <加载 x 进 rax>; testq %rax, %rax; sete %al; movzbq %al, %rax
-void CodeGen::emitUnary(std::shared_ptr<UnaryExpr> expr) {
-    emitExpr(expr->operand);
+void CodeGen::visit(UnaryExpr& expr) {
+    // ── 取地址 &x：要的是【地址】而不是值，故不能先 emitExpr(operand) ──
+    // 对栈上的局部变量，地址就是 leaq off(%rbp)；先加载值再取址会得到
+    // "值所在的内存地址"这种毫无意义的指针。
+    // 对照 clang：CodeGenFunction::EmitUnaryOp 中 UO_AddrOf 走
+    //   EmitLValue(E) + EmitLValueAsAddr（求左值地址，而非求值）。
+    if (expr.op == UnaryOp::Addr) {
+        if (expr.operand->kind == NodeKind::Var) {
+            auto var = std::static_pointer_cast<VarExpr>(expr.operand);
+            auto ci = m_classLocals.find(var->name);
+            if (ci != m_classLocals.end()) {
+                emit(std::format("leaq {}(%rbp), %rax    # &{} = 栈对象地址",
+                    ci->second.offset, var->name));
+                return;
+            }
+            auto it = m_localVars.find(var->name);
+            if (it != m_localVars.end()) {
+                emit(std::format("leaq {}(%rbp), %rax    # &{} = 局部变量栈地址",
+                    it->second, var->name));
+                return;
+            }
+        }
+        // 其它形态（字段地址、数组元素地址…）尚未实现 —— 明确报错而非静默给错值
+        throw std::runtime_error(std::format(
+            "[CodeGen Error] address-of is only supported on local variables "
+            "for now (line {})", expr.location.line));
+    }
 
-    switch (expr->op) {
+    emitExpr(expr.operand);
+
+    switch (expr.op) {
         case UnaryOp::Neg:
             emit("negq %rax                   # 取负：rax = -rax（二进制补码）");
             break;
@@ -1577,6 +1665,10 @@ void CodeGen::emitUnary(std::shared_ptr<UnaryExpr> expr) {
             emit("sete %al                    # 逻辑非：ZF=1 时 al=1");
             emit("movzbq %al, %rax            # 零扩展 al 到 64 位 rax");
             break;
+        case UnaryOp::Addr:
+            // 上面已提前 return（取地址不走"先求值"路径），此处不可达
+            throw std::runtime_error(
+                "[CodeGen Error] UnaryOp::Addr should be handled before emitExpr");
     }
 }
 
@@ -1608,12 +1700,13 @@ void CodeGen::emitUnary(std::shared_ptr<UnaryExpr> expr) {
 //       callq add
 // demo: d.get(5)（非虚方法）→ this(d 的地址) → rdi，5 → rsi，
 //       callq Dog_get（"类名_方法名"简化 mangling）
-void CodeGen::emitCall(std::shared_ptr<CallExpr> expr) {
+void CodeGen::visit(CallExpr& expr) {
     emitComment("function call");
 
     // 检查是否是方法调用
     // ── 路径①/②：callee 形如 obj.method —— 先解析对象类型再定虚实 ──
-    if (auto mem = std::dynamic_pointer_cast<MemberExpr>(expr->callee)) {
+    if (expr.callee->kind == NodeKind::Member) {
+        auto mem = std::static_pointer_cast<MemberExpr>(expr.callee);
         if (mem->isMethodCall || (mem->object && mem->object->resolvedType)) {
             TypePtr objType = mem->object->resolvedType;
             if (mem->isArrow && objType && objType->isPointer()) {
@@ -1639,7 +1732,7 @@ void CodeGen::emitCall(std::shared_ptr<CallExpr> expr) {
                             emitExpr(mem->object);
                             emit("movq %rax, %rdi            # this = 对象地址（第 0 参数）");
                             emitVirtualCall(objType->name, mem->memberName,
-                                          expr->arguments, entry.index);
+                                          expr.arguments, entry.index);
                             return;
                         }
                     }
@@ -1655,13 +1748,13 @@ void CodeGen::emitCall(std::shared_ptr<CallExpr> expr) {
 
             // 计算参数
             // （逐个压栈暂存，随后逆序弹入 rsi/rdx/rcx/r8/r9）
-            for (size_t i = 0; i < expr->arguments.size() && i < 5; i++) {
-                emitExpr(expr->arguments[i]);
+            for (size_t i = 0; i < expr.arguments.size() && i < 5; i++) {
+                emitExpr(expr.arguments[i]);
                 emit("pushq %rax                  # 实参值压栈暂存");
             }
 
             // 恢复参数到寄存器
-            for (int i = static_cast<int>(expr->arguments.size()) - 1; i >= 0 && i < 5; i--) {
+            for (int i = static_cast<int>(expr.arguments.size()) - 1; i >= 0 && i < 5; i--) {
                 static const char* regs[] = {"rsi", "rdx", "rcx", "r8", "r9"};
                 emit(std::format("popq %{}                   # 逆序弹出实参到寄存器", regs[i]));
             }
@@ -1686,14 +1779,14 @@ void CodeGen::emitCall(std::shared_ptr<CallExpr> expr) {
 
     // 普通函数调用
     // 计算参数并放入对应寄存器
-    for (size_t i = 0; i < expr->arguments.size() && i < 6; i++) {
-        emitExpr(expr->arguments[i]);
+    for (size_t i = 0; i < expr.arguments.size() && i < 6; i++) {
+        emitExpr(expr.arguments[i]);
         emit("pushq %rax                  # 实参值压栈暂存");
     }
 
     // 恢复参数到寄存器（逆序）
     static const char* regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
-    for (int i = static_cast<int>(expr->arguments.size()) - 1; i >= 0; i--) {
+    for (int i = static_cast<int>(expr.arguments.size()) - 1; i >= 0; i--) {
         if (i < 6) {
             emit(std::format("popq %{}                   # 逆序弹出实参到寄存器", regs[i]));
         }
@@ -1701,7 +1794,8 @@ void CodeGen::emitCall(std::shared_ptr<CallExpr> expr) {
 
     // 确定函数名
     std::string funcName;
-    if (auto var = std::dynamic_pointer_cast<VarExpr>(expr->callee)) {
+    if (expr.callee->kind == NodeKind::Var) {
+        auto var = std::static_pointer_cast<VarExpr>(expr.callee);
         // asmSymbol：限定名调用（Math::scale）在源码层带 "::"，
         // 净化后与标签发射端一致（见 emitFunction）
         funcName = asmSymbol(var->name);
@@ -1823,14 +1917,14 @@ void CodeGen::emitVirtualCall(
 //       movq -8(%rbp), %rax      # load p（对象地址）
 //       movq 0(%rax), %rax       # .age (offset 0)
 // 兜底：查不到偏移时按偏移 0 读取并留注释（语义阶段本应已拦截）。
-void CodeGen::emitMember(std::shared_ptr<MemberExpr> expr) {
-    emitComment(std::format("member access: .{}", expr->memberName));
+void CodeGen::visit(MemberExpr& expr) {
+    emitComment(std::format("member access: .{}", expr.memberName));
 
     // 计算对象地址
-    emitExpr(expr->object);
+    emitExpr(expr.object);
 
-    TypePtr objType = expr->object->resolvedType;
-    if (expr->isArrow && objType && objType->isPointer()) {
+    TypePtr objType = expr.object->resolvedType;
+    if (expr.isArrow && objType && objType->isPointer()) {
         // 对于 -> 操作，对象本身就是一个指针
         // 不需要额外解引用
     } else if (objType && !objType->isPointer()) {
@@ -1840,12 +1934,12 @@ void CodeGen::emitMember(std::shared_ptr<MemberExpr> expr) {
 
     if (objType) {
         TypePtr actualType = objType;
-        if (expr->isArrow && objType->isPointer()) {
+        if (expr.isArrow && objType->isPointer()) {
             actualType = objType->pointeeType;
         }
 
         if (actualType && actualType->isClass()) {
-            auto field = actualType->classLayout.findField(expr->memberName);
+            auto field = actualType->classLayout.findField(expr.memberName);
             if (field) {
                 // ── 嵌套类字段：取地址而非取值（子对象内联在父对象里）──
                 // o->f.a 的 f 步：类类型字段不是"值"，是父对象内的子对象，
@@ -1856,7 +1950,7 @@ void CodeGen::emitMember(std::shared_ptr<MemberExpr> expr) {
                 // minicc 教学版保留逐层 leaq，便于观察每一跳。
                 if (field->type && field->type->isClass()) {
                     emit(std::format("leaq {}(%rax), %rax    # 嵌套类字段 .{} 取地址（子对象偏移 +{}）",
-                        field->offset, expr->memberName, field->offset));
+                        field->offset, expr.memberName, field->offset));
                     return;
                 }
                 // 直接用偏移量访问字段
@@ -1865,13 +1959,13 @@ void CodeGen::emitMember(std::shared_ptr<MemberExpr> expr) {
                 //   高 32 位）；指针/8B 用 movq；bool(1B) 用 movzbq。
                 if (field->size <= 4) {
                     emit(std::format("movl {}(%rax), %eax    # 读取字段 .{}（偏移 +{}，4B int）",
-                        field->offset, expr->memberName, field->offset));
+                        field->offset, expr.memberName, field->offset));
                 } else if (field->size == 1) {
                     emit(std::format("movzbq {}(%rax), %rax  # 读取字段 .{}（偏移 +{}，1B bool）",
-                        field->offset, expr->memberName, field->offset));
+                        field->offset, expr.memberName, field->offset));
                 } else {
                     emit(std::format("movq {}(%rax), %rax    # 读取字段 .{}（偏移 +{}，8B 指针/long）",
-                        field->offset, expr->memberName, field->offset));
+                        field->offset, expr.memberName, field->offset));
                 }
                 return;
             }
@@ -1899,22 +1993,22 @@ void CodeGen::emitMember(std::shared_ptr<MemberExpr> expr) {
 //       popq %rsi               # arg1 = i
 //       popq %rdi               # this = &v
 //       callq Vector_at         # v.at(i)
-void CodeGen::emitIndex(std::shared_ptr<IndexExpr> expr) {
+void CodeGen::visit(IndexExpr& expr) {
     emitComment("subscript v[i] → desugar to v.at(i)");
 
     // 容器类名：resolvedType 由语义阶段填充（指针容器先解引用一层）
-    TypePtr objType = expr->object->resolvedType;
+    TypePtr objType = expr.object->resolvedType;
     if (objType && objType->isPointer()) {
         objType = objType->pointeeType;
     }
     std::string className = (objType && objType->isClass()) ? objType->name : "";
 
     // this = 对象地址（栈对象经 emitVar 走 leaq 取址；指针直接取值）
-    emitExpr(expr->object);
+    emitExpr(expr.object);
     emit("pushq %rax                  # 保存 this 指针（容器对象地址）");
 
     // 下标表达式 → rax，随后按 System V 调用约定装参
-    emitExpr(expr->index);
+    emitExpr(expr.index);
     emit("pushq %rax                  # 下标值压栈暂存");
 
     emit("popq %rsi                   # arg1: 弹出下标到 rsi");
@@ -1942,8 +2036,8 @@ void CodeGen::emitIndex(std::shared_ptr<IndexExpr> expr) {
 //       leaq _ZTV3Dog(%rip), %rcx        # vtable 地址
 //       addq $16, %rcx                   # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
 //       movq %rcx, (%rax)                # obj._vptr = vtable
-void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
-    emitComment(std::format("new {}()", expr->className));
+void CodeGen::visit(NewExpr& expr) {
+    emitComment(std::format("new {}()", expr.className));
 
     // 查找类的大小
     uint32_t size = 8; // 默认大小
@@ -1953,13 +2047,13 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
     // 在全局类表中查布局：totalSize 决定分配字节数（含 _vptr 槽，
     // 由语义阶段的 ClassLayout 计算），hasVTable 决定是否要安装 _vptr
     if (m_classTypes) {
-        auto it = m_classTypes->find(expr->className);
+        auto it = m_classTypes->find(expr.className);
         if (it != m_classTypes->end()) {
             size = it->second->classLayout.totalSize;
             if (size == 0) size = 8;
             hasVTable = it->second->classLayout.hasVTable;
             if (hasVTable) {
-                vtableLabel = NameMangler::mangleVTable(expr->className);
+                vtableLabel = NameMangler::mangleVTable(expr.className);
             }
         }
     }
@@ -1978,7 +2072,7 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
 
         // 次 vptr：每个次基类各一个
         if (m_classTypes) {
-            auto it = m_classTypes->find(expr->className);
+            auto it = m_classTypes->find(expr.className);
             if (it != m_classTypes->end()) {
                 for (auto& base : it->second->classLayout.bases) {
                     if (base.isPrimary || !base.hasVTable) continue;
@@ -1996,13 +2090,13 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
 
     // 调用构造函数
     // 先计算参数（实参最多 5 个，this 占用 rdi）
-    for (size_t i = 0; i < expr->constructorArgs.size() && i < 5; i++) {
-        emitExpr(expr->constructorArgs[i]);
+    for (size_t i = 0; i < expr.constructorArgs.size() && i < 5; i++) {
+        emitExpr(expr.constructorArgs[i]);
         emit("pushq %rax                  # 构造实参压栈暂存");
     }
 
     // 恢复参数到 rsi, rdx, rcx, r8, r9
-    for (int i = static_cast<int>(expr->constructorArgs.size()) - 1; i >= 0 && i < 5; i--) {
+    for (int i = static_cast<int>(expr.constructorArgs.size()) - 1; i >= 0 && i < 5; i--) {
         static const char* regs[] = {"rsi", "rdx", "rcx", "r8", "r9"};
         emit(std::format("popq %{}                   # 逆序弹出实参到寄存器", regs[i]));
     }
@@ -2011,14 +2105,17 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
     emit("movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）");
     // 构造函数名：与 registerFunction 的 mangling 对齐——
     // 0 参 → ClassName_ClassName，N 参 → ClassName_ClassName_N
-    std::string ctorName = expr->className + "_" + expr->className;
-    if (!expr->constructorArgs.empty()) {
-        ctorName += "_" + std::to_string(expr->constructorArgs.size());
+    std::string ctorName = expr.className + "_" + expr.className;
+    if (!expr.constructorArgs.empty()) {
+        ctorName += "_" + std::to_string(expr.constructorArgs.size());
     }
+    // 命名空间内的类（N::S）名字里带 "::" —— 符号标签必须净化，
+    // 且要与函数定义端（emitFunction 里对 mangledName 走的同一个 asmSymbol）一致
+    ctorName = asmSymbol(ctorName);
     emit(std::format("callq {}                 # 调用构造函数 {}", ctorName, ctorName));
 
     emit("popq %rax                     # 弹出对象指针作为 new 表达式返回值");
-    emitComment(std::format("end new {}()", expr->className));
+    emitComment(std::format("end new {}()", expr.className));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2029,7 +2126,7 @@ void CodeGen::emitNew(std::shared_ptr<NewExpr> expr) {
 //       局部变量查表加载即可 —— "this 只是一个普通参数"是 Itanium ABI
 //       的本质。
 // demo: this（成员函数内）→ movq -8(%rbp), %rax
-void CodeGen::emitThis(std::shared_ptr<ThisExpr>) {
+void CodeGen::visit(ThisExpr&) {
     auto it = m_localVars.find("this");
     if (it != m_localVars.end()) {
         emit(std::format("movq {}(%rbp), %rax       # 加载 this 指针", it->second));
@@ -2057,18 +2154,18 @@ void CodeGen::emitThis(std::shared_ptr<ThisExpr>) {
 //         leaq _ZTI3Dog(%rip), %rsi       # 目标 typeinfo
 //         movq %rax, %rdi                 # 第一参：对象指针
 //         callq __minicc_dynamic_cast
-void CodeGen::emitDynamicCast(std::shared_ptr<DynamicCastExpr> expr) {
+void CodeGen::visit(DynamicCastExpr& expr) {
     m_needsDynamicCastHelper = true;
 
     emitComment(std::format("dynamic_cast<{}*>(operand) —— 运行时 RTTI 检查",
-        expr->targetClassName));
-    emitExpr(expr->operand);                     // %rax = 源对象指针
+        expr.targetClassName));
+    emitExpr(expr.operand);                     // %rax = 源对象指针
     emit(std::format("movq %rax, %rdi              # 参数 1：源对象指针"));
     emit(std::format("leaq {}(%rip), %rsi    # 参数 2：目标 typeinfo",
-        NameMangler::mangleRTTI(expr->targetClassName)));
+        NameMangler::mangleRTTI(expr.targetClassName)));
     emit("callq __minicc_dynamic_cast  # 调用运行时 RTTI 遍历检查类型兼容性");
     emitComment(std::format("%rax = 成功:原指针 / 失败:0 ({}) ",
-        expr->targetClassName));
+        expr.targetClassName));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

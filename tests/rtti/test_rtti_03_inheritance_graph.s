@@ -4,400 +4,394 @@
 # ═══════════════════════════════════════════════════════════
 
     .text
-        .globl Shape_area
-    Shape_area:
+        .globl Shape_area             # 导出函数符号，使链接器可见
+    Shape_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_Shape
-    Shape_Shape:
+        .globl Shape_Shape             # 导出函数符号，使链接器可见
+    Shape_Shape:                       # 函数入口标签
     # Function: Shape (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV5Shape(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV5Shape(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Shape_dtor
-    Shape_dtor:
+        .globl Shape_dtor             # 导出函数符号，使链接器可见
+    Shape_dtor:                       # 函数入口标签
     # Function: ~Shape (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_area
-    Rectangle_area:
+        .globl Rectangle_area             # 导出函数符号，使链接器可见
+    Rectangle_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_Rectangle
-    Rectangle_Rectangle:
+        .globl Rectangle_Rectangle             # 导出函数符号，使链接器可见
+    Rectangle_Rectangle:                       # 函数入口标签
     # Function: Rectangle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV9Rectangle(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV9Rectangle(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Rectangle_dtor
-    Rectangle_dtor:
+        .globl Rectangle_dtor             # 导出函数符号，使链接器可见
+    Rectangle_dtor:                       # 函数入口标签
     # Function: ~Rectangle (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Square_area
-    Square_area:
+        .globl Square_area             # 导出函数符号，使链接器可见
+    Square_area:                       # 函数入口标签
     # Function: area (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $2, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $2, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Square_Square
-    Square_Square:
+        .globl Square_Square             # 导出函数符号，使链接器可见
+    Square_Square:                       # 函数入口标签
     # Function: Square (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV6Square(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV6Square(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Square_dtor
-    Square_dtor:
+        .globl Square_dtor             # 导出函数符号，使链接器可见
+    Square_dtor:                       # 函数入口标签
     # Function: ~Square (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_speak
-    Animal_speak:
+        .globl Animal_speak             # 导出函数符号，使链接器可见
+    Animal_speak:                       # 函数入口标签
     # Function: speak (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_Animal
-    Animal_Animal:
+        .globl Animal_Animal             # 导出函数符号，使链接器可见
+    Animal_Animal:                       # 函数入口标签
     # Function: Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV6Animal(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV6Animal(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Animal_dtor
-    Animal_dtor:
+        .globl Animal_dtor             # 导出函数符号，使链接器可见
+    Animal_dtor:                       # 函数入口标签
     # Function: ~Animal (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_speak
-    Dog_speak:
+        .globl Dog_speak             # 导出函数符号，使链接器可见
+    Dog_speak:                       # 函数入口标签
     # Function: speak (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $1, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $1, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_Dog
-    Dog_Dog:
+        .globl Dog_Dog             # 导出函数符号，使链接器可见
+    Dog_Dog:                       # 函数入口标签
     # Function: Dog (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV3Dog(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV3Dog(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Dog_dtor
-    Dog_dtor:
+        .globl Dog_dtor             # 导出函数符号，使链接器可见
+    Dog_dtor:                       # 函数入口标签
     # Function: ~Dog (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Cat_speak
-    Cat_speak:
+        .globl Cat_speak             # 导出函数符号，使链接器可见
+    Cat_speak:                       # 函数入口标签
     # Function: speak (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
     # return expr
-    movq $2, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $2, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Cat_Cat
-    Cat_Cat:
+        .globl Cat_Cat             # 导出函数符号，使链接器可见
+    Cat_Cat:                       # 函数入口标签
     # Function: Cat (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # this
-    leaq _ZTV3Cat(%rip), %rcx    # vtable pointer
-    addq $16, %rcx    # skip top+rtti to vtable[0]
-    movq %rcx, (%rax)    # install _vptr
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 加载 this 指针
+    leaq _ZTV3Cat(%rip), %rcx    # 取 vtable 首地址
+    addq $16, %rcx              # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
+    movq %rcx, (%rax)           # 安装主 _vptr 到对象首 8 字节
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Cat_dtor
-    Cat_dtor:
+        .globl Cat_dtor             # 导出函数符号，使链接器可见
+    Cat_dtor:                       # 函数入口标签
     # Function: ~Cat (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Point_Point
-    Point_Point:
+        .globl Point_Point             # 导出函数符号，使链接器可见
+    Point_Point:                       # 函数入口标签
     # Function: Point (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax    # return this from constructor
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq -8(%rbp), %rax         # 构造函数返回 this 指针
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl Point_dtor
-    Point_dtor:
+        .globl Point_dtor             # 导出函数符号，使链接器可见
+    Point_dtor:                       # 函数入口标签
     # Function: ~Point (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    leave
-    ret
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
+    movq %rdi, -8(%rbp)         # 保存 this 指针到栈槽
+    movq $0, %rax               # void 函数返回 0
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
-        .globl main
-    main:
+        .globl main             # 导出函数符号，使链接器可见
+    main:                       # 函数入口标签
     # Function: main (params: 0)
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $64, %rsp    # frame for locals
+    pushq %rbp                    # 保存调用者的帧基址到栈上
+    movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）
+    subq $64, %rsp              # 预留局部变量栈空间（16B 对齐）
     # var p = ...
     # new Point()
-    movq $8, %rdi             # malloc size
-    callq malloc                  # allocate memory
-    pushq %rax                    # save allocated objPtr
-    movq (%rsp), %rdi             # this pointer
-    callq Point_Point              # call constructor
-    popq %rax                     # return objPtr
+    movq $8, %rdi             # malloc 分配大小：8 字节
+    callq malloc                  # 调用 malloc 分配堆内存
+    pushq %rax                    # 暂存返回的对象指针到栈上
+    movq (%rsp), %rdi             # this = 已分配对象指针（栈顶取出）
+    callq Point_Point                 # 调用构造函数 Point_Point
+    popq %rax                     # 弹出对象指针作为 new 表达式返回值
     # end new Point()
-    movq %rax, -16(%rbp)    # store to p
-    movq $1, %rax           # int literal
+    movq %rax, -16(%rbp)       # 存储到局部变量 p
+    movq $1, %rax           # 整数字面量载入 rax
     # member assign: .x = ...
-    movq -16(%rbp), %rax    # load p
-    movq %rax, %rcx                # object address
-    movq $1, %rax           # int literal
-    movl %eax, 0(%rcx)    # .x (offset 0)
-    movq $2, %rax           # int literal
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $1, %rax           # 整数字面量载入 rax
+    movl %eax, 0(%rcx)    # 写入字段 .x（偏移 +0）
+    movq $2, %rax           # 整数字面量载入 rax
     # member assign: .y = ...
-    movq -16(%rbp), %rax    # load p
-    movq %rax, %rcx                # object address
-    movq $2, %rax           # int literal
-    movl %eax, 4(%rcx)    # .y (offset 4)
+    movq -16(%rbp), %rax    # 加载局部变量 p 到 rax
+    movq %rax, %rcx                # 对象地址存入 rcx
+    movq $2, %rax           # 整数字面量载入 rax
+    movl %eax, 4(%rcx)    # 写入字段 .y（偏移 +4）
     # return expr
-    movq $0, %rax           # int literal
-    leave
-    ret
-    leave
-    ret
+    movq $0, %rax           # 整数字面量载入 rax
+    leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）
+    ret                           # 返回调用者（从栈上弹出返回地址）
     
 
     .data
-    .globl _ZTV3Cat
-    .align 8
-_ZTV3Cat:
-    .quad 0                    # offset to top
-    .quad _ZTI3Cat       # RTTI type_info pointer (vtable[-1])
-    .quad Cat_speak   # vtable[0]: Cat_speak
+    .globl _ZTV3Dog             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV3Dog:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI3Dog       # RTTI type_info 指针（vtable[-1]）
+    .quad Dog_speak   # vtable[0]: 虚函数 Dog_speak
 
-    .globl _ZTI3Cat
-    .align 8
-_ZTI3Cat:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Cat                 # type name string
-    .quad _ZTI6Animal                 # base class typeinfo
+    .globl _ZTI3Dog             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI3Dog:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Dog                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI6Animal                 # base[Animal] typeinfo 指针
+    .quad 0                 # base[Animal] 子对象偏移（字节）
 
-    .globl _ZTV6Animal
-    .align 8
-_ZTV6Animal:
-    .quad 0                    # offset to top
-    .quad _ZTI6Animal       # RTTI type_info pointer (vtable[-1])
-    .quad Animal_speak   # vtable[0]: Animal_speak
+    .globl _ZTV3Cat             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV3Cat:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI3Cat       # RTTI type_info 指针（vtable[-1]）
+    .quad Cat_speak   # vtable[0]: 虚函数 Cat_speak
 
-    .globl _ZTI6Animal
-    .align 8
-_ZTI6Animal:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Animal                 # type name string
-    .quad 0                    # no base class
+    .globl _ZTI3Cat             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI3Cat:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Cat                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI6Animal                 # base[Animal] typeinfo 指针
+    .quad 0                 # base[Animal] 子对象偏移（字节）
 
-    .globl _ZTV3Dog
-    .align 8
-_ZTV3Dog:
-    .quad 0                    # offset to top
-    .quad _ZTI3Dog       # RTTI type_info pointer (vtable[-1])
-    .quad Dog_speak   # vtable[0]: Dog_speak
+    .globl _ZTV6Animal             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV6Animal:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI6Animal       # RTTI type_info 指针（vtable[-1]）
+    .quad Animal_speak   # vtable[0]: 虚函数 Animal_speak
 
-    .globl _ZTI3Dog
-    .align 8
-_ZTI3Dog:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Dog                 # type name string
-    .quad _ZTI6Animal                 # base class typeinfo
+    .globl _ZTI6Animal             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI6Animal:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Animal                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
-    .globl _ZTV6Square
-    .align 8
-_ZTV6Square:
-    .quad 0                    # offset to top
-    .quad _ZTI6Square       # RTTI type_info pointer (vtable[-1])
-    .quad Square_area   # vtable[0]: Square_area
+    .globl _ZTV9Rectangle             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV9Rectangle:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI9Rectangle       # RTTI type_info 指针（vtable[-1]）
+    .quad Rectangle_area   # vtable[0]: 虚函数 Rectangle_area
 
-    .globl _ZTI6Square
-    .align 8
-_ZTI6Square:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Square                 # type name string
-    .quad _ZTI9Rectangle                 # base class typeinfo
+    .globl _ZTI9Rectangle             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI9Rectangle:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Rectangle                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI5Shape                 # base[Shape] typeinfo 指针
+    .quad 0                 # base[Shape] 子对象偏移（字节）
 
-    .globl _ZTV9Rectangle
-    .align 8
-_ZTV9Rectangle:
-    .quad 0                    # offset to top
-    .quad _ZTI9Rectangle       # RTTI type_info pointer (vtable[-1])
-    .quad Rectangle_area   # vtable[0]: Rectangle_area
+    .globl _ZTV5Shape             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV5Shape:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI5Shape       # RTTI type_info 指针（vtable[-1]）
+    .quad Shape_area   # vtable[0]: 虚函数 Shape_area
 
-    .globl _ZTI9Rectangle
-    .align 8
-_ZTI9Rectangle:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Rectangle                 # type name string
-    .quad _ZTI5Shape                 # base class typeinfo
+    .globl _ZTI5Shape             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI5Shape:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Shape                 # 指向类型名称字符串
+    .quad 0                 # 无基类（基类计数 = 0）
 
-    .globl _ZTV5Shape
-    .align 8
-_ZTV5Shape:
-    .quad 0                    # offset to top
-    .quad _ZTI5Shape       # RTTI type_info pointer (vtable[-1])
-    .quad Shape_area   # vtable[0]: Shape_area
+    .globl _ZTV6Square             # 导出 vtable 符号
+    .align 8                # 8 字节对齐
+_ZTV6Square:                        # vtable 标签
+    .quad 0                    # offset-to-top = 0（主基类子对象与对象起始重合）
+    .quad _ZTI6Square       # RTTI type_info 指针（vtable[-1]）
+    .quad Square_area   # vtable[0]: 虚函数 Square_area
 
-    .globl _ZTI5Shape
-    .align 8
-_ZTI5Shape:
-    .quad 0                    # type_info vtable (simplified)
-    .quad .Ltype_name_Shape                 # type name string
-    .quad 0                    # no base class
+    .globl _ZTI6Square             # 导出 RTTI 符号
+    .align 8                # 8 字节对齐
+_ZTI6Square:                        # typeinfo 标签
+    .quad 0                    # type_info vtable = 0（简化版，未链接真实 RTTI）
+    .quad .Ltype_name_Square                 # 指向类型名称字符串
+    .quad 1                 # 基类计数（MI 计数风格）
+    .quad _ZTI9Rectangle                 # base[Rectangle] typeinfo 指针
+    .quad 0                 # base[Rectangle] 子对象偏移（字节）
 
 
     .section .rodata
-.Ltype_name_Cat:
-    .string "Cat"           # type name
-.Ltype_name_Animal:
-    .string "Animal"           # type name
-.Ltype_name_Dog:
-    .string "Dog"           # type name
-.Ltype_name_Square:
-    .string "Square"           # type name
-.Ltype_name_Rectangle:
-    .string "Rectangle"           # type name
-.Ltype_name_Shape:
-    .string "Shape"           # type name
+.Ltype_name_Dog:                     # 类型名称标签
+    .string "Dog"           # 类型名称字符串
+.Ltype_name_Cat:                     # 类型名称标签
+    .string "Cat"           # 类型名称字符串
+.Ltype_name_Animal:                     # 类型名称标签
+    .string "Animal"           # 类型名称字符串
+.Ltype_name_Rectangle:                     # 类型名称标签
+    .string "Rectangle"           # 类型名称字符串
+.Ltype_name_Shape:                     # 类型名称标签
+    .string "Shape"           # 类型名称字符串
+.Ltype_name_Square:                     # 类型名称标签
+    .string "Square"           # 类型名称字符串
