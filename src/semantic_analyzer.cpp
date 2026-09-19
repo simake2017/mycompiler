@@ -843,20 +843,20 @@ ExprPtr SemanticAnalyzer::foldStaticConst(ExprPtr expr) {
     if (!me->isTypeAccess) return expr;
 
     // object 是模板 id（VarExpr{name, explicitTemplateArgs}）
-    if (me->object->kind != NodeKind::Var) return expr;
+    if (me->object->kind != NodeKind::Var) return expr; //wangyang object 是var 表达式
     auto ve = std::static_pointer_cast<VarExpr>(me->object);
 
     // ── 解析出类实例名 ──
     // 带实参：Box<int> → 先实例化拿到实例类名（Box_int）
     // 不带实参：直接当类名用（如已实例化好的名字）
-    std::string clsName = ve->name;
+    std::string clsName = ve->name; // 变量name
     if (!ve->explicitTemplateArgs.empty()) {
         TypePtr tid = Type::makeClass(ve->name);
         for (const auto& ta : ve->explicitTemplateArgs) {
             tid->templateArgs.push_back(
                 ta.isType() ? TemplateArg::ofType(resolveType(ta.type)) : ta);
         }
-        TypePtr inst = resolveType(tid);
+        TypePtr inst = resolveType(tid); // wangyang**** 就是在这里解析相应的类型  tests/tmpl/test_tmpl_35_void_t_detect.cpp:74
         if (!inst) return expr;
         clsName = inst->name;
     }
@@ -4059,7 +4059,7 @@ SemanticAnalyzer::selectClassTemplate(
     // 实参表里若出现 NTTP 值，直接跳过特化路径走主模板。
     std::vector<TypePtr> argTypes;
     bool allTypeArgs = true;
-    for (const auto& a : args) {
+    for (const auto& a : args) { // wangyang 看的是进去的参数 比如 box<Dog,Void> 这种，进入的参数是不是 type
         if (!a.isType()) { allTypeArgs = false; break; }
         argTypes.push_back(a.type);
     }
@@ -4261,7 +4261,7 @@ TypePtr SemanticAnalyzer::getOrInstantiateClass(
     // 补全必须在【选择特化之前】做：偏特化/全特化的匹配都是对完整实参表做的
     // （Box<int*, int> 的全特化要有 2 位才能匹配上）。
     std::vector<TemplateArg> fullArgs = templateIdType->templateArgs;
-    if (fullArgs.size() < primary->templateParams.size()) {
+    if (fullArgs.size() < primary->templateParams.size()) { //wangyang 这里属于将模板参数缺失的参数也带进来
         for (size_t i = fullArgs.size(); i < primary->templateParams.size(); i++) {
             const TemplateParam& p = primary->templateParams[i];
             fullArgs.push_back(p.defaultArg);

@@ -823,6 +823,99 @@ return Type::makeVoid();
 必须真的去查成员、真的去走调用决议（`[call] begin(0 args) → int`），
 查不到才算失败。
 
+#### 追问：`declval<T>` 里的 `T`，到底在哪一行被换掉？
+
+上面日志打的是 `[declval] std::declval<Container>()`。但看 `inferCall` 里那个内建分支，
+它只是**朴素地取** `explicitTemplateArgs[0].type`，自己不做任何替换：
+
+```cpp
+// src/semantic_analyzer.cpp:3476-3486
+if (calleeVar && (funcName == "std::declval" || funcName == "declval")) {
+    if (!calleeVar->explicitTemplateArgs.empty() &&
+        calleeVar->explicitTemplateArgs[0].type) {
+        TypePtr t = calleeVar->explicitTemplateArgs[0].type;   // ← 谁把它从 T 换成了 Container？
+        TypePtr r = Type::makeRValueReference(t);              // → Container&&
+        std::cout << std::format("{}[declval] std::declval<{}>() → {}\n", ...);
+        return r;
+    }
+}
+```
+
+答案：**替换点不在 3476，而在它之前——`cloneExpr` 的 `VarExpr` 分支。**
+
+关键事实：`<T>` 这个显式模板实参**挂在 `VarExpr` 上，不是挂在 `CallExpr` 上** ——
+因为 `std::declval<T>()` 里的 `<T>` 属于 callee 名字的一部分。
+所以替换必须由 `cloneExpr` 处理 `NodeKind::Var` 的那一段负责：
+
+```cpp
+// src/template_instantiation.cpp:1055-1064（cloneExpr 的 NodeKind::Var 分支）
+auto cloned = std::make_shared<VarExpr>(e.name);        // ① 克隆名字
+cloned->location = e.location;
+for (const auto& ta : e.explicitTemplateArgs) {         // ② 逐个处理显式实参
+    if (ta.isType() && ta.type) {
+        cloned->explicitTemplateArgs.push_back(
+            TemplateArg::ofType(substituteType(ta.type, subst)));   // ★ 就是这一行
+    } else {
+        cloned->explicitTemplateArgs.push_back(ta);     // 值实参（NTTP）原样带过
+    }
+}
+```
+
+真做置换动作的是被它调用的 `substituteType` Case 1（`src/template_instantiation.cpp:555-574`）：
+
+```cpp
+if (type->isTemplateParam()) {
+    auto it = subst.find(type->templateParamName);   // 查 "T"
+    if (it != subst.end()) {
+        std::cout << std::format("    [subst] ★ TemplateParam '{}' → '{}' (direct replacement)\n", ...);
+        return it->second.type;                      // 返回 Container
+    }
+    std::cout << std::format("    [subst] TemplateParam '{}' not in substitution map, keep as-is\n", ...);
+    return type;
+}
+```
+
+于是日志里那两行是**紧挨着的一对「写—读」**：
+
+```text
+    [subst] ★ TemplateParam 'T' → 'Container' (direct replacement)   ← template_instantiation.cpp:573（写）
+      [declval] std::declval<Container>() → Container&&              ← semantic_analyzer.cpp:3482（读）
+```
+
+中间只隔了一次函数返回。3482 打印出来的 `Container`，就是 573 行 `return` 的那个 `TypePtr`。
+
+★ **蓝图上那个 `T` 至今还在** —— 替换是**非破坏性**的，
+`substituteType` / `cloneExpr` 是纯函数式的：读原节点、返回新节点，
+全程没有一次写回 `spec->specPattern`：
+
+```text
+原节点（spec->specPattern 里的，永不变）：
+  CallExpr
+  └── callee: VarExpr{ name="std::declval",
+                       explicitTemplateArgs=[ TemplateParam("T") ] }   ← 至今还是 T
+                              │
+                              │  cloneExpr(1055-1064) → substituteType(555-574)
+                              ▼
+副本（concrete，栈上局部，只给求值用）：
+  CallExpr
+  └── callee: VarExpr{ name="std::declval",
+                       explicitTemplateArgs=[ Container ] }            ← 3482 读的是这个
+```
+
+这解释了为什么实例化日志要把「蓝图」和「替换表」分开列——
+匹配全做完之后，`║ Pattern:` 那一行印的仍然是 `is_range<T, ...>`：
+
+```text
+  [spec:select]   │  唯一候选 → 直接选中 'is_range<T, std::void_t<decltype(...), ...>>'
+  [instantiate:class] ★ on-demand instantiation: is_range<Container>
+  ║ Pattern:   is_range<T, std::void_t<decltype(...), decltype(...)>>   ← T 还在
+  ║ Substitution map: { 'T' → 'Container', }
+```
+
+★ **两层替换的分工**：`explicitTemplateArgs` 里装的是 `TemplateArg::type`（`TypePtr`），
+属于**类型位置** ⇒ 走 `substituteType`；若是值位置（NTTP）⇒ 走 `cloneExpr`。
+这就是项目里"两层替换"的来源（见 `docs/learn/18`）。
+
 ### 第 7 步 · 实例化 + 静态常量折叠
 
 选中偏特化后，用它当蓝图实例化：
@@ -865,6 +958,36 @@ return Type::makeVoid();
 ```asm
     movq $1, %rax        # BoolLiteral(true) —— 编译期已算完，运行时零开销
 ```
+
+---
+
+### 七步之后 · 收束：第 6 步 vs 第 7 步，同一个 `substituteType` 的两种语义
+
+这是全文最容易看漏的一处——**替换在整条链上发生了两次，用的是同一张表、同一个引擎，
+但目的完全不同**：
+
+| | 第 6 步（探测） | 第 7 步（落地） |
+|---|---|---|
+| 调用者 | `reducePattern` 里**当场 new 的临时** `TemplateInstantiator`（`template_deduction.cpp:263-266`） | `m_instantiator`（Sema 成员，长驻） |
+| 目的 | 回答一个问题：「这个模式位替换后合法吗？」 | 造出真类型 |
+| 产物 | 栈上的 `concrete`，函数返回即销毁 | 注册进符号表的实例类 `is_range_Container_void` |
+| 替换表来源 | 同一次 `matchPattern` 里刚推出来的 `subst` | 同一个表（`selectClassTemplate` 返回的 `taggedSubst`） |
+| 失败时 | 抛 `SubstitutionFailure` → 候选出局（**SFINAE**） | 硬错误，编译中断 |
+| 蓝图 | 只读，分毫未动 | 深拷贝一份再改 |
+
+```text
+  第 5 步 bind 写下的 T := Container
+        │
+        ├─► 第 6 步：临时 instantiator.substituteType(..., tagged)   ← 试探
+        │      产物：concrete（栈上）  →  evaluateDecltype  →  合法/不合法
+        │
+        └─► 第 7 步：m_instantiator.instantiate(blueprint, args, &specSubst)   ← 兑现
+               产物：is_range_Container_void（进符号表）
+```
+
+★ 一句话：**第 6 步的替换是"试探"，第 7 步的替换是"兑现"**。
+同一张表从第 5 步的 `bind` 里写下，被这两处先后消费 ——
+这正是 `void_t` 探测能"先假装试一次，成了再真做一遍"的全部机制。
 
 ---
 

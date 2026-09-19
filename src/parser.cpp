@@ -1586,7 +1586,7 @@ StmtPtr Parser::parseVarDeclStmt(TypePtr type) {
     ExprPtr init = nullptr;
     std::vector<ExprPtr> ctorArgs;
     if (match(TokenType::Assign)) {
-        init = parseExpression();
+        init = parseExpression(); //wangyang**** 这里就是变量 statement的初始声明表达式
     }
     else if (check(TokenType::LParen)) {
         // ── 直接初始化 `Type name(args...);`（[dcl.init]/16）──
@@ -2145,7 +2145,7 @@ ExprPtr Parser::parsePrimaryExpr() {
                     const Token& memTok = expect(TokenType::Identifier,
                         "Expected member name after '::'");
                     auto me = std::make_shared<MemberExpr>(expr, memTok.text, /*arrow=*/false);
-                    me->isTypeAccess = true;
+                    me->isTypeAccess = true; // 标明这是一个类型访问，不是一个对象取值
                     me->location = loc;
                     std::cout << std::format(
                         "  [parse] 类型限定访问: <template-id>::{} (static member)\n",
