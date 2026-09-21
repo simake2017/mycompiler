@@ -14,10 +14,10 @@
 | 层次 | 问的是 | 原实现 | 结论 |
 |---|---|---|---|
 | **形状** | 形参存在哪、怎么查 | `std::vector<std::string>` 扁平名字表 | 构造上是对的（`scopeBase`/`resize` 配对），但答不出 kind/层级/归属 |
-| **存储** | 形参节点住在哪 | `std::vector<TemplateParam>` 值语义 | 解析期 `push_back` 会 reallocate ⇒ 缓存的指针悬空 |
+| **存储** | 形参节点住在哪 | `std::vector<TemplateParam>` 值语义 | 解析期 `push_back` 会 reallocate ⇒ 存下的元素**地址**失联（存下标则无恙） |
 | **时机** | 形参何时可查 | 整个形参表解析**完**才注册 | ★ **真 bug**：默认实参看不见前一位形参 |
 
-前两层在当时的代码里**没有症状**（栈深最多 1、没人缓存指针），第三层才是把
+前两层在当时的代码里**没有症状**（栈深最多 1、没人存过元素地址），第三层才是把
 `template<class T, class U = T>` 直接打挂的那个。
 
 ---
@@ -86,7 +86,10 @@ TemplateTypeParmDecl *Param
 直到整个 ASTContext 销毁。⇒ clang 缓存 `TemplateTypeParmDecl*` **天然安全**。
 
 > minicc 的坑是自己造的：`vector<TemplateParam>` 值语义 ⇒ 元素住在 vector 的堆块里
-> ⇒ 扩容搬家 ⇒ 先前取的指针悬空。**改成指针容器就是向 clang 这套表示靠拢。**
+> ⇒ 扩容搬家 ⇒ 先前取的指针悬空。
+> **指针化让形状向 clang 这套表示靠拢**（数组里存的是指针，节点的命另有归属）；
+> 真正终结悬空的是"节点不再住在容器里"这个性质 —— minicc 用 `shared_ptr`
+> 拿到它，clang 用 arena 拿到它。详见 §4.2。
 
 ### 3.2 作用域：复用统一 Scope 链，不另起容器
 
@@ -202,15 +205,53 @@ using TemplateParamPtr = std::shared_ptr<TemplateParam>;
 //   都由 vector<TemplateParam> 改为 vector<TemplateParamPtr>
 ```
 
-一个必须记住的区分：
+#### 4.2.1 为什么值语义会出事：vector 扩容会【搬家所有旧元素】
 
-| 缓存什么 | 扩容后 |
-|---|---|
-| `const TemplateParam*`（= `v[i].get()`） | ✅ 对象在堆上没动 |
-| `const TemplateParamPtr*`（= `&v[i]`） | ❌ 元素（指针本身）搬家了 |
+`push_back` 的"往后放"只在 `size < capacity` 时成立。一旦撞上 `capacity`，
+vector 必须申请更大的块、把**全部旧元素搬过去**、`free` 旧块 ——
+这是"元素连续存放"的硬约束，后面没位置时没法就地扩容。
 
-本实现选了**更保守的一条**：查询时**现算**下标寻址，不缓存任何指针——
-既然 `count` 是下标（扩容后依然有效），就少一个必须记住的不变量。
+实测（探针 `docs/learn/probes/vector_growth_probe.cpp`，跑法见 §7，元素为 `std::string`）：
+
+| 时刻 | size | capacity | `&v[0]` | 说明 |
+|---|---|---|---|---|
+| 起始 | 0 | 0 | — | |
+| push 第 1 个后 | 1 | 1 | `0x…ec0` | 首次分配，无旧元素 |
+| push 第 2 个后 | 2 | 2 | `0x…ef0` | ★ 撞 cap，搬家 |
+| push 第 3 个后 | 3 | 4 | `0x…f40` | ★ 撞 cap，又搬 |
+| push 第 4 个后 | 4 | 4 | `0x…f40` | cap 有余量，原地 |
+| push 第 5 个后 | 5 | 8 | `0x…fd0` | ★ 撞 cap，又搬 |
+
+（地址因 ASLR 每次运行不同，要看的是**模式**：容量翻倍那几次地址才变。）
+
+capacity 按 `1→2→4→8` 翻倍，**搬家发生在 push 第 2、3、5、9… 个时**。
+
+这解释了现象里一个刺眼的细节：**为什么两个形参的用例全绿、加到三个才炸**。
+第 2 个 `push_back` 是第一个搬家点，而 `template<class T, class U = T>`
+里对 `T` 的查询恰好发生在它**之前**（解析 U 的默认实参时 U 自己还没注册）；
+只有第 3 位形参的默认实参去查第 1 位时，才会读到那个已被搬走的旧地址。
+
+#### 4.2.2 下标 vs 地址：这才是分水岭
+
+| 帧里存什么 | 扩容后 | 用在 |
+|---|---|---|
+| `const TemplateParam*`（= `&v[i]`，值语义时代的取法） | ❌ 旧块被 free，失联 | 方案 ①（已废弃） |
+| `const TemplateParam*`（= `v[i].get()`，指针化之后） | ✅ 对象在堆上没动 | 指针化之后可以这么存 |
+| `size_t count` + 每次现取 `v[i]` | ✅ 下标与扩容无关 | 方案 ②（本实现） |
+
+**关键区分是"存下标"还是"存地址"，不是"存什么类型的指针"。**
+存了下标，扩容对查询完全透明；存了地址，扩容即失联。
+
+本实现选**最保守的一条**：帧里只留 `owner + count`（都是下标语义），
+查询时现取 `*owner->templateParams[i]`。
+
+> ★ 但要诚实：**自从把元素改成 `shared_ptr`，"防悬空"这一条已经不再需要靠
+> "不缓存指针"来实现了** —— 节点住在 vector 之外的稳定地址上，扩容搬的只是
+> 指针值本身。保留"只存下标"写法的收益收窄为【少一条必须记住的不变量】，
+> 而非【防悬空】。
+> 换句话说：**指针化在"解决悬空"上并非必需**，它的真实收益是另两条 ——
+> ① 形状对齐 clang（`TemplateParameterList` 就是 `NamedDecl*` 数组 + 长度）；
+> ② 让下面那条浅拷贝成立。
 
 > 另一处必须有意为之的语义变化：`parser.cpp` 的
 > `decl->guide->templateParams = decl->templateParams;`（推导指引继承外层形参表）
@@ -342,6 +383,15 @@ parseTemplateDecl
 ## 7. 可复现实验
 
 ```bash
+# ⓪ 独立探针：亲自看 vector 扩容搬家（§4.2 那张表就是它的输出）
+clang++-18 -std=c++20 docs/learn/probes/vector_growth_probe.cpp -o /tmp/vgrow && /tmp/vgrow
+#   起始         size=0 cap=0
+#   push 第 1 个后 size=1 cap=1  &v[0]=0x…ec0  （原地追加，地址没动）
+#   push 第 2 个后 size=2 cap=2  &v[0]=0x…ef0  ★ 搬家了 —— 此前元素的地址全变
+#   push 第 3 个后 size=3 cap=4  &v[0]=0x…f40  ★ 搬家了 —— 此前元素的地址全变
+#   push 第 4 个后 size=4 cap=4  &v[0]=0x…f40  （原地追加，地址没动）
+#   push 第 5 个后 size=5 cap=8  &v[0]=0x…fd0  ★ 搬家了 —— 此前元素的地址全变
+
 # ① 正向：依赖默认实参（裸名 + 复合类型）
 clang++-18 -std=c++20 -fsyntax-only tests/tmpl/test_tmpl_53_dependent_default_template_arg.cpp  # rc=0
 ./build-linux/minicc tests/tmpl/test_tmpl_53_dependent_default_template_arg.cpp -o /tmp/t53

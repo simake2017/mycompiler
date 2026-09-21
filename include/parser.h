@@ -102,13 +102,23 @@ private:
     // 当前帧（无模板上下文时为 nullptr）—— 对应 clang 的"当前 Scope"
     TemplateParamFrame* m_currentFrame = nullptr;
 
-    // 查模板形参：从内层往外层走（内层优先），返回形参本身而非 bool。
+    // 查模板形参：从当前帧往外层帧走（内层优先），返回形参本身而非 bool。
     // 对照 clang：Sema 的名字查找沿 Scope 链上行。
     //
-    // ★ 每次【现取】&owner->templateParams[i]，绝不缓存指针 —— count 是
-    //   下标（vector 扩容后依然有效），而指针不是。即便 ast.h 已把元素改成
-    //   shared_ptr（节点本身不再搬家），这里仍保留"现取"写法：
-    //   少一个必须记住的不变量。
+    // 【帧里只存 owner + count，不存任何地址】—— 两者都是【下标语义】：
+    //   count 是上界，`owner->templateParams[i]` 中的 i 是下标，查询时现取。
+    //   下标与 vector 扩容无关（它描述的仍是同一逻辑位置）；而先前存下的
+    //   元素地址会因旧块被 free 而失联。分水岭是"存下标还是存地址"，
+    //   不是"存什么类型的指针"。
+    //
+    // ★ 但别说反因果：自从 ast.h 把元素改成 shared_ptr，节点本身就住在
+    //   vector 之外的稳定地址上，缓存 `const TemplateParam*` 已【不会】悬空
+    //   （扩容搬的只是指针值）。所以"只存下标"的收益是【少一条必须记住的
+    //   不变量】，不是【防悬空】—— 防悬空由 shared_ptr 承担。
+    //   对照 clang：TemplateParameterList 同样只存 NamedDecl* 数组 + 长度，
+    //   节点的命由 ASTContext 的 arena 保，二者分工一致。
+    //
+    // 返回裸指针而非引用：查不到时要能表达"没有"（nullptr）。
     const TemplateParam* lookupTemplateParam(const std::string& name) const;
 
     // ── Token 流操作（LL(1) 前瞻的底层设施）──
