@@ -1,71 +1,32 @@
 // =============================================================================
-// minicc —— Mini C++ Compiler 主程序
+// minicc —— Mini C++ Compiler 主程序（编译器驱动，按顺序编排 6 个阶段）
 // =============================================================================
-// 编译器驱动：按顺序编排 6 个阶段的执行。
-//
-// 完整流水线：
-//   源码 (.cpp)
-//     → [1] 词法分析 (Lexer)        → Token 流
-//     → [2] 语法分析 (Parser)       → AST
-//     → [3] 语义分析 (SemaAnalyzer) → 带类型信息的 AST + 内存布局
-//     → [4] 模板实例化 (TemplateInst) → 展开后的真实代码
-//     → [5] 代码生成 (CodeGen)      → x86-64 汇编 (.s)
-//     → [6] 链接 (MiniLinker)       → 可执行文件（内置 _start + malloc，不依赖系统 ld）
-//
-// 用法：
-//   ./minicc <source.cpp> [-o output.s] [--dump-tokens] [--dump-ast]
-// =============================================================================
-//
-// ─── 命令行参数详解（本文件 main() 解析）─────────────────────────────────
-//   minicc <source.cpp> [-o output] [-I dir] [-S] [-E] [--dump-*]
+// 用法  ./minicc <source.cpp> [-o output] [-I dir] [-S] [-E] [--dump-*]
 //
 //   <source.cpp>    输入源文件（必填）
-//   -o output       输出路径：默认模式输出可执行文件（缺省取 <source> 去扩展名）；
+//   -o output       输出路径：默认输出可执行文件（缺省取 <source> 去扩展名）；
 //                   -S 模式输出汇编 <source>.s；-E 模式写预处理文本。
-//   -S              只到阶段 5 为止，输出 .s 汇编（等价 gcc -S，不链接）
 //   -I dir          头文件搜索目录，可重复（-I include -I third_party），
-//                   出现顺序即搜索优先级，原样传给预处理器。
-//   -E              只执行阶段 0（预处理）并输出结果，等价 gcc -E，
-//                   用于调试宏/include/条件编译问题。
-//   --dump-tokens       阶段 1 后打印完整 Token 流（调试）
-//   --dump-ast          阶段 2 后打印 AST 顶层声明（调试）
-//   --dump-hierarchy    阶段 3 后打印类层次结构图（继承树 + typeinfo 链）
-//   --dump-layout       阶段 3 后打印类内存布局详图（对象→vtable→RTTI 三层）
-//   多个 --dump-* 可同时使用，如 --dump-hierarchy --dump-layout
+//                   出现顺序即搜索优先级，原样传给预处理器
+//   -S              只到阶段 5 为止，输出 .s 汇编（等价 gcc -S，不链接）
+//   -E              只执行阶段 0（预处理）并输出结果，等价 gcc -E，调试宏/include 用
+//   --dump-tokens / --dump-ast       阶段 1 / 阶段 2 后打印 Token 流 / AST（调试）
+//   --dump-hierarchy / --dump-layout 阶段 3 后打印类层次结构图 / 类内存布局详图
+//   （多个 --dump-* 可同时使用，如 --dump-hierarchy --dump-layout）
 //
-// 示例：
-//   ./minicc tests/test_tmpl_01.cpp                 # 全管线 → test_tmpl_01.s
-//   ./minicc tests/pp/main.cpp -I tests/pp -E       # 只看预处理结果
+// demo: ./minicc tests/test_tmpl_01.cpp             ⇒ 全管线，产出 test_tmpl_01.s
+//       ./minicc tests/pp/main.cpp -I tests/pp -E   ⇒ 只看预处理结果
 //
-// ─── 编译驱动全景图（阶段 ↔ 实现文件 ↔ 本文件调用点）────────────────────
-//
-//   source.cpp
-//     │ 阶段0 预处理     preprocessor.cpp            processFile()
-//     │        行拼接→include并合→条件编译→宏展开     [cpp]/[lex.phases]1~4
-//     ▼
-//   展开后纯文本（宏已替换、头文件已并合、条件分支已裁决）
-//     │ 阶段1 词法分析   lexer.cpp                   tokenizeAll()
-//     ▼
-//   Token 流
-//     │ 阶段2 语法分析   parser.cpp                  parseTranslationUnit()
-//     ▼
-//   AST（抽象语法树，TranslationUnit）
-//     │ 阶段3 语义分析   semantic_analyzer.cpp       analyze()
-//     │        类型检查 / auto 推导 / 内存布局 / vtable
-//     ▼
-//   带类型信息的 AST + 类布局表
-//     │ 阶段4 模板实例化 template_instantiation.cpp  instantiate()
-//     │        类模板=结构化替换；函数模板=调用点推导驱动
-//     ▼
-//   展开后的实例
-//     │ 阶段5 代码生成   codegen.cpp                 generate()
-//     ▼
-//   output.s（x86-64 AT&T 汇编）
-//     │ 阶段6 链接：系统 as 出 .o → 内置 MiniLinker（src/linker.cpp）
-//     │        合并节 → 符号决议 → 重定位回填 → 写最小可执行 ELF
-//     ▼
-//   可执行文件（非 PIE，入口 _start；内置 malloc/free，不依赖系统 ld）
-// ─────────────────────────────────────────────────────────────────────────
+// 六阶段全景（阶段 ↔ 实现文件 ↔ 本文件调用点）：
+//   阶段0 预处理     preprocessor.cpp            processFile()   [cpp]/[lex.phases]1~4
+//   阶段1 词法分析   lexer.cpp                   tokenizeAll()
+//   阶段2 语法分析   parser.cpp                  parseTranslationUnit()
+//   阶段3 语义分析   semantic_analyzer.cpp       analyze()   （类型检查/auto/布局/vtable）
+//   阶段4 模板实例化 template_instantiation.cpp  instantiate()（类=结构化替换，函数=推导驱动）
+//   阶段5 代码生成   codegen.cpp                 generate()      ⇒ output.s（x86-64 AT&T）
+//   阶段6 链接       系统 as 出 .o → 内置 MiniLinker（src/linker.cpp，见 docs/learn/15）
+//                    ⇒ 非 PIE 可执行文件（合并节 → 符号决议 → 重定位回填 → 写 ELF）
+// =============================================================================
 
 #include "lexer.h"
 #include "parser.h"
@@ -89,9 +50,8 @@ using namespace minicc;
 // 辅助函数
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 读取整个文件到字符串
-// （通用辅助；注意当前驱动实际未使用——阶段 0 的 Preprocessor 自带
-// readFileContents，由它负责读入源码）
+// 读取整个文件到字符串（通用辅助 —— 当前驱动未使用：源码由阶段 0 的
+// Preprocessor::readFileContents 读入）
 std::string readFile(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -111,9 +71,8 @@ void writeFile(const std::string& path, const std::string& content) {
     file << content;
 }
 
-// 打印分隔线
-// 全阶段中文日志的一部分：每个阶段开始前先打一条醒目横幅，
-// 方便在滚动日志里快速定位"现在跑到哪一步了"。
+// 打印分隔线（全阶段中文日志的一部分：每阶段开头的醒目横幅，
+// 便于在滚动日志里定位"现在跑到哪一步了"）
 void printPhase(const std::string& phase) {
     std::cout << "\n";
     std::cout << "════════════════════════════════════════════════════════════\n";
@@ -121,10 +80,8 @@ void printPhase(const std::string& phase) {
     std::cout << "════════════════════════════════════════════════════════════\n";
 }
 
-// 打印 Token 流（调试用）
-// 由 --dump-tokens 触发。格式：行:列 类型 文本。demo：
-//      1:1   INT             'int'
-//      1:5   IDENTIFIER      'main'
+// 打印 Token 流（由 --dump-tokens 触发）。格式：行:列 类型 文本
+// demo: `1:1   INT             'int'` / `1:5   IDENTIFIER      'main'`
 void dumpTokens(const std::vector<Token>& tokens) {
     for (auto& tok : tokens) {
         std::cout << std::format("  {:4}:{:<3} {:<15} '{}'\n",
@@ -138,26 +95,17 @@ static void printNode(const std::string& prefix, bool isLast, const std::string&
     std::cout << prefix << (isLast ? "└── " : "├── ") << label << "\n";
 }
 
-// ── AST 树形打印（访问者版）────────────────────────────────────────────────────
-// 使用 ├──/└──/│ 风格绘制完整 AST，包含函数体、语句、表达式。
-// 由 --dump-ast 触发。
-//
-// 【为什么改成访问者】
-//   改造前这里是两条 if-else + dynamic_pointer_cast 链（dumpExpr 14 级、
-//   dumpStmt 8 级）。dynamic 转换的本质是"问对象你是什么类型"，而这正是
-//   虚函数该干的事 —— 交给 accept 的虚表分派后，本类只需重写关心的 visit
-//   重载，一个 cast 都不需要，分派也从 O(n) 变成 O(1)。
+// ── AST 树形打印（访问者版，由 --dump-ast 触发）───────────────────────────────
+// 用 ├──/└──/│ 风格绘制完整 AST（含函数体、语句、表达式）。
+// 分派手法：14 种表达式 + 8 种语句全部走 accept 的虚表分派，本类只重写关心的
+// visit 重载，零 cast（判据见 semantic_analyzer.h 注释；理论见 docs/learn/29）。
+// 未重写的节点类型 = "什么都不做"，与原先 else 分支的语义等价。
 //
 // 【位置信息怎么传】
 //   访问者接口不带 prefix/isLast 这类"每个节点各不相同"的上下文（带了就
-//   不是通用访问者了），所以把它们存成成员变量，由 dumpXxx 在 accept 之前
-//   设置好。★ 递归约定：每个 visit 必须先把要用的值取进【局部变量】再往下
-//   递归 —— 子节点的 dumpXxx 会覆写成员，回来后读到的就是别人的前缀。
-//
-// 【原来 else 分支的 "UnknownExpr"/"UnknownStmt" 去哪了】
-//   那两条是死代码：NodeKind 里的 14 个表达式种类、8 个语句种类在此全部有
-//   对应分支，else 永不可达。改成访问者后，未重写的节点类型就是"什么都不做"，
-//   语义等价。
+//   不是通用访问者了），所以把它们存成成员变量，由 dumpXxx 在 accept 之前设置好。
+//   ★ 递归约定：每个 visit 必须先把要用的值取进【局部变量】再往下递归 ——
+//   子节点的 dumpXxx 会覆写成员，回来后读到的就是别人的前缀。
 class AstDumper : public AstVisitor {
 public:
     // ── 入口：每个都对 null 做保护，再设好位置状态后 accept ──
@@ -177,9 +125,9 @@ public:
         d->accept(*this);
     }
 
-    // 函数体打印（支持普通函数、构造函数、析构函数）
-    // 这里只有一个二路判断，用已有的 NodeKind 标签足够 —— 访问者是为
-    // N 路分派准备的，两路分支没必要为它绕一层虚调用。
+    // 函数体打印（支持普通函数、构造函数、析构函数）。
+    // 这里只有一个二路判断，用已有的 NodeKind 标签足够 —— 访问者是为 N 路
+    // 分派准备的，两路分支没必要为它绕一层虚调用。
     void dumpFunctionBody(FunctionDecl& func, const std::string& prefix) {
         if (!func.body) return;
 
@@ -207,8 +155,8 @@ public:
         dumpBlock(func.body, prefix);
     }
 
-    // Block 打印（函数体）：与语句层的 BlockStmt 渲染不同（那里带 "BlockStmt"
-    // 标签），这里固定打成 "└── Block"，故不走 accept，直接渲染。
+    // Block 打印（函数体）：与语句层的 BlockStmt 渲染不同（那里带 "BlockStmt" 标签），
+    // 这里固定打成 "└── Block"，故不走 accept，直接渲染。
     void dumpBlock(const std::shared_ptr<BlockStmt>& block, const std::string& prefix) {
         if (!block) return;
         std::cout << prefix << "└── Block\n";
@@ -357,9 +305,8 @@ public:
     }
 
     // ── 顶层声明（10）────────────────────────────────────────────────────
-    // 普通函数与构造/析构函数共用一份头部渲染 —— 改造前的
-    // `dynamic_pointer_cast<FunctionDecl>(decl)` 也会匹配到派生类，
-    // 于是三者都打成 "FunctionDecl: ..."。保持同样的输出。
+    // 普通函数与构造/析构函数共用一份头部渲染：三者都打成 "FunctionDecl: ..."
+    //（构造/析构是 FunctionDecl 的派生类，故共用同一渲染分支）。
     void visit(FunctionDecl& f) override      { renderFunctionDecl(f); }
     void visit(ConstructorDecl& f) override   { renderFunctionDecl(f); }
     void visit(DestructorDecl& f) override    { renderFunctionDecl(f); }
@@ -504,10 +451,8 @@ void dumpAST(const TranslationUnit& unit) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 主函数：编译器驱动
+// 主函数：编译器驱动 —— 解析命令行 → 依次跑阶段 0~6 → 写汇编 / 链接
 // ─────────────────────────────────────────────────────────────────────────────
-// 编译器驱动：解析命令行 → 依次跑阶段 0~6 → 写出汇编。
-// 用法：minicc <src.cpp> [-o out.s] [-I dir] [-E] [--dump-tokens] [--dump-ast]
 int main(int argc, char* argv[]) {
     // 缺少输入文件 → 打印用法并以非零码退出
     if (argc < 2) {
@@ -518,8 +463,7 @@ int main(int argc, char* argv[]) {
 
     std::string inputFile = argv[1];
     std::string outputFile;
-    // ── DumpOptions：诊断可视化标志 ──
-    // 正常编译不变，--dump-* 按需触发对应的可视化输出
+    // ── DumpOptions：诊断可视化标志（--dump-* 按需触发，正常编译流程不受影响）──
     struct DumpOptions {
         bool tokens = false;        // --dump-tokens
         bool ast = false;           // --dump-ast
@@ -531,8 +475,7 @@ int main(int argc, char* argv[]) {
     bool emitAsmOnly = false;              // -S：只吐汇编，不链接（同 gcc -S）
     std::vector<std::string> includeDirs;   // -I 搜索目录（可多次）
 
-    // 解析命令行参数
-    // 单破折号短选项；-o/-I 吃掉紧随其后的值；-I 可多次出现，
+    // 解析命令行参数：单破折号短选项；-o/-I 吃掉紧随其后的值；-I 可多次出现，
     // 顺序即搜索优先级；-E 让驱动在阶段 0 结束后立即返回。
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -571,12 +514,11 @@ int main(int argc, char* argv[]) {
     // 都由函数末尾的 catch 统一打印 [ERROR] 并以非零码退出。
     try {
         // ═══════════════════════════════════════════════════════════════
-        // 阶段 1：词法分析 (Lexical Analysis)
+        // 阶段 0：预处理 (Preprocessing)
         // ═══════════════════════════════════════════════════════════════
-        // ── 阶段 0：预处理（[cpp.phase] 翻译阶段 2~4）──
-        // 行拼接 → #include 并合 → 条件编译 → 宏展开，
-        // 之后词法分析工作在"展开后的纯文本"上（与 clang 的 token 级
-        // 预处理不同，教学版是文本级，见 docs/learn/07）。
+        // [cpp.phase] 翻译阶段 2~4：行拼接 → #include 并合 → 条件编译 → 宏展开。
+        // 之后词法分析工作在"展开后的纯文本"上 —— 教学版是文本级实现，
+        // 与 clang 的 token 级预处理不同（见 docs/learn/07）。
         printPhase("Phase 0: Preprocessing (预处理)");
 
         // 把命令行的 -I 目录交给预处理器（搜索顺序 = 出现顺序）
@@ -603,8 +545,8 @@ int main(int argc, char* argv[]) {
 
         printPhase("Phase 1: Lexical Analysis (词法分析)");
 
-        // Lexer 的输入是预处理后的文本而非原始文件：此时已没有任何 '#' 指令，
-        // 宏已就地替换、头文件已并合（[lex.phases]：分词属于阶段 5，在预处理之后）。
+        // Lexer 的输入是预处理后的文本而非原始文件：此时已无 '#' 指令、宏已就地替换、
+        // 头文件已并合（[lex.phases]：分词在预处理之后）。
         std::string source = preprocessed;   // 词法分析作用于预处理后的文本
         Lexer lexer(source);
         std::vector<Token> tokens = lexer.tokenizeAll();
@@ -705,11 +647,11 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << ">\n";
 
-                // 函数模板（S1）：蓝图存储即可，实例化由调用点实参推导驱动（S2+）
-                // 别名模板（[temp.alias]）：没有"实例化"这一步 ——
-                // 别名不是新类型，用的时候在 Phase 3 由 expandAliasTemplate
-                // 【解糖】成既有类型，既不产生新类也不产生新符号。
-                // 必须在这里拦下：下面各分支都假设 classTemplate != nullptr，
+                // 函数模板（S1）：蓝图存储即可，实例化由调用点实参推导驱动（S2+）。
+                // 别名模板（[temp.alias]）：别名不是新类型 ⇒ 没有"实例化"这一步，
+                // 使用时在 Phase 3 由 expandAliasTemplate【解糖】成既有类型，
+                // 既不产生新类也不产生新符号。
+                // ⚠ 必须在这里拦下：下面各分支都假设 classTemplate != nullptr，
                 // 别名模板的 classTemplate 是空的，会直接空指针崩。
                 if (tmpl->isAliasTemplate()) {
                     std::cout << std::format(
@@ -719,9 +661,8 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // 推导指引（[temp.deduct.guide]）：没有实体，不参与实例化演示 ——
-                // 它只在 CTAD 那一刻被查一次，用完即弃。同别名模板，必须在
-                // 这里拦下：下面各分支都假设 classTemplate != nullptr。
+                // 推导指引（[temp.deduct.guide]）：没有实体，只在 CTAD 那一刻被查一次、
+                // 用完即弃 —— 不参与实例化演示，同别名模板必须在这里拦下。
                 if (tmpl->isDeductionGuide()) {
                     std::cout << std::format(
                         "  (deduction guide for '{}': a CTAD-only rule — never "
@@ -739,9 +680,8 @@ int main(int argc, char* argv[]) {
 
                 // ── 特化（偏/全）不参与"用各种类型演示实例化"（[temp.class.spec]）──
                 // 特化的形参模式限定了它只对某一类实参有意义（如 Box<T*,T> 只收
-                // 「指针 + 同类型」），拿 int/double/int&/... 去硬填会产出语义错误的
-                // 实例。特化的正确触发方式是【使用点实参】——由 Sema 的
-                // selectClassTemplate 在 getOrInstantiateClass 里择优命中。
+                // 「指针 + 同类型」），拿 int/double/int&/… 硬填会产出语义错误的实例。
+                // 它的正确触发方式是【使用点实参】—— Sema::selectClassTemplate 择优命中。
                 if (tmpl->isSpecialization()) {
                     std::cout << std::format(
                         "  ({} specialization of '{}': matched on demand at use sites "
@@ -752,13 +692,12 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 实参包装便利函数：TemplateArg 是 tagged 值，类型实参要显式标形态。
-                // demo：ta(Type::makeInt()) → TemplateArg{kind=Type, type=int}
+                // demo: ta(Type::makeInt()) ⇒ TemplateArg{kind=Type, type=int}
                 auto ta = [](TypePtr t) { return TemplateArg::ofType(std::move(t)); };
 
                 // ★ 多种实例化演示（仅类模板）★
                 // 分支顺序：先按【形参形态】判 NTTP，再按个数展开类型实参演示 ——
-                // 否则 template<int N> 会落进下面的「1 个类型形参」分支，
-                // 被硬塞 6 个类型实参（含 int&/int&&），触发形态校验失败。
+                // 否则 template<int N> 会落进下面的「1 个类型形参」分支，被硬塞 6 个类型实参。
                 if (tmpl->typeParams.size() == 1
                     && tmpl->templateParams[0]->kind == TemplateParamKind::NonType) {
                     // 单 NTTP 模板：Buf<4> —— 值替换的完整演示
@@ -814,9 +753,8 @@ int main(int argc, char* argv[]) {
                 }
                 else if (tmpl->typeParams.size() == 2) {
                     // ── 按形参形态分派第二组实参（[temp.arg]）──
-                    // 旧实现一律传 double，对 template<class T, int N> 会传入
-                    // 一个类型实参去填 NTTP 槽 —— 正是本次修复要消除的错位。
-                    // 现按 templateParams[1].kind 决定第二实参是类型还是值。
+                    // 第二实参是类型还是值，一律由 templateParams[1].kind 决定。
+                    // ★ 若固定传类型实参，template<class T, int N> 会拿类型去填 NTTP 槽。
                     const TemplateParam& p2 = *tmpl->templateParams[1];
                     if (p2.kind == TemplateParamKind::NonType) {
                         std::cout << std::format(
@@ -884,7 +822,7 @@ int main(int argc, char* argv[]) {
         std::string objPath = (tmpDir / ("minicc_" + stem + ".o")).string();
         writeFile(asmPath, assembly);
 
-        // ① 汇编：借用系统 as（汇编器只做机械翻译，见 docs/learn/09）
+        // ① 汇编：借用系统 as（汇编器只做机械翻译，见 docs/learn/15）
         std::cout << std::format("  [as] {} → {}\n", asmPath, objPath);
         int rc = std::system(("as -o " + objPath + " " + asmPath).c_str());
         if (rc != 0) {

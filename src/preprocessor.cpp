@@ -1,5 +1,5 @@
 // =============================================================================
-// 阶段 0：预处理器实现
+// src/preprocessor.cpp —— 阶段 0：预处理器实现（理论见 docs/learn/07）
 // =============================================================================
 // 算法骨架与 clang 对照：
 //   processText      ~ PP::Lex（指令识别 + 条件栈）     lib/Lex/PPDirectives.cpp
@@ -7,22 +7,18 @@
 //   expand           ~ MacroExpander（重扫描+涂蓝）      lib/Lex/PPMacroExpansion.cpp
 //   evalConstantExpr ~ EvaluateDirectiveExpression      lib/Lex/PPExpressions.cpp
 // 简化清单见 include/preprocessor.h 头注与 docs/learn/07。
-// =============================================================================
 //
-// ─── 管线位置与标准章节（补充）───────────────────────────────────────────
-// 阶段 0，位于 Lexer 之前，是整条管线唯一的"文本级"处理阶段：
-//
+// 管线位置 —— 整条管线唯一的"文本级"阶段，位于 Lexer 之前：
 //   源码.cpp ─► processFile ─► processText ─► 展开后纯文本 ─► Lexer → Parser → ...
-//                                │
 //                                ├─ 行拼接            [lex.phases] 翻译阶段 2
 //                                ├─ 注释剥离/指令识别  [lex.phases] 翻译阶段 3
 //                                ├─ #include 并合      [cpp.include]（翻译阶段 4）
 //                                ├─ 条件编译栈         [cpp.cond]
 //                                └─ 宏展开            [cpp.replace]/[cpp.rescan]
 //
-// 相关标准章节：[cpp.define]/[cpp.undef] 宏定义与删除、[cpp.pragma] #pragma、
-//               [cpp.error] #error、[cpp.predefined] 内建宏 __LINE__/__FILE__。
-// ─────────────────────────────────────────────────────────────────────────
+// 相关标准章节：[cpp.define]/[cpp.undef]、[cpp.pragma]、[cpp.error]、
+//               [cpp.predefined]（内建宏 __LINE__/__FILE__）。
+// =============================================================================
 
 #include "preprocessor.h"
 #include <cctype>
@@ -45,7 +41,7 @@ namespace minicc {
 
 // ── 词法小工具 ───────────────────────────────────────────────────────────
 // 预处理器不预先分词，只在文本上按需读"词"：这三个函数界定了什么算一个词
-// （等价于 C++ 标识符字符集）。demo：readWord("MAX(a,b)", 0) → out="MAX"。
+// （等价于 C++ 标识符字符集）。demo: readWord("MAX(a,b)", 0) ⇒ out="MAX"。
 bool Preprocessor::isWordStart(char c) { return std::isalpha((unsigned char)c) || c == '_'; } // 是不是字母
 bool Preprocessor::isWordChar(char c)  { return std::isalnum((unsigned char)c) || c == '_'; } // 数字
 
@@ -62,12 +58,11 @@ std::string Preprocessor::trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
-// 剥行内注释（字符串/字符字面量感知）
-// 属于翻译阶段 3 的准备工作：注释必须在分词前移除（[lex.phases]）。
-// demo："int a; // 行注释" → "int a; "
-//      "/* 块 */ int b;"   → " int b;"（块注释替换为一个空格，防止记号粘连：
-//       int/**/x 若直接删掉注释会变成 intx，必须保持 int 与 x 分开）
-//      字符串字面量里出现的 "//" 不是注释，原样保留。
+// 剥行内注释（字符串/字符字面量感知）—— 翻译阶段 3 的准备工作：注释必须在分词前移除。
+// demo: "int a; // 行注释" ⇒ "int a; "
+//       "/* 块 */ int b;"  ⇒ " int b;"（块注释替换为一个空格，防止记号粘连：
+//         int/**/x 若直接删掉注释会变成 intx，必须保持 int 与 x 分开）
+//       字符串字面量里出现的 "//" 不是注释，原样保留。
 std::string Preprocessor::stripComment(const std::string& line) {
     std::string out;
     bool inStr = false, inChar = false;
@@ -110,11 +105,10 @@ std::string Preprocessor::readFileContents(const std::string& path) const {
 Preprocessor::Preprocessor(PreprocessorOptions opts) : m_opts(std::move(opts)) {}
 
 // 预处理总入口（main.cpp "阶段 0" 的唯一调用点）。
-// 先把主文件的 canonical 路径压入 include 栈——主文件自身也受循环检测保护：
-// 若 a.cpp include b.cpp、b.cpp 又 include a.cpp，handleInclude 会发现 a.cpp
-// 已在栈上而报错，而不是无限递归。
-// demo：processFile("tests/pp/main.cpp") → 返回所有头文件已并合、所有宏已展开
-//       的单一文本（等价 gcc -E 的输出）。
+// 先把主文件的 canonical 路径压入 include 栈 —— 主文件自身也受循环检测保护：
+// a.cpp include b.cpp、b.cpp 又 include a.cpp 时，handleInclude 会发现 a.cpp
+// 已在栈上并报错，而不是无限递归。
+// demo: processFile("tests/pp/main.cpp") ⇒ 头文件已并合、宏已展开的单一文本（gcc -E 等价物）
 std::string Preprocessor::processFile(const std::string& path) {
     std::string canon = fs::weakly_canonical(path).string();
     m_includeStack.push_back(canon);
@@ -128,11 +122,9 @@ std::string Preprocessor::processFile(const std::string& path) {
 // 本预处理器的心脏：对一段源文本执行完整的翻译阶段 2~4。
 // 主文件与被 #include 的文件走同一条路（handleInclude 会递归调用本函数）。
 // demo（行拼接，[lex.phases] 阶段 2）：
-//   物理行 1：#define MAX(a,b) \
-//   物理行 2：  ((a)>(b)?(a):(b))
-//   → 先删除所有 '\' + 换行，拼成一个逻辑行：
-//     #define MAX(a,b)   ((a)>(b)?(a):(b))
-//   → 之后按逻辑行识别出这是一条完整的 #define，宏体跨行书写得以成立。
+//   物理行 `#define MAX(a,b) \` + `  ((a)>(b)?(a):(b))`
+//   ⇒ 先删除所有 '\' + 换行、拼成一个逻辑行 `#define MAX(a,b)   ((a)>(b)?(a):(b))`
+//   ⇒ 再按逻辑行识别出这是一条完整的 #define，宏体跨行书写由此成立。
 std::string Preprocessor::processText(const std::string& src, const std::string& fileName) {
     // ── 翻译阶段 2：行拼接（'\' + 换行 → 删除）──
     // 全文一次性扫描完成，先于一切指令识别——标准规定阶段 2 在阶段 3 之前，
@@ -145,19 +137,15 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
         spliced += src[i];
     }
 
-    // std::cout << "test====>" << spliced << std::endl;
-
-    // 条件编译栈（[cpp.cond]）——每进入一层 #if/#ifdef/#ifndef 压入一个 Cond。
-    // 状态机语义：
+    // 条件编译栈（[cpp.cond]）：每进入一层 #if/#ifdef/#ifndef 压入一个 Cond ——
     //   active       当前分支是否活跃：决定普通行是否输出、其余指令是否生效
-    //   takenBranch  本层是否已有分支取真：#elif/#else 只允许"接在前面全假的
-    //                分支后面"，一旦某分支激活就置真，后续 #elif 一律失活（互斥）
-    //   parentActive 进入本层时外层活跃性的快照：外层不活跃，本层任何分支
-    //                都不可能活跃——"死分支里的真条件救不活自己"
-    // demo：#ifdef A（A 未定义）→ 压入 {active:F, takenBranch:F, parentActive:T}
-    //       其内部 #if 1 → parent=F，条件甚至不求值，active=F（嵌套正确失活）
-    // demo：#if 0 → #elif 1 → #else：#if 0 全假；#elif 1 激活并置 takenBranch；
-    //       #else 因 takenBranch 已真而失活（三选一互斥语义）。
+    //   takenBranch  本层是否已有分支取真：#elif/#else 只允许接在前面全假的分支后，
+    //                某分支一旦激活就置真，后续 #elif 一律失活（互斥）
+    //   parentActive 进入本层时外层活跃性的快照：外层不活跃则本层任何分支都不活跃
+    //                ——"死分支里的真条件救不活自己"
+    // demo: #ifdef A（A 未定义）⇒ {active:F, takenBranch:F, parentActive:T}，其内部
+    //       #if 1 因 parent=F 连条件都不求值（嵌套正确失活）
+    // demo: #if 0 / #elif 1 / #else ⇒ 只有 #elif 1 激活（三选一互斥语义）
     struct Cond {
         bool active;       // 当前分支是否活跃
         bool takenBranch;  // 是否已有分支被采纳（#elif/#else 互斥用）
@@ -181,29 +169,28 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
         std::string clean = stripComment(line);
         std::string t = trim(clean);
 
-        // 调试：每行源文本单独打一个 [src-line] 块标记
-        // 让测试里的 dumpWithExplanation 把它当作"分块锚点"插 === 分隔。
-        // 用特殊分隔符 <SRC>...</SRC> 包裹原文，避免原文中的方括号干扰切串。
+        // 调试：每行源文本单独打一个 [src-line] 块标记 —— 测试里的
+        // dumpWithExplanation 把它当作"分块锚点"插 === 分隔。
+        // ⚠ 必须用 <SRC>…</SRC> 包裹原文，否则原文里的方括号会干扰切串。
         std::cout << std::format("  [pp] {}:{} [src-line] <SRC>{}</SRC>\n",
             fileName, lineNo, line);
 
         // ── 指令行 ──
         // 翻译阶段 3（[lex.phases]）：trim 后以 '#' 开头即预处理指令。
-        // demo："  #include "util.h"  " → after="include \"util.h\""
-        //       → 指令词 dir="include"，剩余参数 rest="\"util.h\""。
+        // demo: 行 "  #include \"util.h\"  " ⇒ after=`include "util.h"`，
+        //       指令词 dir="include"，剩余参数 rest="\"util.h\""。
         if (!t.empty() && t[0] == '#') {
             std::string after = trim(t.substr(1));
             std::string dir;
             size_t p = readWord(after, 0, dir);
             std::string rest = trim(after.substr(p));
 
-            // 条件指令即使在非活跃分支也要处理（需追踪嵌套层级）
-            // ——否则死分支里的 #endif 会错误地弹掉外层栈帧。
-            // demo：#ifdef DEBUG（DEBUG 已定义）→ cond=真
-            //       → 压入 {active:T, takenBranch:T, parentActive:T}，
-            //       此后直到配对 #endif，普通行照常输出、其余指令照常生效。
-            // 注意 parent 不活跃时 cond 保持 false 且不求值——
-            // 死分支里的 #if 表达式可能引用未定义宏，贸然求值会误报。
+            // 条件指令即使在非活跃分支也要处理（需追踪嵌套层级）—— 否则死分支里的
+            // #endif 会错误地弹掉外层栈帧。
+            // demo: #ifdef DEBUG（已定义）⇒ cond=真 → 压入 {active:T, takenBranch:T,
+            //       parentActive:T}，此后直到配对 #endif 普通行照常输出。
+            // ⚠ parent 不活跃时 cond 保持 false 且【不求值】—— 死分支里的 #if
+            //   表达式可能引用未定义宏，贸然求值会误报。
             if (dir == "ifdef" || dir == "ifndef" || dir == "if") {
                 bool parent = enclosingActive();
                 bool cond = false;
@@ -226,8 +213,7 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
             }
             // #elif：外层活跃 && 前面无分支取真 && 本条件为真，三者同时满足才激活。
             // && 的短路求值保证：前面分支已取真时表达式根本不被求值（[cpp.cond]）。
-            // demo：#if 0 / A 段 / #elif 1 / B 段 / #endif
-            //       → A 段跳过；#elif 1 激活（takenBranch 置真）→ B 段输出。
+            // demo: #if 0 / A 段 / #elif 1 / B 段 / #endif ⇒ A 段跳过，B 段输出。
             if (dir == "elif") {
                 if (condStack.empty()) ppError("#elif without #if", fileName, lineNo);
                 auto& st = condStack.back();
@@ -256,9 +242,8 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
                 out += '\n'; continue;
             }
 
-            // 其余指令仅在活跃分支有效
-            // 死分支里的 #define/#include 等一律跳过
-            // "#if 0 ... #endif 可以整段注释掉代码"的原理。
+            // 其余指令仅在活跃分支有效：死分支里的 #define/#include 等一律跳过 ——
+            // 这就是 "#if 0 ... #endif 可以整段注释掉代码"的原理。
             if (!enclosingActive()) { out += '\n'; continue; } // 死分支里面的 语句一律无效
 
             // 指令分派表：各指令的处理函数见各自注释
@@ -294,11 +279,9 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
 
 // ── #define / #undef ─────────────────────────────────────────────────────
 // 解析 #define 的剩余部分（宏名 + 可选参数表 + 宏体），登记进宏表。
-// demo：rest = "N 10"
-//       → 对象宏 { name:"N", body:"10", functionLike:false }
-// demo：rest = "MAX(a,b) ((a)>(b)?(a):(b))"
-//       → '(' 紧跟宏名 → 函数宏，参数表 ["a","b"]，
-//         宏体 "((a)>(b)?(a):(b))"（trim 后保留内部空白）。
+// demo: rest="N 10" ⇒ 对象宏 { name:"N", body:"10", functionLike:false }
+//       rest="MAX(a,b) ((a)>(b)?(a):(b))" ⇒ '(' 紧跟宏名 ⇒ 函数宏，参数表 ["a","b"]，
+//       宏体 "((a)>(b)?(a):(b))"（trim 后保留内部空白）
 void Preprocessor::handleDefine(const std::string& rest, const std::string& fileName, int line) {
     size_t i = 0;
     std::string name;
@@ -309,12 +292,12 @@ void Preprocessor::handleDefine(const std::string& rest, const std::string& file
     def.name = name;
 
     // 函数宏：'(' 必须紧跟宏名（[cpp.define]： intervening 空白即对象宏）
-    // demo："#define F(x) x" 是函数宏；"#define G (x)" 是对象宏（宏体为 "(x)"）。
+    // demo: "#define F(x) x" 是函数宏；"#define G (x)" 是对象宏（宏体为 "(x)"）。
     if (i < rest.size() && rest[i] == '(') {
         def.functionLike = true;
         i++;
         // 逐个读参数名：',' 分隔、')' 结束，参数间允许任意空白。
-        // demo："MAX(a, b)" → params = ["a", "b"]。
+        // demo: "MAX(a, b)" ⇒ params = ["a", "b"]。
         while (true) {
             while (i < rest.size() && std::isspace((unsigned char)rest[i])) i++;
             if (i < rest.size() && rest[i] == ')') { i++; break; }
@@ -354,7 +337,7 @@ void Preprocessor::handleDefine(const std::string& rest, const std::string& file
 }
 
 // #undef：从宏表移除名字（名字本就不存在也不报错，与标准一致 [cpp.undef]）。
-// demo：#undef N 之后，arr[N] 中的 N 不再是宏，按普通标识符留给后续阶段。
+// demo: #undef N 之后，arr[N] 中的 N 不再是宏，按普通标识符留给后续阶段。
 void Preprocessor::handleUndef(const std::string& rest, int line) {
     std::string name = trim(rest);
     std::cout << std::format("  [pp] line {} #undef {}\n", line, name);
@@ -362,16 +345,15 @@ void Preprocessor::handleUndef(const std::string& rest, int line) {
 }
 
 // ── #include：搜索路径算法（对照 HeaderSearch::LookupFile）──────────────
-// 处理一条 #include，返回值是"被包含文件展开后的全文"，由 processText 直接
-// 并合进当前输出（翻译阶段 4，[cpp.include]）。流程：
+// 处理一条 #include，返回值是"被包含文件展开后的全文"，由 processText 直接并合进
+// 当前输出（翻译阶段 4，[cpp.include]）。流程：
 //   ① 解析 "..."（引号形式）或 <...>（尖括号形式）中的文件名
 //   ② resolveInclude 按搜索路径（-I 目录 + 当前目录/系统目录）定位真实文件
-//   ③ canonical 路径已在 m_pragmaOnce → 跳过（#pragma once 去重）
-//   ④ canonical 路径已在 include 栈上 → 循环 include，报错
+//   ③ canonical 路径已在 m_pragmaOnce ⇒ 跳过（#pragma once 去重）
+//   ④ canonical 路径已在 include 栈上 ⇒ 循环 include，报错
 //   ⑤ 压栈 → 递归 processText（被包含文件里还可再 #include）→ 弹栈
-// demo：main.cpp:3 #include "util.h"
-//   → 日志 "[pp] #include "util.h" → tests/pp/util.h"，
-//     util.h 展开后的全文插入到输出中原来 #include 所在的位置。
+// demo: main.cpp:3 的 #include "util.h" ⇒ 日志 "[pp] #include "util.h" → tests/pp/util.h"，
+//       util.h 展开后的全文插入到输出中原来 #include 所在的位置。
 std::string Preprocessor::handleInclude(const std::string& rest,
                                         const std::string& fileName, int line) {
     if (rest.empty()) ppError("expected filename after #include", fileName, line);
@@ -420,7 +402,7 @@ std::string Preprocessor::handleInclude(const std::string& rest,
 // 头文件搜索路径（[cpp.include] 允许实现自定义顺序，这里取最常见约定）：
 //   "file"：① 当前文件所在目录 ② -I 目录（按命令行先后）
 //   <file>：① -I 目录（按命令行先后） ② /usr/include（系统头兜底）
-// demo：当前文件 tests/pp/main.cpp，命令含 -I include：
+// demo: 当前文件 tests/pp/main.cpp，命令含 -I include：
 //   #include "util.h" → 试 tests/pp/util.h → 命中返回
 //   #include "minicc/util.h" → 试 tests/pp/minicc/util.h → 试 include/minicc/util.h
 // 全部落空：报错并列出每个尝试过的路径（模仿 clang 的 'file not found' 诊断）。
@@ -469,15 +451,12 @@ void Preprocessor::handlePragma(const std::string& rest, const std::string& file
 
 // ── 宏展开：递归重扫描 + 涂蓝（[cpp.rescan] 简化）──────────────────────
 // 对一段文本逐字符扫描做宏替换，返回展开结果。hide 集即标准里的"涂蓝"：
-// 正在展开的宏名加入 hide，重扫描遇到它不再展开 → 自引用不会死循环。
-// demo（对象宏）：#define N 10，文本 "arr[N]" → "arr[10]"
-// demo（链式重扫描）：#define SIZE N*2 → "SIZE" 先替换为 "N*2"，
-//                     再对 "N*2" 递归展开 → "10*2"
-// demo（涂蓝）：#define A A+1 → "A" 展开为 "A+1"，其中的 A 已涂蓝，
-//               重扫描时原样保留 → 最终 "A+1"（不会无限展开）
-// demo（函数宏）：#define MAX(a,b) ((a)>(b)?(a):(b))
-//   "MAX(x, y+1)" → 收集实参 ["x","y+1"] → 实参各自先展开 →
-//   替换宏体中的参数名 → 整体重扫描 → "((x)>(y+1)?(x):(y+1))"
+// 正在展开的宏名加入 hide，重扫描遇到它不再展开 ⇒ 自引用不会死循环。
+// demo: #define N 10 ⇒ 文本 "arr[N]" 展开成 "arr[10]"
+//       #define SIZE N*2 ⇒ "SIZE" 先替换为 "N*2"，再对 "N*2" 递归展开 ⇒ "10*2"
+//       #define A A+1 ⇒ "A" 展开为 "A+1"，其中已涂蓝的 A 重扫描时原样保留（不死循环）
+//       #define MAX(a,b) ((a)>(b)?(a):(b)) ⇒ "MAX(x, y+1)" 收集实参 ["x","y+1"]
+//         → 实参各自先展开 → 替换宏体参数名 → 整体重扫描 ⇒ "((x)>(y+1)?(x):(y+1))"
 std::string Preprocessor::expand(const std::string& text,
                                  const std::unordered_set<std::string>& hide,
                                  const std::string& fileName, int line) {
@@ -566,7 +545,7 @@ std::string Preprocessor::expand(const std::string& text,
         }
 
         // 收集实参：括号配平，顶层逗号切分
-        // demo："MAX(f(1,2), y)" → f(1,2) 内的逗号处于 depth=1 层，不切分
+        // demo: "MAX(f(1,2), y)" ⇒ f(1,2) 内的逗号处于 depth=1 层，不切分
         //       → 实参 ["f(1,2)", "y"]（2 个，而不是 3 个）。
         std::vector<std::string> args;
         std::string cur;
@@ -603,7 +582,7 @@ std::string Preprocessor::expand(const std::string& text,
             fileName, line, indent, word, trim(text.substr(j + 1, k - j - 1)), as); }
 
         // 实参先展开（[cpp.subst]），再按词边界替换参数名，最后整体重扫描
-        // demo：#define N 10 时调用 MAX(N, x)
+        // demo: #define N 10 时调用 MAX(N, x)
         //       → 实参 "N" 先展开为 "10" → 替换得 "((10)>(x)?(10):(x))"。
         std::vector<std::string> expandedArgs;
         for (auto& a : args)
@@ -637,8 +616,7 @@ std::string Preprocessor::expand(const std::string& text,
 // 把宏体中的参数名逐处替换为对应实参文本（纯词法替换，[cpp.subst]）。
 // 按"整词"匹配保证词边界：参数 a 不会命中 abc 的前缀；
 // 字符串字面量内的参数名不替换（简化：未实现 # 字符串化，见头注）。
-// demo：body="((a)>(b)?(a):(b))"，args=["x","y+1"]
-//       → "((x)>(y+1)?(x):(y+1))"
+// demo: body="((a)>(b)?(a):(b))"、args=["x","y+1"] ⇒ "((x)>(y+1)?(x):(y+1))"
 std::string Preprocessor::substituteParams(const MacroDef& m,
                                            const std::vector<std::string>& args) {
     std::string out;
@@ -670,13 +648,13 @@ std::string Preprocessor::substituteParams(const MacroDef& m,
 
 // ── #if 常量表达式（对照 PPEpressions.cpp）──────────────────────────────
 // 三步：① defined(X) → 1/0（必须先于宏展开，[cpp.cond]）
-//       ② 展开剩余宏  ③ 未定义标识符按 0 处理，递归下降求值
-// demo：#if defined(USE_LOG) && VER >= 2（其中 #define VER 3）
+//       ② 展开剩余宏；③ 未定义标识符按 0 处理，递归下降求值
+// demo: #if defined(USE_LOG) && VER >= 2（其中 #define VER 3）
 //   ① defined(USE_LOG) → 查宏表 → " 1 "（已定义）
 //   ② 剩余宏展开：VER → 3，表达式变为 " 1  && 3 >= 2"
-//   ③ 递归下降求值 → 1（真）→ 该 #if 分支激活
-// 为什么 defined 必须先于展开：若宏展开的结果里再出现 defined，
-// 标准明文禁止——先处理 defined 可天然规避这一陷阱。
+//   ③ 递归下降求值 → 1（真）⇒ 该 #if 分支激活
+// ★ defined 必须先于展开：若宏展开的结果里再出现 defined，标准明文禁止 ——
+//   先处理 defined 可天然规避这一陷阱。
 long Preprocessor::evalConstantExpr(const std::string& expr,
                                     const std::string& fileName, int line) {
     // ── ① defined 处理 ──
@@ -710,7 +688,7 @@ long Preprocessor::evalConstantExpr(const std::string& expr,
         s += expr[i]; i++;
     }
 
-    // ── ② 宏展开 ── 宏展开
+    // ── ② 宏展开 ──
     s = expand(s, {}, fileName, line);
 
     // ── ③ 分词 + 递归下降求值 ──

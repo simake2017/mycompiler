@@ -1,59 +1,26 @@
 #pragma once
 // =============================================================================
-// 阶段 2：抽象语法树 (AST) 节点定义
+// 阶段 2：抽象语法树（AST）节点定义 —— 理论见 docs/learn/10
 // =============================================================================
-// AST 是源代码的树状结构表示，是编译器各阶段之间传递信息的核心载体。
+// AST 是 Parser 的输出、后续所有阶段的唯一输入：
+//   Parser 建树 → Sema 填 resolvedType / 注册符号 / 算类布局 → 模板实例化克隆+替换
+//   → CodeGen 消费出汇编。
 //
-// 节点层次：
-//   ASTNode（基类）
-//   ├── Expression（表达式：有类型、有值）
-//   │   ├── IntLiteralExpr      // 42
-//   │   ├── BoolLiteralExpr     // true / false
-//   │   ├── StringLiteralExpr   // "hello"
-//   │   ├── NullptrLiteralExpr  // nullptr
-//   │   ├── VarExpr             // 变量引用
-//   │   ├── BinaryExpr          // a + b
-//   │   ├── UnaryExpr           // -x, !x
-//   │   ├── CallExpr            // foo(a, b)
-//   │   ├── MemberExpr          // obj.field
-//   │   ├── NewExpr             // new Foo()
-//   │   └── ThisExpr            // this
-//   ├── Statement（语句：无值，执行动作）
-//   │   ├── ExprStmt            // 表达式语句
-//   │   ├── VarDeclStmt         // 变量声明（含 auto）
-//   │   ├── ReturnStmt          // return expr;
-//   │   ├── IfStmt              // if / else
-//   │   ├── WhileStmt           // while 循环
-//   │   ├── BlockStmt           // { ... }
-//   │   └── AssignStmt          // lhs = rhs
-//   └── Declaration（顶层声明）
-//       ├── FunctionDecl        // 函数声明
-//       ├── ClassDecl           // 类声明
-//       └── TemplateDecl        // 模板声明（蓝图）
-// =============================================================================
+// 节点层次（NodeKind 是运行时类型标签，等价 clang 的 Stmt::StmtClass / Decl::Kind）：
+//   ASTNode
+//   ├── Expression  有类型有值   IntLiteral BoolLiteral StringLiteral NullptrLiteral
+//   │                            Var Binary Unary Call Member Index New DynamicCast
+//   │                            This Delete
+//   ├── Statement   无值执行动作 ExprStmt VarDecl Return If While Block Assign DeleteStmt
+//   └── Declaration 引入新名字   Function Class Template GlobalVar Enum Namespace
+//                                TypeAlias Constructor Destructor DeductionGuide
 //
-// 【在管线中的位置】
-//   Preprocessor → Lexer → Parser（产出 AST）→ SemanticAnalyzer（填 resolvedType、
-//   注册符号、算类布局）→ TemplateDeduction/Instantiation（克隆+替换 AST）
-//   → CodeGen（消费 AST 出汇编）。AST 是 Parser 的输出，也是后续阶段的唯一输入。
-//
-// 【对应 C++ 标准章节】
-//   [expr.*]     表达式（expr.prim.literal / expr.prim.id / expr.call /
-//                expr.ref / expr.new / expr.prim.this / expr.unary / expr.add 等）
-//   [stmt.*]     语句（stmt.expr / stmt.dcl / stmt.return / stmt.select / stmt.iter）
-//   [dcl.fct]    函数声明与参数
-//   [class] / [class.derived] / [class.virtual]   类、继承、虚函数
-//   [temp]       模板（TemplateDecl 蓝图）
-//
-// 【对应 clang 模块】
-//   clang 把声明与语句/表达式分在两棵树上：Decl（include/clang/AST/Decl*.h）
-//   与 Stmt/Expr（include/clang/AST/Stmt*.h、Expr*.h）。本文件用单一 ASTNode 基类
-//   统一三者，便于教学遍历与打印。
-//     ASTNode         ≈ clang::Decl 与 clang::Stmt 的公共概念
-//     Expression      ≈ clang::Expr（Expr.h）
-//     Statement       ≈ clang::Stmt（Stmt.h）
-//     Declaration     ≈ clang::Decl（Decl.h）
-//     TranslationUnit ≈ clang::TranslationUnitDecl
+// 【标准章节】[expr.*] 表达式 / [stmt.*] 语句 / [dcl.fct] 函数
+//             [class] [class.derived] [class.virtual] 类与继承 / [temp] 模板蓝图
+// 【clang 对照】clang 把声明与语句/表达式分在两棵树（Decl*.h 与 Stmt*.h / Expr*.h），
+//   本文件用单一 ASTNode 基类统一三者，便于教学遍历与打印：
+//     ASTNode ≈ Decl ∪ Stmt │ Expression ≈ Expr │ Statement ≈ Stmt
+//     Declaration ≈ Decl    │ TranslationUnit ≈ TranslationUnitDecl
 // =============================================================================
 
 #include "ast_visitor.h"   // 节点 accept 的实现要访问 AstVisitor，故在此引入。
@@ -115,16 +82,10 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 // Expression：表达式基类（有类型信息）
 // ─────────────────────────────────────────────────────────────────────────────
-// 【核心特征】：表达式的核心在于“计算”和“求值”。它一定有确定的类型（resolvedType），并且一定能计算出一个具体的值。
-// 【与 Statement 的区别】：表达式可以作为另一个表达式的一部分（如 a + (b * c)），而语句不行。表达式本身一般不单独存在，除非被包装成 ExprStmt（如 foo();）。
-// 【与 Declaration 的区别】：表达式不向符号表引入新名字，只是读取已有的名字或计算新的值。
-// 【代码示例】：
-//    - `42`           （IntLiteralExpr，类型 int，值 42）
-//    - `a + b`        （BinaryExpr，类型由 a 和 b 决定，计算它们的和）
-//    - `foo(x, y)`    （CallExpr，类型为 foo 的返回值类型，值为函数的执行结果）
-//
-// 对应 clang::Expr。每个表达式经语义分析后都有唯一类型 resolvedType
-// （[expr]：每个表达式都有类型）。Parser 阶段 resolvedType 为空，阶段 3 填充。
+// 三大族判据：Expression 有 resolvedType / 可求值 / 可做子表达式（42、a+b、foo(x,y)）；
+//             Statement 无类型、只描述执行动作（return、if、x = 5;），不能做子表达式；
+//             Declaration 向符号表引入名字（函数/类/模板），无运行时值。
+// 对应 clang::Expr。表达式都有唯一类型（[expr]），Parser 留空、阶段 3 填充。
 struct Expression : ASTNode {
     TypePtr resolvedType; // 语义分析阶段填充
 
@@ -173,13 +134,11 @@ struct NullptrLiteralExpr : Expression {
 // 语义阶段把 VarExpr 解析到符号表中的具体声明，并填 resolvedType。
 struct VarExpr : Expression {
     std::string name;
-    // 显式模板实参（S3）：foo<int>(x) 中的 <int>。
-    // Parser 在标识符后识别 template-id 时填充；语义阶段据此做显式+推导混合。
-    // 挂在 VarExpr 上是因为 template-id 出现在调用的 '(' 之前。
-    // 用 TemplateArg（tagged）而非裸 TypePtr：与 Type::templateArgs 保持一致，
-    // 使得 foo<4>(x) 能被解析出来——虽然函数模板的 NTTP 尚未实现，
-    // 由语义阶段给出"函数模板暂不支持非类型实参"的明确报错，
-    // 而不是在语法阶段就崩成"Expected type name"。
+    // 显式模板实参（S3）：foo<int>(x) 中的 <int>。Parser 在标识符后识别 template-id 时
+    // 填充；语义阶段据此做"显式 + 推导"混合。挂在 VarExpr 上是因为 template-id 出现在
+    // 调用的 '(' 之前；用 TemplateArg（tagged）与 Type::templateArgs 保持一致，使
+    // foo<4>(x) 也能被解析出来（否则语法阶段就崩成 "Expected type name"），再由语义
+    // 阶段给出"函数模板暂不支持非类型实参"的明确报错。
     std::vector<TemplateArg> explicitTemplateArgs;
     explicit VarExpr(std::string n) : Expression(NodeKind::Var), name(std::move(n)) {}
 
@@ -258,17 +217,13 @@ struct MemberExpr : Expression {
     bool        isMethodCall = false; // 是否是方法调用（语义分析阶段确定）
 
     // ── 类型限定访问：Cls<Args>::member（静态成员）────────────────────
-    // 【为什么单独立标志】obj.field 的 object 是【对象】，运行期要按偏移量取；
-    //   而 Cls<Args>::value 的 Cls<Args> 是【类型】，根本没有对象、没有偏移量，
-    //   它是个编译期常量。二者语义不同，必须能分辨。
-    // 【demo】is_range<decltype(numbers)>::value
-    //           → MemberExpr{ object=VarExpr{is_range, explicitTemplateArgs=[decltype(...)]},
-    //                         memberName="value", isTypeAccess=true }
-    // 【理论】[expr.ref]/[expr.prim.id.qual]：限定名查找（qualified lookup）
-    //   在类的作用域（含基类）里找静态数据成员。
-    //   本实现把命中的静态常量【折叠成字面量】（见 Sema::foldStaticConst）——
-    //   因为值在编译期就已知，运行期不应再去内存里读。
-    // 对照 clang：DeclRefExpr(NestedNameSpecifier + ValueDecl)，
+    // 为何单独立标志：obj.field 的 object 是【对象】，运行期按偏移量取；而
+    //   Cls<Args>::value 的限定者是【类型】，无对象无偏移，是编译期常量。
+    // 理论：[expr.ref]/[expr.prim.id.qual] 限定名查找，在类作用域（含基类）里找静态
+    //   数据成员；命中的静态常量被折叠成字面量（Sema::foldStaticConst）。
+    // demo: is_range<decltype(numbers)>::value ⇒ MemberExpr{object=VarExpr{is_range,
+    //         explicitTemplateArgs=[decltype(...)]}, memberName="value", isTypeAccess=true}
+    // clang 对照：DeclRefExpr(NestedNameSpecifier + ValueDecl)，
     //   Sema::BuildDeclarationNameExpr 走 CXXScopeSpec 的那条路径。
     bool        isTypeAccess = false;
 
@@ -280,20 +235,14 @@ struct MemberExpr : Expression {
 };
 
 // ─── 下标访问表达式（语法糖，降级为 at()/set() 调用）────────────────────────
-// 对应 [expr.sub]（下标运算符）；clang: ArraySubscriptExpr /
-// CXXOperatorCallExpr（operator[] 重载形式）。
-// demo：v[i]       → IndexExpr{ object=VarExpr{v}, index=VarExpr{i} }
-// 设计（教学版 operator[] 的"糖化"）：
-//   真 C++ 里 v[i] 是 operator[] 重载调用；minicc 尚无运算符重载，
-//   于是把下标语法直接降级为两个约定方法：
-//     右值位置（读）：int x = v[i];   ≡  int x = v.at(i);
-//     左值位置（写）：v[i] = x;       ≡  v.set(i, x);
-//   类只要实现 at(int)/set(int,int) 两个成员方法，就自动获得 [] 手感
-//   （Vector<T>/Map<K,V> 封装即建立在此约定上）。
-// 语义阶段：inferIndex 校验 object 是类类型且类里有 at() 方法；
-//           结果类型 = at() 的返回类型。
-// 代码生成：emitExpr(IndexExpr) → 发射 this + 实参、callq <类名>_at；
-//           emitAssign 见 AssignStmt.target 为 IndexExpr 时改发 <类名>_set。
+// 对应 [expr.sub]；clang: ArraySubscriptExpr / CXXOperatorCallExpr（operator[] 重载）。
+// 设计（教学版 operator[] 的"糖化"）：minicc 尚无运算符重载，故把下标语法降级为两个
+//   约定方法 —— 右值位置（读）v[i] ≡ v.at(i)；左值位置（写）v[i] = x ≡ v.set(i, x)。
+//   类只要实现 at(int)/set(int,int) 就自动获得 [] 手感（Vector<T>/Map<K,V> 即此约定）。
+// demo: v[i] ⇒ IndexExpr{ object=VarExpr{v}, index=VarExpr{i} }
+// Sema: inferIndex 校验 object 是类类型且类里有 at()；结果类型 = at() 的返回类型。
+// CodeGen: emitExpr 发 this + 实参、callq <类名>_at；target 为 IndexExpr 的赋值改发
+//   <类名>_set。
 struct IndexExpr : Expression {
     ExprPtr object;  // 被下标的容器对象（类类型）
     ExprPtr index;   // 下标表达式（按约定方法签名校验）
@@ -366,15 +315,9 @@ struct DeleteExpr : Expression {
 // ─────────────────────────────────────────────────────────────────────────────
 // Statement：语句基类
 // ─────────────────────────────────────────────────────────────────────────────
-// 【核心特征】：语句的核心在于“控制流程”和“执行动作”。它没有类型，也不会计算出一个可被后续引用的值。
-// 【与 Expression 的区别】：语句是一条完整的指令，控制程序怎么跑（循环、条件、返回），而表达式只是指令里算数的部分。你不能写 `int x = if (a) { 1; };`，因为 `if` 是语句没有值。
-// 【与 Declaration 的区别】：语句执行具体的运行时逻辑，而声明侧重于向编译器报告“这里有个什么东西”。虽然变量声明（VarDeclStmt）在 C++ 中算作语句，但大部分纯声明（如类、函数蓝图）不是。
-// 【代码示例】：
-//    - `return 0;`         （ReturnStmt，动作是退出函数）
-//    - `if (flag) { ... }` （IfStmt，动作是分支跳转）
-//    - `x = 5;`            （AssignStmt，动作是修改内存，本项目里算作语句。注：C++里赋值本身是表达式，这里简化了）
-//
-// 对应 clang::Stmt。语句没有值、只描述执行动作（区别于带 resolvedType 的表达式）。
+// 无类型、只描述执行动作（判据见上方 Expression 的三大族）。对应 clang::Stmt。
+// demo: return 0; ⇒ ReturnStmt；if (f) {...} ⇒ IfStmt；x = 5; ⇒ AssignStmt
+//   （★ C++ 里赋值本身是表达式，本项目简化成语句。）
 struct Statement : ASTNode {
     explicit Statement(NodeKind k) : ASTNode(k) {}
 };
@@ -402,24 +345,17 @@ struct VarDeclStmt : Statement {
     ExprPtr     initializer;     // 初始化表达式（可为 nullptr）
 
     // ── 直接初始化：`Type name(args...);`（[dcl.init]/16）──
-    // 【为什么单列而不是塞进 initializer】两者的语义层级不同：
-    //   `T x = e;` 是【拷贝初始化】——先造一个 T 再拷/移到 x；
-    //   `T x(args);` 是【直接初始化】——直接在 x 的存储上跑构造函数。
-    //   本项目的类对象没有拷贝语义，两条路最终都落到"在 x 的槽位上调用
-    //   构造函数"，但参数传递方式不同（前者只有一个实参，后者是完整实参表）。
-    // 【为什么 CTAD 非要有它】[dcl.type.class.deduct]/1：**类模板实参推导
-    //   只在直接初始化（或 `=` 加单个同模板实参）时触发** ——
-    //   `MyPtr m(7);` 里没有写 `<...>`，推导的输入就是这串构造实参。
-    //   `=` 形式的 `MyPtr m = 7;` 不是 CTAD（那是转换，C++17 起才有拷贝推导）。
-    // 空 ⇒ 不是括号初始化；CodeGen 对空表走原来的路径（默认构造 / 标量赋值）。
+    // 与 initializer 的语义层级不同：`T x = e;` 是拷贝初始化，`T x(args);` 是直接初始化
+    //   —— 后者直接在 x 的存储上跑构造函数，实参是完整实参表。
+    // ★ CTAD 非它不可：[dcl.type.class.deduct]/1 规定类模板实参推导【只在直接初始化触发】
+    //   —— `MyPtr m(7);` 没写 `<...>`，推导输入就是这串构造实参。
+    // 空 ⇒ 不是括号初始化，CodeGen 走原路径（默认构造 / 标量赋值）。
     std::vector<ExprPtr> ctorArgs;
 
     // 语义阶段选定并【回填】的构造函数符号（成员 mangledName）。
-    // 【为什么不能让 CodeGen 自己拼】mangling 规则是有状态的 —— 同名多参
-    //   会追加参数个数后缀（`MyPtr_int_MyPtr_int_1`），而"该调哪个重载"
-    //   只有 Sema 知道（它刚做完推导/决议）。CodeGen 若按 `Name_Name`
-    //   硬拼，遇到带参构造就会拼出一个不存在的符号（链接期 undefined）。
-    // 空 ⇒ 零参构造，CodeGen 回退到 `Name_Name`（老路径，行为不变）。
+    // ★ 不能让 CodeGen 自己拼：mangling 是有状态的（同名多参追加参数个数后缀），"该调
+    //   哪个重载"只有刚做完推导/决议的 Sema 知道；硬拼 `Name_Name` 会拼出不存在的符号。
+    // 空 ⇒ 零参构造，CodeGen 回退 `Name_Name`。
     std::string ctorSymbol;
 
     VarDeclStmt(std::string n, TypePtr t, ExprPtr init)
@@ -517,15 +453,10 @@ struct DeleteStmt : Statement {
 // ─────────────────────────────────────────────────────────────────────────────
 // Declaration：顶层声明基类
 // ─────────────────────────────────────────────────────────────────────────────
-// 【核心特征】：声明的核心在于“向符号表引入新的名字（标识符）”，并描述它们的结构和签名，供后面的代码引用。
-// 【与 Expression 的区别】：声明是编译期的概念，它告诉编译器“如何看待”后面的表达式，声明本身不产出运行时的值。
-// 【与 Statement 的区别】：声明大多不能放在普通语句的位置随便执行。顶层声明如类、函数、模板，它们是构建程序骨架的基石，而语句是填充在函数体里的血肉。
-// 【代码示例】：
-//    - `int foo(int x);`                     （FunctionDecl，引入名字 foo）
-//    - `class Point { int x; int y; };`      （ClassDecl，引入名字 Point，以及它的内存布局）
-//    - `template<typename T> class MyPtr;`   （TemplateDecl，引入一个需要实例化的蓝图）
-//
-// 对应 clang::Decl。声明引入名字（函数/类/模板），是符号表的构成单元。
+// 向符号表引入名字并描述其结构签名，是符号表的构成单元，本身不产出运行时值。
+// 对应 clang::Decl；三者判据见上方 Expression 的三大族。
+// demo: int foo(int x); ⇒ FunctionDecl；class Point {...}; ⇒ ClassDecl；
+//       template<typename T> class MyPtr; ⇒ TemplateDecl
 struct Declaration : ASTNode {
     explicit Declaration(NodeKind k) : ASTNode(k) {}
 };
@@ -540,17 +471,10 @@ struct Parameter {
 
 // ─── 函数声明 ─────────────────────────────────────────────────────────────────
 // 对应 [dcl.fct]/[dcl.fct.def]；clang: FunctionDecl（成员函数为 CXXMethodDecl）。
-// demo：int f(int a) { return a; }
-//   → FunctionDecl{ name=f, returnType=int,
-//                   parameters=[ Parameter{a:int} ],
-//                   body=BlockStmt[ ReturnStmt[ VarExpr{a} ] ] }
-//   ASCII:     FunctionDecl(f)
-//              ├─ returnType → int
-//              ├─ parameters → [ a : int ]
-//              └─ body → BlockStmt
-//                          └─ ReturnStmt
-//                              └─ VarExpr(a)
-// isVirtual/isOverride 用于类的虚函数（[class.virtual]）；mangledName 由阶段4填充。
+// demo: int f(int a) { return a; } ⇒ FunctionDecl{ name=f, returnType=int,
+//         parameters=[Parameter{a:int}], body=BlockStmt[ ReturnStmt[ VarExpr{a} ] ] }
+// isVirtual/isOverride 用于类的虚函数（[class.virtual]）；mangledName 由阶段 4 填充；
+// ownerClassName 非空表示成员函数。
 struct FunctionDecl : Declaration {
     std::string          name;
     TypePtr              returnType;
@@ -671,17 +595,12 @@ using TypeAliasDeclPtr = std::shared_ptr<TypeAliasDecl>;
 
 // ─── 类声明 ───────────────────────────────────────────────────────────────────
 // 对应 [class]/[class.mem]；clang: CXXRecordDecl。继承见 [class.derived]。
-// demo：class Point : public Base { int x; int foo() { ... } };
-//   → ClassDecl{ name=Point, baseClassNames=["Base"],
-//                fields=[ FieldInfo{x:int} ],
-//                methods=[ FunctionDecl{foo} ],
-//                classType=<Type: Class Point> }
-// 多继承：class D : public A, public B { ... } → baseClassNames=["A","B"]
-//   （[class.mi]；本项目仅支持 public 非虚继承，声明顺序即子对象摆放顺序）
-// 语义阶段把 ClassDecl 翻译成 Type 的 ClassLayout（算偏移 / 建 vtable）。
+// demo: class Point : public Base { int x; int foo() {...} }; ⇒ ClassDecl{name=Point,
+//         baseClassNames=["Base"], fields=[FieldInfo{x:int}], methods=[FunctionDecl{foo}]}
+// 多继承：[class.mi]，本项目仅支持 public 非虚继承，声明顺序即子对象摆放顺序。
+// Sema 把 ClassDecl 翻译成 Type 的 ClassLayout（算偏移 / 建 vtable）。
 // ─── 静态常量成员（见 ClassDecl::staticConsts）──────────────────────────────
-// demo：std::false_type 的 value → { value=0, type=bool }
-//       std::true_type  的 value → { value=1, type=bool }
+// demo: std::false_type::value ⇒ {value=0, type=bool}；true_type ⇒ {value=1, type=bool}
 struct StaticConstMember {
     int64_t value = 0;
     TypePtr type;          // 常量自身的类型（bool / int …）
@@ -697,35 +616,29 @@ struct ClassDecl : Declaration {
     AccessModifier           currentAccess = AccessModifier::Private;
 
     // ── 静态常量成员（名 → 值）──────────────────────────────────────────
-    // 【用途】std 垫片里的 false_type/true_type 靠它提供 ::value。
-    //   Parser 不解析类内 `static const int value = 1;`（该语法未实现），
-    //   故这些成员由 SemanticAnalyzer::registerBuiltins 直接注入。
-    // 【理论】静态数据成员不占对象内存、没有偏移量，是编译期已知的常量
-    //   （[class.static.data]）。查找要走"类作用域 + 基类链"
-    //   （[class.member.lookup]），与实例字段的 findField 是两条不同的路径。
-    // 对照 clang：VarDecl 且 isStaticDataMember()，
-    //   取值走 EvaluatingValueDecl 的常量求值。
-    // ★ 带类型：真 C++ 里 std::false_type::value 的类型是 bool 而非 int，
-    //   这个差别是可观察的 —— `bool b = Trait<T>::value;` 合法而
-    //   `int i = Trait<T>::value;` 在本项目下报错（int→bool 未开放为隐式转换）。
-    //   故折叠时按这里的 type 生成对应字面量，而不是一律给 int。
+    // 【用途】std 垫片 false_type/true_type 的 ::value 由 SemanticAnalyzer::
+    //   registerBuiltins 直接注入（Parser 不解析类内 `static const int value = 1;`）。
+    // 【理论】静态数据成员不占对象内存、无偏移量，是编译期常量（[class.static.data]）；
+    //   查找走"类作用域 + 基类链"（[class.member.lookup]），与 findField 是两条路径。
+    //   clang 对照：VarDecl 且 isStaticDataMember()，取值走常量求值。
+    // ★ 带类型：false_type::value 的类型是 bool 而非 int，差别可观察（本项目下
+    //   `int i = Trait<T>::value;` 报错，int→bool 未开放为隐式转换）—— 折叠时按这里的
+    //   type 造对应字面量，而不是一律给 int。
     std::unordered_map<std::string, StaticConstMember> staticConsts;
 
     // ── 成员类型别名（名 → 目标类型）────────────────────────────────────
     // 【语法】`using type = T;` 与 `typedef T type;`（[dcl.typedef]）
-    // 【理论】类型别名是【纯编译期】设施：它不产生新类型、不占内存、
-    //   不进符号表（链接器根本不认识它），只在编译期做一次名字替换。
-    //   这正是 type_traits 全家桶的出口 —— 每个元函数的"返回值"都是一条
-    //   `using type = ...`，所以没有它写不出任何 trait。
-    // 【依赖情形】别名目标可以是模板形参（`using type = T;`），
-    //   实例化时由 TemplateInstantiator 做结构化替换（与字段/方法同一条路）。
-    //   对照 clang：TypedefNameDecl，实例化走 Sema::InstantiateTypedefNameDecl。
+    // 【理论】类型别名是纯编译期设施：不产生新类型、不占内存、不进符号表，只在编译期做
+    //   一次名字替换 —— 它是 type_traits 全家桶的出口（每个元函数的"返回值"都是一条
+    //   `using type = ...`）。目标可含模板形参，实例化时由 TemplateInstantiator 结构化
+    //   替换（与字段/方法同一条路）。
+    //   clang 对照：TypedefNameDecl / Sema::InstantiateTypedefNameDecl。
     std::unordered_map<std::string, TypePtr> typeAliases;
     std::vector<std::string> typeAliasOrder;   // 保持声明顺序，便于日志可观测
 
     ClassDecl() : Declaration(NodeKind::Class) {}
 
-    // 便捷访问：第一个基类（无继承时返回空串）——兼容单继承路径的旧语义
+    // 便捷访问：第一个基类（无继承时返回空串）
     std::string firstBase() const {
         return baseClassNames.empty() ? "" : baseClassNames.front();
     }
@@ -735,25 +648,18 @@ struct ClassDecl : Declaration {
 using ClassDeclPtr = std::shared_ptr<ClassDecl>;
 
 // ─── 模板声明（代码蓝图） ─────────────────────────────────────────────────────
-// 阶段2（Parser）遇到 template<typename T> class MyPtr {...} 或
-// template<typename T> T twice(T x) {...} 时，将整个声明"冻结"为蓝图，
-// 暂不解析内部语义。
-// 等到阶段4（模板实例化）遇到 MyPtr<int>（类模板），或遇到 twice(21) 这样的
-// 调用（函数模板，由 S2+ 实参推导驱动）时，才克隆并替换 T → int。
+// Parser 遇 `template<typename T> class MyPtr {...}` 或 `template<typename T>
+// T twice(T x) {...}` 时把整个声明"冻结"成蓝图，暂不解析内部语义；等实例化（类模板
+// MyPtr<int> / 函数模板由实参推导驱动）时再克隆并做 T → int 的结构化替换。
 //
-// classTemplate 与 funcTemplate 互斥（S1+）：
-// 一个 TemplateDecl 要么是类模板，要么是函数模板。
-// 对照 clang：ClassTemplateDecl 和 FunctionTemplateDecl 都继承自 TemplateDecl，
-// 这里用"双槽位 + 判别方法"代替继承，保持 AST 扁平、便于教学。
+// classTemplate / funcTemplate / aliasTemplate / guide 四槽位互斥：一个 TemplateDecl 只
+// 承载一种蓝图。clang 里它们各是独立的 Decl（ClassTemplateDecl / FunctionTemplateDecl /
+// TypeAliasTemplateDecl / CXXDeductionGuideDecl），本项目用"多槽位 + 判别方法"代替继承，
+// 保持 AST 扁平、便于教学。
 //
-// demo：template<typename T> T twice(T x) { return x + x; }
-//   → TemplateDecl{ typeParams=["T"], classTemplate=nullptr,
-//                   funcTemplate=FunctionDecl{ name=twice,
-//                       returnType=<TemplateParam T>,
-//                       parameters=[ Parameter{x, <TemplateParam T>} ],
-//                       body=BlockStmt[ ReturnStmt[ BinaryExpr{Add,
-//                           VarExpr{x}, VarExpr{x}} ] ] } }
-//   （T 以 TemplateParam 占位类型存在；实例化时才被替换为实际类型）
+// demo: template<typename T> T twice(T x) { return x + x; } ⇒ TemplateDecl{typeParams=["T"],
+//   classTemplate=nullptr, funcTemplate=FunctionDecl{name=twice, returnType=<TemplateParam T>,
+//   parameters=[x:<TemplateParam T>], body=BlockStmt[ReturnStmt[BinaryExpr{Add,x,x}]]}}
 // ─── 模板形参（类型形参 vs 非类型形参 NTTP）──────────────────────────────
 // 对应 [temp.param]；clang: TemplateTypeParmDecl / NonTypeTemplateParmDecl
 enum class TemplateParamKind {
@@ -767,56 +673,45 @@ struct TemplateParam {
     TypePtr           nonType = nullptr; // 非类型形参对应的类型（如 int）
 
     // ── 默认模板实参（[temp.param]/12）──
-    // demo：template<typename T, typename U = void> 里 U 的 `= void`
-    //   → defaultArg = TemplateArg{kind=Type, type=void}, hasDefault = true
-    // 用 hasDefault 而不是 defaultArg.type == nullptr 判"有无默认"：
-    // 显式写 `= void` 时 type 非空但语义上仍是"有默认"，两者必须分开。
-    //
-    // 【标准约束】默认实参只能在**主模板**（及别名模板）的形参表里给；
-    // 偏特化的形参表不得有默认实参。且一旦某位形参有默认值，
-    // 其后的每一位都必须有（[temp.param]/12："后续形参必须有默认实参"）。
+    // demo: template<typename T, typename U = void> 里 U 的 `= void` ⇒ hasDefault = true
+    // 用 hasDefault 而非 defaultArg.type == nullptr 判"有无默认"：显式写 `= void` 时
+    //   type 非空但语义上仍是"有默认"，两者必须分开。
+    // 【标准约束】默认实参只能给在主模板（及别名模板）的形参表；偏特化不得有默认实参；
+    //   且一旦某位形参有默认值，其后的每一位都必须有。
     TemplateArg       defaultArg;
     bool              hasDefault = false;
 
-    // ── 无名形参（[temp.param]/3）──────────────────────────────────────
-    // demo：template <typename T, typename = void>
-    //         第 2 位形参没有名字，只用它的默认值参与 void_t 推导。
-    // 内部仍给一个合成名（"$unnamed0"）当替换表的键 —— 表总得有键，
-    // 而 '$' 不是合法标识符字符，保证用户代码永远写不出同名的引用，
-    // 语义上等价于"这个名字不可见"。
+    // ── 无名形参（[temp.param]/3）──
+    // demo: template <typename T, typename = void> 第 2 位形参只用默认值参与 void_t 推导。
+    // 内部给一个合成名（"$unnamed0"）当替换表的键 —— 表总得有键，而 '$' 不是合法标识符
+    //   字符，保证用户代码写不出同名引用，语义上等价于"这个名字不可见"。
     bool              isUnnamed = false;
 
     SourceLocation    location;
 };
 
 // ── 模板形参以【指针】形式持有（对应 clang 的 TemplateParameterList）────────
-// clang：TemplateParameterList 用 TrailingObjects 内联存 `NamedDecl*` 数组，
-//   节点由 TemplateTypeParmDecl::Create 分配在 ASTContext 的 BumpPtrAllocator
-//   （arena）上 —— 永不移动、永不单独释放，故缓存形参指针永远安全。
-// 本项目没有 arena，用 shared_ptr 拿到同样的两个性质：
-//   ① 节点不随容器扩容而搬家（vector 扩容搬的是【指针值】，不是节点本身）；
-//   ② 节点生命周期覆盖全部引用方（对应 clang 靠 arena 兜底的那一半）。
-// 【为什么必须改成指针】值语义时元素住在 vector 的堆块里，解析期一路
-//   push_back 会 reallocate，任何先前取得的 `const TemplateParam*` 立刻悬空
-//   —— 而模板形参作用域的查询恰恰发生在 push_back 进行中（见 parser.h 的帧）。
+// clang：TemplateParameterList 用 TrailingObjects 内联存 `NamedDecl*` 数组，节点由
+//   TemplateTypeParmDecl::Create 分配在 ASTContext 的 BumpPtrAllocator（arena）上，
+//   永不移动、永不单独释放 —— 故缓存形参指针永远安全。
+// 本项目无 arena，用 shared_ptr 拿到同样两条性质：① 节点不随容器扩容而搬家（vector
+//   扩容搬的是【指针值】，不是节点本身）；② 生命周期覆盖全部引用方。
+// ★ 值语义会悬空：元素住在 vector 堆块里，解析期一路 push_back 会 reallocate，先前取得
+//   的 `const TemplateParam*` 立刻失效 —— 而模板形参作用域的查询恰发生在 push_back
+//   进行中（见 parser.h 的帧）。
 using TemplateParamPtr = std::shared_ptr<TemplateParam>;
 
 // ─── 模板声明的种类（[temp.class.spec] / [temp.expl.spec]）──────────────────
 // 一个类模板可以有三种"版本"，同名共存，靠实参匹配择优：
 //
-//   template<class T, class U = void> struct Box { ... };   Primary     主模板
-//   template<class T> struct Box<T*, T> { ... };            PartialSpec 偏特化
-//   template<> struct Box<int*, int> { ... };               ExplicitSpec 全特化（显式特化）
+//   template<class T, class U = void> struct Box {...};   Primary      主模板
+//   template<class T> struct Box<T*, T> {...};            PartialSpec  偏特化
+//   template<> struct Box<int*, int> {...};               ExplicitSpec 全特化
 //
-// 对照 clang：ClassTemplateDecl（主模板）持有 PartialSpecialization 链表
-// （ClassTemplatePartialSpecializationDecl）与 Specializations 集合
-// （ClassTemplateSpecializationDecl），三者是不同 AST 节点、由 Sema 关联。
-// 本项目用"同结构 + 判别枚举"保持 AST 扁平。
-//
-// 【择优顺序】[temp.class.spec.match] + [temp.expl.spec]/6：
-//   ① 全特化精确匹配（最高优先，命中即用）
-//   ② 偏特化逐个做形参推导，取匹配成功者
-//   ③ 都不中 → 主模板 + 默认实参补全
+// 【择优顺序】[temp.class.spec.match] + [temp.expl.spec]/6：① 全特化精确匹配（命中即用）
+//   ② 偏特化逐个推导，取匹配成功者 ③ 都不中 → 主模板 + 默认实参补全。
+// clang 对照：ClassTemplateDecl 另挂偏特化链表与实例化集合，是不同 AST 节点；本项目用
+//   "同结构 + 判别枚举"保持 AST 扁平。
 enum class TemplateSpecKind {
     Primary,      // 主模板
     PartialSpec,  // 偏特化：形参表非空，且 specPattern 中含模板参数（如 T*）
@@ -826,17 +721,13 @@ enum class TemplateSpecKind {
 // ─────────────────────────────────────────────────────────────────────────────
 // ─── 推导指引（deduction guide，[temp.deduct.guide]）─────────────────────────
 // 对应 clang: CXXDeductionGuideDecl。
-// 语法：DeductionGuide := ['template' '<' params '>'] Name '(' params ')' '->' Name '<' args '>' ';'
-// demo：template<class T> MyPtr(T) -> MyPtr<T>;      // 从构造实参反推 T
-//       Box(int) -> Box<int>;                        // 非模板指引：写死映射
+// 语法：['template' '<' params '>'] Name '(' params ')' '->' Name '<' args '>' ';'
+// demo: template<class T> MyPtr(T) -> MyPtr<T>;   // 从构造实参反推 T
+//       Box(int) -> Box<int>;                     // 非模板指引：写死映射
 //
-// 【它到底解决什么】CTAD 默认只会"拿构造函数当指引用"，可构造函数写不出
-//   所有想要的映射 —— 最典型的是：类的构造函数收 `T*`，但你希望 `MyPtr(p)`
-//   对 `int*` 推出 `MyPtr<int>` 而不是 `MyPtr<int*>`。推导指引就是给用户
-//   一个"改写映射规则"的钩子：它长得像函数，但**不产生任何代码**，
-//   只参与 CTAD 那一次推导。
-// 【与普通函数的本质区别】没有函数体、没有符号、不参与重载决议 ——
-//   它是编译期的纯映射规则，用完即弃。
+// CTAD 默认只会"拿构造函数当指引用"，可构造函数写不出所有想要的映射 —— 推导指引是用户
+//   改写映射规则的钩子。★ 它长得像函数但【不产生任何代码】：没有函数体、没有符号、
+//   不参与重载决议，只参与 CTAD 那一次推导，用完即弃。
 struct DeductionGuideDecl : Declaration {
     std::vector<TemplateParamPtr> templateParams;  // 指引自身的模板形参（可为空）
     std::string                guideName;       // 被指引的类模板名（如 "MyPtr"）
@@ -859,11 +750,9 @@ struct TemplateDecl : Declaration {
 
     // ── 特化支持（[temp.class.spec] / [temp.expl.spec]）──
     // specKind    : 本声明是主模板 / 偏特化 / 全特化
-    // specPattern : 特化形参模式，对应模板名后尖括号里的那串实参
-    //   template<class T> struct Box<T*, T>;      → [T*, T]      （含模板参数 → 偏特化）
-    //   template<> struct Box<int*, int>;         → [int*, int]  （全具体 → 全特化）
-    //   主模板（struct Box { ... }）无尖括号 → specPattern 为空
-    // demo：Box<T*, T> 的 specPattern[0] = Type{Pointer, TemplateParam"T"}
+    // specPattern : 特化形参模式 = 模板名后尖括号里的那串实参；主模板无尖括号 ⇒ 空
+    //   Box<T*, T>     ⇒ [T*, T]      （含模板参数 ⇒ 偏特化；pattern[0]=Pointer(T)）
+    //   Box<int*, int> ⇒ [int*, int]  （全具体 ⇒ 全特化）
     TemplateSpecKind           specKind = TemplateSpecKind::Primary;
     std::vector<TypePtr>       specPattern;
 
@@ -878,17 +767,15 @@ struct TemplateDecl : Declaration {
     bool isFunctionTemplate() const { return funcTemplate != nullptr; }
     // ── 别名模板 [temp.alias] ──
     // template<class T> using Vec = MyPtr<T>;
-    // 【与类模板的本质差别】别名【不是新类型】，只是既有类型的另一个名字：
-    //   Vec<int> 和 MyPtr<int> 是【同一个类型】，不产生包装类、不产生新符号。
-    //   所以它没有"实例化"这一步，只有"替换"这一步——把形参换掉就完事。
-    // 对照 clang：TypeAliasTemplateDecl + AliasTemplateSpecializationType
-    //   （clang 为了诊断仍保留一层 sugar，本实现直接解糖到最终类型）。
+    // ★ 别名【不是新类型】，只是既有类型的另一个名字：Vec<int> 和 MyPtr<int> 是同一个
+    //   类型，不产生包装类、不产生新符号 —— 故它没有"实例化"，只有"替换"（换掉形参）。
+    // clang 对照：TypeAliasTemplateDecl + AliasTemplateSpecializationType（为诊断保留
+    //   一层 sugar，本实现直接解糖到最终类型）。
     bool isAliasTemplate()    const { return aliasTemplate != nullptr; }
     // ── 推导指引（[temp.deduct.guide]）──
-    // template<class T> MyPtr(T) -> MyPtr<T>;
-    // 【它不是"模板"】这里借用 TemplateDecl 只是因为语法上共用 `template<...>`
-    //   前缀外壳。指引本身没有实体、没有符号、不被实例化 —— 它只是 CTAD
-    //   在推导时可以被问到的一条"映射规则"。故它也有自己的 templateParams。
+    // 【它不是"模板"】借用 TemplateDecl 只因语法上共用 `template<...>` 前缀外壳；指引没有
+    //   实体、没有符号、不被实例化 —— 它只是 CTAD 可问到的一条"映射规则"（故也有
+    //   templateParams）。
     bool isDeductionGuide()   const { return guide != nullptr; }
     // 模板的主名（类名 / 函数名 / 别名名 / 被指引的类模板名）
     const std::string& templateName() const {
@@ -906,8 +793,7 @@ using TemplateDeclPtr = std::shared_ptr<TemplateDecl>;
 // TranslationUnit：编译单元的根节点
 // ─────────────────────────────────────────────────────────────────────────────
 // 对应 clang::TranslationUnitDecl。Parser 的最终产物，CodeGen 从这里开始遍历。
-// demo：一个含 1 函数 + 1 类的源文件
-//   → TranslationUnit{ declarations=[ FunctionDecl, ClassDecl ] }
+// demo: 含 1 函数 + 1 类的源文件 ⇒ TranslationUnit{ declarations=[FunctionDecl, ClassDecl] }
 struct TranslationUnit {
     std::vector<DeclPtr> declarations;  // 所有顶层声明
 };

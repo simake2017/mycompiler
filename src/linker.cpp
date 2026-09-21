@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // linker.cpp —— minicc 教学链接器（主线 B）实现
 // ─────────────────────────────────────────────────────────────────────────────
-// 五步流水线（与 docs/learn/09 一一对应）：
+// 五步流水线（与 docs/learn/15 一一对应）：
 //   ① readObject        解析 .o（ELF64 节表 / 符号表 / .rela）
 //   ② layoutSections    合并同类节，分配虚地址（非 PIE，基址 0x400000）
 //   ③ injectRuntime     注入 _start / malloc / free 机器码（不依赖 crt/libc）
@@ -112,10 +112,10 @@ int mergeKindOf(const std::string& name) {
 // ═══════════════════════════════════════════════════════════════════════════
 // ① readObject —— 解析一个 .o 文件
 // ═══════════════════════════════════════════════════════════════════════════
-// 做什么：把 ELF 可重定位文件拆成链接器关心的三样东西：
+// 把 ELF 可重定位文件拆成链接器关心的三样东西：
 //   可合并节（.text/.rodata/.data/.bss 的内容）、符号表、重定位表。
-// 教学点：.o 里所有符号值都是"节内偏移"，绝对地址要等链接时才产生——
-//   这就是重定位存在的根本原因。
+// 教学点：.o 里所有符号值都是"节内偏移"，绝对地址要等链接时才产生 ——
+//   这正是重定位存在的根本原因。
 bool MiniLinker::readObject(const std::string& path, LinkResult& res) {
     // 整个文件读进内存（.o 很小，全量读最简单）
     std::ifstream f(path, std::ios::binary);
@@ -152,8 +152,7 @@ bool MiniLinker::readObject(const std::string& path, LinkResult& res) {
     };
 
     // ── 合并节内容：同类节首尾相接追加到对应合并缓冲区 ──
-    // 关键不变量：每个原始节的"段内起始偏移"此刻被锁定，
-    // 之后符号值（节内偏移）+ 段内偏移 = 该符号在合并段中的位置。
+    // 关键不变量：原始节的"段内起始偏移"此刻锁定 ⇒ 之后 符号值 + 段内偏移 = 合并段中的位置。
     obj.secToMerge.assign(shdrs.size(), -1);
     obj.secOffset.assign(shdrs.size(), 0);
     std::vector<uint8_t>* mergeBuf[4] = {&mergedText_, &mergedRodata_,

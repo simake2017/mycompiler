@@ -1,65 +1,33 @@
 #pragma once
 // =============================================================================
-// 阶段 5：代码生成器 (Code Generator)
+// 阶段 5：代码生成器 (Code Generator)（理论见 docs/learn/14）
 // =============================================================================
-// 核心职责：将树状的 AST "拍平"为线性的 x86-64 汇编指令。
+// 职责：把树状 AST "拍平"成线性的 x86-64 指令（AT&T 语法 .s）。走到这里类型与
+//   字段名彻底消失，只剩地址和数字 —— "运行期看偏移量"的最终体现。
+//   obj.field    ⇒ [rbp+offset]（编译期算好的数字偏移）
+//   ptr->vfunc() ⇒ 读 vptr → 加偏移 → 跳转（三部曲，详见 emitVirtualCall）
+// 目标：x86-64 System V AMD64 ABI │ 输出：GNU as 可汇编的 .s（.text/.data/.rodata）
+// 管线：Preprocessor → Lexer → Parser → Sema → 模板推导/实例化 → ★CodeGen★
+//   → .s → 自研链接器产出可执行文件。输入：类型全解析、auto 已替换、ClassLayout 已算好。
 //
-// 这是"运行期看偏移量"的最终体现：
-//   - obj.field   → [rbp + offset]（直接用数字偏移量访问内存）
-//   - ptr->vfunc() → 三部曲：读 vptr → 加偏移 → 跳转
-//   - 类型和字段名在此阶段彻底消失，只剩下地址和数字
+// ── 调用约定（System V AMD64 ABI）──────────────────────────────────────
+//   整数/指针参数依次用 rdi, rsi, rdx, rcx, r8, r9，返回值 rax，栈 16 字节对齐；
+//   成员函数的 this 占第一个参数槽 rdi（Itanium C++ ABI），显式实参从 rsi 起顺延。
+//   栈帧以 %rbp 为基址（详见 codegen.cpp emitFunction）：-8 起依次是 this、
+//   形参 spill（各 8B），再往下是局部变量，向低地址增长，止于 %rsp（序言 subq 预留）。
 //
-// 目标架构：x86-64 (System V AMD64 ABI)
-// 输出格式：AT&T 语法的汇编文件（.s）
-// =============================================================================
+// ── vtable 与名字修饰（Itanium C++ ABI 简化版）─────────────────────────
+//   含虚函数的类 → 一张 vtable（.data），对象偏移 0 处藏 _vptr；虚调用 =
+//     movq (%rdi),%rax ; movq N(%rax),%rax ; callq *%rax
+//   成员方法 "类名_方法名"（Dog_speak）│ 模板实例 _Z5MyPtrIiE（阶段 4 NameMangler）
+//   vtable/typeinfo：_ZTV7MyClass / _ZTI7MyClass
 //
-// ─── 在编译管线中的位置 ──────────────────────────────────────────────────
-//   Preprocessor → Lexer → Parser → SemanticAnalyzer → TemplateDeduction /
-//   TemplateInstantiation → ★CodeGen（本文件）★ → .s 文本 → 外部 as/ld
-//
-//   输入：语义分析与模板实例化均已完成的 AST —— 类型全部解析、auto 已
-//         替换为具体类型、ClassLayout（字段偏移/大小/vtable）已算好。
-//   输出：一份可直接交给 GNU as 汇编的 AT&T 语法 .s（.text/.data/.rodata）。
-//
-// ─── 理论背景 ────────────────────────────────────────────────────────────
-// 1) 调用约定 System V AMD64 ABI（Linux 下 C/C++ 的事实标准）：
-//      整数/指针参数依次用 rdi, rsi, rdx, rcx, r8, r9；返回值用 rax；
-//      栈 16 字节对齐；成员函数的 this 指针占用第一个参数槽 rdi
-//      （Itanium C++ ABI 规定），显式实参从 rsi 起顺延。
-// 2) 栈帧布局（本项目：一切以 %rbp 为基址，详见 codegen.cpp emitFunction）：
-//
-//        高地址
-//      ┌──────────────────────┐
-//      │ 返回地址 (call 压入)   │
-//      ├──────────────────────┤ ← %rbp（pushq %rbp 保存旧帧基址）
-//      │ 旧 %rbp              │
-//      ├──────────────────────┤ -8(%rbp)
-//      │ this（仅成员函数）     │
-//      ├──────────────────────┤ -16(%rbp)
-//      │ 形参 1（寄存器 spill） │
-//      ├──────────────────────┤ -24(%rbp)
-//      │ 形参 2 …             │
-//      ├──────────────────────┤
-//      │ 局部变量（每个 8B）    │ ← m_currentStackOffset 向低地址增长
-//      └──────────────────────┘ ← %rsp（subq $64, %rsp 预留）
-//        低地址
-//
-// 3) vtable 与动态分发（Itanium C++ ABI 简化版）：
-//      含虚函数的类 → 一张 vtable（.data 段）；对象偏移 0 处藏 _vptr
-//      指向它。虚调用 = 两次访存 + 一次间接跳转（详见 emitVirtualCall）：
-//          movq (%rdi), %rax   ; movq N(%rax), %rax   ; callq *%rax
-// 4) 名字修饰（GCC/Itanium mangling，本项目实现的子集）：
-//      · 普通成员方法：简化方案 "类名_方法名"（如 Dog_speak）
-//      · vtable / typeinfo：标准前缀 _ZTV7MyClass / _ZTI7MyClass
-//      · 模板实例：_Z5MyPtrIiE 风格，由阶段 4 的 NameMangler 生成
-//
-// ─── 对应 LLVM 模块 ──────────────────────────────────────────────────────
-//   本文件 ≈ 把 LLVM 好几个阶段压缩进 ~900 行手写代码：
-//   · lib/CodeGen/SelectionDAG（指令选择）→ emitExpr/emitStmt 手写模式匹配
-//   · lib/Target/X86/X86ISelLowering.cpp（调用约定降级）→ emitCall/emitVirtualCall
-//   · RegAllocGreedy（寄存器分配）→ 极简"单累加器 rax + 栈周转"策略
-//   · PrologEpilogInserter（序言/尾声插入）→ emitFunction 手写 push/leave/ret
-//   · AsmPrinter（汇编打印）→ generate() 拼装三段输出
+// ── 对应 LLVM 模块（把 LLVM 好几个阶段压缩进 ~900 行手写代码）──────────
+//   SelectionDAG 指令选择 → emitExpr/emitStmt 手写模式匹配 │
+//   X86ISelLowering 调用约定降级 → emitCall/emitVirtualCall │
+//   RegAllocGreedy → 极简"单累加器 rax + 栈周转"策略 │
+//   PrologEpilogInserter（序言/尾声）→ emitFunction 手写 push/leave/ret │
+//   AsmPrinter（汇编打印）→ generate() 拼装三段输出
 // =============================================================================
 
 #include "ast.h"
@@ -120,16 +88,15 @@ private:
     // 天然支持嵌套块——与符号表 enterScope/exitScope 同构。
     std::vector<std::vector<std::string>> m_blockDtorStack;
 
-    // 发射"调用 C 的析构函数"：
-    //   rdi = leaq off(%rbp)（对象地址），按 vtable 有无定虚实
-    // 与 emitDelete 共享；块尾析构是它的"无 free"版（栈对象不经过 malloc）
+    // 发射"调用 C 的析构函数"：rdi = leaq off(%rbp)（对象地址），按 vtable 有无定虚实。
+    // 与 emitDelete 共享；块尾析构是它的"无 free"版（栈对象不经过 malloc）。
     void emitClassDtorCall(const std::string& className, int rbpOffset);
 
-    // 帧空间预估：扫描函数体内所有局部变量声明，把每个的占用字节数累加
-    // （类类型按布局 totalSize 对齐到 8，其余按 8 字节槽）——序言的
-    // subq $N 用这个数，保证类对象（可能 >8B）不越出预留空间。
-    // 对照真实编译器：这就是 LLVM 的 PrologEpilogInserter 帧布局计算，
-    // 此处为最朴素的"先数后减"一遍扫描。
+    // 帧空间预估：扫描函数体内所有局部变量声明并累加占用字节（类类型按布局
+    // totalSize 对齐到 8，其余按 8 字节槽）—— 序言的 subq $N 用它，保证类对象
+    // （可能 >8B）不越出预留空间。
+    // 对照真实编译器：即 LLVM 的 PrologEpilogInserter 帧布局计算，此处为最朴素的
+    // "先数后减"一遍扫描。
     uint32_t estimateFrameSize(FuncDeclPtr func);
     uint32_t estimateBlockSize(std::shared_ptr<BlockStmt> block);
 
@@ -166,7 +133,7 @@ private:
 
     // ── 语句生成 ──
     // 语句分发器：accept 走虚表分派到下方对应的 visit 重载（"lowering 降级"的入口）。
-    // 改造前这里是 8 级 if-else + dynamic_pointer_cast 链，见 include/ast_visitor.h。
+    // 分派手法的判据见 include/ast_visitor.h 与 semantic_analyzer.h。
     void emitStmt(const StmtPtr& stmt);
     // 复合语句：顺序发射子语句
     void visit(BlockStmt& block) override;
