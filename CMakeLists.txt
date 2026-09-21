@@ -100,3 +100,11 @@ target_link_libraries(unit_tests dl)
 include(GoogleTest)
 gtest_discover_tests(unit_tests)
 
+# ─── ministl 测试 ───────────────────────────────────────────────────────────
+# ministl 本身是可以独立配置的 CMake 项目，这里 add_subdirectory 进来，
+# 这样 CLion 打开 mycompiler 时能一并看到它的 5 个测试目标、
+# 每个 TEST() 左侧出现绿色三角，不必再另开一个窗口。
+# googletest 用的是上面同一份 FetchContent 声明（同 URL、同 tag），
+# 会被识别为已 populate 的依赖直接复用，不会重复下载或重复构建。
+add_subdirectory(ministl)
+
