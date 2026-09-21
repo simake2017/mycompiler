@@ -12,6 +12,10 @@ cmake-build-debug/
 .cache/
 .vscode/
 
+# CLion 远程开发（Gateway）的机器本地标记：记录上次上传的时间戳，
+# 每台机器一份。提交它会让每次同步都产生无意义 diff。
+.clion.source.upload.marker
+
 compile_commands.json
 
 # 重构安全网：日志基线（logdiff.sh 生成，3.3M，不入库）

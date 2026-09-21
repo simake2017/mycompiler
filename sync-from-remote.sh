@@ -36,6 +36,7 @@ rsync -az ${DRY} --itemize-changes \
     --exclude 'Testing/' \
     --exclude '.cache/' \
     --exclude '_deps/' \
+    --exclude '.logbaseline/' \
     --exclude '.git/' \
     --exclude '*.o' \
     --exclude 'minicc' \
