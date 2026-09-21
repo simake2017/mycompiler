@@ -97,15 +97,23 @@ const Token& Parser::advance() {
     return tok;
 }
 
-// ── 模板形参作用域查询：裸名是否命中当前 template<...> 的类型形参？──
-// 供 parseType 区分 TemplateParam("T") 与 Class("T")。
+// ── 模板形参查找：从当前帧往外层帧走（内层优先），返回形参本身 ──
+// 供 parseType 区分 TemplateParam("T") 与 Class("T")，并区分【类型形参】与
+// NTTP 名 —— 后者出现在类型位置要报明确错误（见 parseType 的调用点）。
 // 线性扫描即可：形参个数极少（个位数），无需 hash（教学取舍：可讲解 > 高性能）。
-// 对应 clang: Sema 的 TemplateParameterScope 查找（ActOnIdentifier 前判定依赖名）。
-bool Parser::isInTemplateParamScope(const std::string& name) const {
-    for (const auto& p : m_templateParamScope) {
-        if (p == name) return true;
+// 对应 clang: Sema 沿 Scope 链上行的名字查找（判定依赖名）。
+//
+// ★ 这里【现取】*owner->templateParams[i] 而不缓存指针：
+//   i 是下标，容器扩容后依然有效；而任何缓存的 `const TemplateParam*`
+//   都可能因 vector reallocate 悬空（见 ast.h 里 TemplateParamPtr 的说明）。
+const TemplateParam* Parser::lookupTemplateParam(const std::string& name) const {
+    for (const TemplateParamFrame* f = m_currentFrame; f; f = f->parent) {
+        for (size_t i = 0; i < f->count; i++) {
+            const TemplateParam& p = *f->owner->templateParams[i];
+            if (p.name == name) return &p;   // ★ 现取，扩容后依然有效
+        }
     }
-    return false;
+    return nullptr;
 }
 
 // ── 前瞻判断（LL(1) 的核心动作）：只比较类型，不消费。──
@@ -293,7 +301,12 @@ TypePtr Parser::parseType() {
         //   可有可无；本实现两种写法都收，语义相同（都是"去限定者里取成员类型"）。
         // 对照 clang：Parser::ParseTypenameType → Sema::ActOnTypenameType
         //   → 建 DependentNameType（限定者是依赖的）/ TypenameType。
-        if (isInTemplateParamScope(name) && check(TokenType::ColonColon)) {
+        // 【为什么要求 kind == Type】模板的【值形参】N 是值名，`N::x` 不成话
+        //   （对照 clang: err_not_type / "N is not a type"）。只有类型形参
+        //   才能当限定者。
+        const TemplateParam* qualParam = lookupTemplateParam(name);
+        if (qualParam && qualParam->kind == TemplateParamKind::Type
+            && check(TokenType::ColonColon)) {
             TypePtr qual = Type::makeTemplateParam(name);
             std::cout << std::format(
                 "  [parse:type] ★ 依赖限定名: {}::...（限定者是模板形参）\n", name);
@@ -322,7 +335,24 @@ TypePtr Parser::parseType() {
             // 对应 clang: Sema::isIdentiferADependentTemplateName / ActOnType
             // 在模板上下文中把 T 解析为 TemplateTypeParmType。
             // 注意：只认不含 '::' 的裸名（std::T 这种限定名不可能是模板形参）。
-            if (name.find("::") == std::string::npos && isInTemplateParamScope(name)) {
+            const TemplateParam* tp = (name.find("::") == std::string::npos)
+                                    ? lookupTemplateParam(name) : nullptr;
+            // ★ 只有【类型形参】才建成 TemplateParam 节点 —— 非类型形参（NTTP）
+            //   的名字在【模板实参位置】是合法的【值实参】：
+            //       template<int N> struct Buf { ... };
+            //       template<int N> using BufA = Buf<N>;   // 这里的 N 是值
+            //   而 parseType 分不清自己是被"类型位置"还是"模板实参位置"
+            //   （parseTemplateArgumentList 会拿裸名试探 parseType）调用的。
+            //   故值名一律沿用旧路径（建 Class(name)），由替换阶段按
+            //   "替换表里绑的是值"还原成值实参（见 template_instantiation.cpp）。
+            //   对照 clang：这个区分发生在 ParseTemplateArgument（实参位）而非
+            //   ParseTypeName（类型位），minicc 没有那层分派，故在此保守处理。
+            //   ★ 教训：这一条曾误写成"值名一律报错"，结果打挂了
+            //     test_tmpl_50 的 `Buf<N>`（rc 0→1）。parseType 是复用的，
+            //     不能假设调用者一定在类型位置。
+            //   代价：`template<int N> struct A { N x; }` 仍报 "unknown type name
+            //   'N'" 而非更准的 err_not_type —— 记为已知边界。
+            if (tp && tp->kind == TemplateParamKind::Type) {
                 base = Type::makeTemplateParam(name);
                 std::cout << std::format("  [parse:type] base = {} (template param, scope hit)\n", name);
             }
@@ -810,6 +840,16 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     // ★ 空形参表 template<> 是合法的 —— 它是【全特化】的标记（[temp.expl.spec]）：
     //   template<> struct Box<int*, int> { ... };
     //   故此处先判 '>' 再进循环（不能用 do-while 无条件吃一个形参）。
+    //
+    // ── 模板形参作用域：★ 建帧 —— 构造即入栈，析构即出栈 ──
+    // 使形参表 + 模板体解析期间 parseType 能把裸 T 识别为 TemplateParam 节点。
+    // 对照 clang：ParseTemplateParameters 里
+    //   `TemplateScopes.Enter(Scope::TemplateParamScope)`（ParseTemplate.cpp:332）
+    //   —— 作用域同样开在【解析形参表之前】，由 MultiParseScope 析构时 Exit。
+    // ★ 作用域【开的时机】本来就是对的（对应 clang 的 Enter）；真正决定裸 T
+    //   能不能被认出来的是【形参何时注册进作用域】，见下面循环内的说明。
+    TemplateParamFrame frame(this, decl.get());
+
     if (!check(TokenType::Greater)) {
         int unnamedSeq = 0;   // 无名形参的合成名序号（见下方 unnamed 分支）
         do {
@@ -858,6 +898,23 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                     param.nonType->toString(), param.name);
             }
 
+            // ── ★★ 顺序关键：先解析默认实参，后注册本形参 ──
+            // [basic.scope.pdecl]/9：形参名的作用域从【其声明符之后】才开始。
+            // clang 的实现（ParseTemplate.cpp:654 注释原文）：
+            //   "Per C++0x [basic.scope.pdecl]p9, we parse the default argument
+            //    before we introduce the type parameter into the local scope."
+            //   代码上：ParseTypeName 解析默认实参在前（:671），
+            //           Actions.ActOnTypeParameter 建 Decl 在后（:676）。
+            // 于是第 i 位的默认实参只能看见第 0..i-1 位 —— 因为前几位是
+            //   【之前几轮循环】注册的，而自己这一位还没注册。
+            // 实证（clang++-18 -std=c++20 -fsyntax-only）：
+            //   template<class T, class U = T> struct A {...}; A<int> x;   ✅
+            //   template<class T = int, class U = T*> struct C {...};      ✅
+            //   template<class U = U> struct B {...};   ❌ unknown type name 'U'
+            // ★ 本文件此前是真 bug：所有形参都在【循环结束之后】才注册，
+            //   连上一轮的 T 都没进门 ⇒ `template<class T, class U = T>` 里的 T
+            //   被建成 Class("T")，报 unknown type name 'T'，报错点也看不出根因。
+            //
             // ── 默认模板实参（[temp.param]/12）：形参名后可选 '= 默认值' ──
             // demo：template<typename T, typename U = void>
             //         → U 的 defaultArg = TemplateArg{Type, void}, hasDefault = true
@@ -881,8 +938,25 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                     param.name, param.defaultArg.toString());
             }
 
+            // ── ★ 现在才注册本形参（在默认实参解析【之后】）──
+            // 对照 clang：Sema::ActOnTypeParameter 末尾的 S->AddDecl(Param)
+            //   （SemaTemplate.cpp:1074）才是真正入作用域的动作，它同样发生在
+            //   默认实参解析之后；返回值再由
+            //   ParseTemplateParameterList:357-359 收进形参表。
+            // 注册动作有两件事，必须成对：
+            //   ① push 进 decl->templateParams（数据 —— 答案在这里）
+            //   ② frame.count 跟上（可见范围 —— 下标计数）
+            // 二者同步 ⇒ 第 i+1 轮的默认实参正好能看见第 0..i 位。
+            // （不再区分 Type/NonType：值形参名同样要进作用域，否则
+            //   `template<int N> struct A { ... };` 里 N 根本查不到 —— 见
+            //   lookupTemplateParam 的调用点如何用 kind 报"值不是类型"。）
             decl->typeParams.push_back(param.name);
-            decl->templateParams.push_back(param);
+            decl->templateParams.push_back(
+                std::make_shared<TemplateParam>(std::move(param)));
+            frame.count = decl->templateParams.size();   // ← 可见范围同步扩张
+            std::cout << std::format(
+                "  [parse:template]   ↗ register tparam '{}' into scope\n",
+                decl->templateParams.back()->name);
 
         } while (match(TokenType::Comma) && (std::cout << ", ", true));
     }
@@ -898,32 +972,22 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     // 一旦某位形参带了默认值，其后每一位都必须带；否则出现"空洞"，
     // 调用者无法用位置实参填满。对照 clang: err_template_param_default_arg_missing
     for (size_t i = 0; i < decl->templateParams.size(); i++) {
-        if (decl->templateParams[i].hasDefault) {
+        if (decl->templateParams[i]->hasDefault) {
             for (size_t j = i + 1; j < decl->templateParams.size(); j++) {
-                if (!decl->templateParams[j].hasDefault) {
+                if (!decl->templateParams[j]->hasDefault) {
                     errorAt(current(), std::format(
                         "template parameter '{}' must have a default argument "
                         "because '{}' (declared before it) has one",
-                        decl->templateParams[j].name, decl->templateParams[i].name));
+                        decl->templateParams[j]->name, decl->templateParams[i]->name));
                 }
             }
             break;
         }
     }
 
-    // 把【类型形参名】压入模板形参作用域，使模板体解析期间
-    // parseType 能把裸 T 识别为 TemplateParam 节点。
-    // 对应 clang: Parser 进入模板声明时压入 TemplateParameterDepth
-    // （Sema::TemplateParameterScope），模板体解析完（此处为函数返回前）弹出。
-    // 只压 Type 形参：NTTP 名字（如 int N 的 N）不是类型名，不能当类型用。
-    size_t scopeBase = m_templateParamScope.size();
-    for (const auto& param : decl->templateParams) {
-        if (param.kind == TemplateParamKind::Type) {
-            m_templateParamScope.push_back(param.name);
-            std::cout << std::format("  [parse:template]   ↗ push tparam '{}' into scope\n",
-                param.name);
-        }
-    }
+    // （形参已在上面的循环里逐个注册进 frame —— 时机是"默认实参解析之后"，
+    //   见循环内的说明。此处无需任何动作：frame 是栈上局部对象，
+    //   函数返回时析构自动出栈。）
 
     // 解析模板体：类模板 或 函数模板（S1+）
     // 分派依据：template<...> 之后的第一个 Token
@@ -1055,7 +1119,12 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     // 模板体解析完毕，弹出本层形参作用域（与上方 push 配对）。
     // 教学取舍：不实现嵌套模板（template<template> 套娃）的逐层作用域栈深度，
     // 但用 size 恢复而非 clear，天然支持未来嵌套。
-    m_templateParamScope.resize(scopeBase); // 这里就是弹出刚才push 进去的元素
+    // ── 帧出栈 ──
+    // ★ 这里【什么都不用写】：`frame` 是栈上局部对象，函数返回时析构，
+    //   析构里回写 m_currentFrame = parent 完成出栈。
+    //   异常路径由栈展开同样保证 —— 对照 clang 的 MultiParseScope。
+    //   （此前这里是 `m_templateParamScope.resize(scopeBase);` 手工配对：
+    //    一旦中途 error()/errorAt() 抛异常（[[noreturn]]）就不会执行。）
     std::cout << "  [parse:template]   ↘ tparam scope popped\n";
 
     return decl;

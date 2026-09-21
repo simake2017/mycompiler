@@ -1239,8 +1239,22 @@ void CodeGen::visit(AssignStmt& stmt) {
                 if (objType->isClass()) {
                     auto field = objType->classLayout.findField(mem->memberName);
                     if (field) {
-                        emit(std::format("movl %eax, {}(%rcx)    # 写入字段 .{}（偏移 +{}）",
-                            field->offset, mem->memberName, field->offset));
+                        // ★ 按字段宽度选指令 —— 与读路径（本文件 :1960 一带）对称。
+                        // 历史 bug：此处曾硬编码 movl（4B），给 8B 字段（指针/引用/
+                        //   long）赋值时高 32 位被直接截掉。症状是"写得进、读出来错"：
+                        //   读路径按 8B 用 movq，于是读回 {低 32 位正确 + 高 32 位垃圾}。
+                        //   复现：`PtrBox<int> q; q.p = pv;` 之后 q.p != pv
+                        //   （tests/tmpl/test_tmpl_53 的 ②，一度被误判成默认实参的锅）。
+                        //   此前没暴露：从没有用例给 8B 字段赋过值。
+                        // size <= 4 保持原指令与原注释文案不动 —— 避免无谓的
+                        //   汇编/日志漂移（本项目日志即契约，见 logdiff.sh）。
+                        if (field->size <= 4) {
+                            emit(std::format("movl %eax, {}(%rcx)    # 写入字段 .{}（偏移 +{}）",
+                                field->offset, mem->memberName, field->offset));
+                        } else {
+                            emit(std::format("movq %rax, {}(%rcx)    # 写入字段 .{}（偏移 +{}，8B）",
+                                field->offset, mem->memberName, field->offset));
+                        }
                         return;
                     }
                 }

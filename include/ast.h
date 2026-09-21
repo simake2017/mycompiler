@@ -789,6 +789,18 @@ struct TemplateParam {
     SourceLocation    location;
 };
 
+// ── 模板形参以【指针】形式持有（对应 clang 的 TemplateParameterList）────────
+// clang：TemplateParameterList 用 TrailingObjects 内联存 `NamedDecl*` 数组，
+//   节点由 TemplateTypeParmDecl::Create 分配在 ASTContext 的 BumpPtrAllocator
+//   （arena）上 —— 永不移动、永不单独释放，故缓存形参指针永远安全。
+// 本项目没有 arena，用 shared_ptr 拿到同样的两个性质：
+//   ① 节点不随容器扩容而搬家（vector 扩容搬的是【指针值】，不是节点本身）；
+//   ② 节点生命周期覆盖全部引用方（对应 clang 靠 arena 兜底的那一半）。
+// 【为什么必须改成指针】值语义时元素住在 vector 的堆块里，解析期一路
+//   push_back 会 reallocate，任何先前取得的 `const TemplateParam*` 立刻悬空
+//   —— 而模板形参作用域的查询恰恰发生在 push_back 进行中（见 parser.h 的帧）。
+using TemplateParamPtr = std::shared_ptr<TemplateParam>;
+
 // ─── 模板声明的种类（[temp.class.spec] / [temp.expl.spec]）──────────────────
 // 一个类模板可以有三种"版本"，同名共存，靠实参匹配择优：
 //
@@ -826,7 +838,7 @@ enum class TemplateSpecKind {
 // 【与普通函数的本质区别】没有函数体、没有符号、不参与重载决议 ——
 //   它是编译期的纯映射规则，用完即弃。
 struct DeductionGuideDecl : Declaration {
-    std::vector<TemplateParam> templateParams;  // 指引自身的模板形参（可为空）
+    std::vector<TemplateParamPtr> templateParams;  // 指引自身的模板形参（可为空）
     std::string                guideName;       // 被指引的类模板名（如 "MyPtr"）
     std::vector<Parameter>     parameters;      // 指引的形参表（推导模式 P）
     std::vector<TypePtr>       targetArgs;      // `->` 右侧的实参（含模板形参）
@@ -839,7 +851,7 @@ using DeductionGuideDeclPtr = std::shared_ptr<DeductionGuideDecl>;
 
 struct TemplateDecl : Declaration {
     std::vector<std::string>   typeParams;     // 模板参数名列表（如 ["T", "N"]，向后兼容）
-    std::vector<TemplateParam> templateParams; // 结构化模板形参列表（含类型/非类型区分）
+    std::vector<TemplateParamPtr> templateParams; // 结构化模板形参列表（含类型/非类型区分）
     ClassDeclPtr               classTemplate;  // 类模板蓝图（与 funcTemplate 互斥）
     FuncDeclPtr                funcTemplate;   // 函数模板蓝图（S1+）
     TypeAliasDeclPtr           aliasTemplate;  // 别名模板蓝图：template<T> using X = ...;

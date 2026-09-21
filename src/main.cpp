@@ -760,7 +760,7 @@ int main(int argc, char* argv[]) {
                 // 否则 template<int N> 会落进下面的「1 个类型形参」分支，
                 // 被硬塞 6 个类型实参（含 int&/int&&），触发形态校验失败。
                 if (tmpl->typeParams.size() == 1
-                    && tmpl->templateParams[0].kind == TemplateParamKind::NonType) {
+                    && tmpl->templateParams[0]->kind == TemplateParamKind::NonType) {
                     // 单 NTTP 模板：Buf<4> —— 值替换的完整演示
                     std::cout << std::format(
                         "\n  ─── Instantiation (NTTP): {}<4> ───\n",
@@ -817,7 +817,7 @@ int main(int argc, char* argv[]) {
                     // 旧实现一律传 double，对 template<class T, int N> 会传入
                     // 一个类型实参去填 NTTP 槽 —— 正是本次修复要消除的错位。
                     // 现按 templateParams[1].kind 决定第二实参是类型还是值。
-                    const TemplateParam& p2 = tmpl->templateParams[1];
+                    const TemplateParam& p2 = *tmpl->templateParams[1];
                     if (p2.kind == TemplateParamKind::NonType) {
                         std::cout << std::format(
                             "\n  ─── Instantiation: {}<int, 8> (NTTP) ───\n",

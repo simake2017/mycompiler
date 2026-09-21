@@ -153,7 +153,12 @@ bool TemplateDeducer::matchPattern(
         // argIsLValue 传 true：类模板特化模式里的引用（Box<T&>）按"可绑定"处理，
         // 不做函数调用那套左值/右值绑定检查（那是 [temp.deduct.call] 的规则）。
         // 注：上面已单独把关"引用必须对引用"，故此处继续传 true 是安全的。
-        if (!deducePair(P, args[i], /*argIsLValue=*/true, paramNames, subst, out)) {
+        // ★ structuralMatch 传 true：本次是【偏特化的结构等价】而非调用的实参推导，
+        //   必须关掉 [temp.deduct.call]/3 的万能引用规则 —— 否则 `Kind<T&&>` 匹配
+        //   `Kind<int&&>` 时会把 T 绑成 int&（它把"实参是引用"当成了"实参是左值"）。
+        //   两个标志分开传，正是为了让"松紧"与"适用哪套规则"各归各位。
+        if (!deducePair(P, args[i], /*argIsLValue=*/true, paramNames, subst, out,
+                        /*structuralMatch=*/true)) {
             failReason = out.failureReason;
             return false;
         }
@@ -346,7 +351,7 @@ bool TemplateDeducer::bind(const std::string& paramName, const TypePtr& type,
 //   → 裸 T 绑定 ⇒ T := int ✓
 bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsLValue,
                                  const std::vector<std::string>& paramNames,
-                                 Subst& subst, DeductionResult& out) {
+                                 Subst& subst, DeductionResult& out, bool structuralMatch) {
     if (!P || !A) {
         out.failureReason = "internal: null type in deduction";
         return false;
@@ -363,7 +368,7 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
     if (TypePtr desugared = desugarAlias(P, subst); desugared != P) {
         std::cout << std::format("  [deduction]   P={:<12} ⇒ 别名解糖为 {}\n",
             pStr, desugared->toString());
-        return deducePair(desugared, A, argIsLValue, paramNames, subst, out);
+        return deducePair(desugared, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
     // ── P = const X：剥 P 的顶层 const ──
@@ -372,7 +377,7 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
     // 若 const 在内层（如 const T*）则不会被这里剥掉，随递归继续参与推导。
     if (P->isConst()) {
         std::cout << std::format("  [deduction]   P={:<12} A={:<12} ⇒ 剥顶层 const\n", pStr, aStr);
-        return deducePair(P->innerType, A, argIsLValue, paramNames, subst, out);
+        return deducePair(P->innerType, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
     // ── P = T&：左值引用参数，实参必须左值 ──
@@ -386,22 +391,38 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
             std::cout << std::format("  [deduction]   ✗ {}\n", out.failureReason);
             return false;
         }
-        return deducePair(P->referencedType, A, argIsLValue, paramNames, subst, out);
+        return deducePair(P->referencedType, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
     // ── P = T&&：万能引用（forwarding reference）──
     // 左值实参 ⇒ T := A&（实例化时 T&& 折叠为 A&）；右值实参 ⇒ T := A
     // 标准依据：[temp.deduct.call]/3——P 为"模板参数的右值引用"且实参为左值时，
     // 推导把 A 按左值引用处理（即 T := A&）；这是 std::forward 完美转发的根基。
+    //
+    // ★ A 可能【本身已是引用类型】，这里不能天真地再套一层 '&'：
+    //   [expr.type]/1 规定表达式永远没有引用类型（引用在确定表达式类型时被剥掉），
+    //   所以 clang 里 A 到这一步已是裸类型，`getLValueReferenceType(A)` 天然不产生嵌套。
+    //   但本实现的 A 取自变量的【声明类型】——`int& rr` 交给这里的 A 就是 `int&`，
+    //   再套一层即得嵌套引用 `int& &`。实测后果：同一调用点
+    //     id(a)  → T := int&    → 符号 _Z2idIRiE
+    //     id(rr) → T := int& &  → 符号 _Z2idIRRiE   ← clang 只产出前者
+    //   即"同一个函数模板被实例化两次"。
+    //   ★ 修复不在这里补剥壳，而是由 Type::makeLValueReference 按 [dcl.ref]/6
+    //     在构造点折叠（`int&` 套左值引用 → 仍是 `int&`）—— 折叠规则只写一份。
+    // ★ 万能引用是【调用】独有的规则（[temp.deduct.call] 的标题就是 "Deducing
+    //   template arguments from a function call"）。类模板偏特化匹配不做调用，
+    //   只做结构等价，故 structuralMatch 时【必须跳过】下面这个绑定分支 ——
+    //   否则 `Kind<T&&>` 匹配 `Kind<int&&>` 会 bind 出 T := int&（把"实参是引用"
+    //   当成了"实参是左值"），而正确答案是 T := int。
     if (P->isRValueReference()) {
         TypePtr inner = P->referencedType;
-        if (isTemplateParamName(inner, paramNames) && argIsLValue) {
+        if (!structuralMatch && isTemplateParamName(inner, paramNames) && argIsLValue) {
             std::cout << std::format(
                 "  [deduction]   P={:<12} A={:<12} (lvalue) ⇒ 万能引用折叠路径\n", pStr, aStr);
             return bind(paramKey(inner), Type::makeLValueReference(A),
                         subst, out, pStr, aStr);
         }
-        return deducePair(inner, A, argIsLValue, paramNames, subst, out);
+        return deducePair(inner, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
     // ── P = T*：实参必须是指针，递归 pointee ──
@@ -415,7 +436,7 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
             std::cout << std::format("  [deduction]   ✗ {}\n", out.failureReason);
             return false;
         }
-        return deducePair(P->pointeeType, A->pointeeType, argIsLValue, paramNames, subst, out);
+        return deducePair(P->pointeeType, A->pointeeType, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
     // ── P = T（裸模板参数，值传递）──
@@ -479,7 +500,7 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
                     out.trace.push_back({pStr, aStr, out.failureReason, false});
                     return false;
                 }
-                if (!deducePair(pa.type, aa.type, argIsLValue, paramNames, subst, out))
+                if (!deducePair(pa.type, aa.type, argIsLValue, paramNames, subst, out, structuralMatch))
                     return false;
                 continue;
             }

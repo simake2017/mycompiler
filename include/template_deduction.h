@@ -124,9 +124,21 @@ public:
     //   当模式、构造实参当被推项，直接调它做逐位合一 —— 见
     //   SemanticAnalyzer::deduceClassTemplateArgs。CTAD 与函数模板推导
     //   共用这一个核心，正是"同一套合一算法换个方向用"的落地点。
+    // structuralMatch：本次合一是【类模板偏特化的结构等价】还是【调用的实参推导】。
+    //   ★ 两者的差别不是"松紧"，而是【适用哪一套规则】：
+    //     · 调用（false，默认）：适用 [temp.deduct.call] 全套调整，含
+    //       /3 的万能引用规则 —— P 是"模板参数的右值引用"且实参左值时，T := A&。
+    //     · 偏特化匹配（true）：只做 [temp.class.spec.match]/2 的结构等价，
+    //       `T&&` 模式对 `int&&` 实参 ⇒ T := int（剥掉实参那层引用），
+    //       绝不能套用万能引用规则 —— 那会 bind 出 T := int&，
+    //       使 `Kind<T&&>` 匹配 `Kind<int&&>` 时把 T 绑成 int&（错）。
+    //   之所以要显式区分：matchPattern 为了跳过左值/右值绑定检查而传
+    //   argIsLValue=true，而 argIsLValue 恰好【同时】是万能引用分支的开关，
+    //   一个标志被两套规则共用 ⇒ 关掉一个必然误开另一个。
     bool deducePair(const TypePtr& P, const TypePtr& A, bool argIsLValue,
                     const std::vector<std::string>& paramNames,
-                    Subst& subst, DeductionResult& out);
+                    Subst& subst, DeductionResult& out,
+                    bool structuralMatch = false);
 
 private:
     // 模式位里的别名模板 id 解糖：`Vec<T>` → `MyPtr<T>`（[temp.alias]/1）。

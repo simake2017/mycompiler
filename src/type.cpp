@@ -73,10 +73,34 @@ TypePtr Type::makePointer(TypePtr pointee) {
     return t;
 }
 
+// ── 引用折叠（[dcl.ref]/6）：★ 在【构造点】就规范化，不留给调用方 ──
+// 四行合一：只要有一层是左值引用，结果就是左值引用。
+//     T&  &  → T&      T&  && → T&      T&& &  → T&      T&& && → T&&
+// 【为什么必须放在这里】引用折叠不是"替换时顺手做的一步"，而是【引用类型的不变量】：
+//   造引用的地方有四处 —— 模板替换（substituteType）、实参推导的万能引用 bind、
+//   Parser 的声明符、Sema。早先只在 substituteType 里折叠，等于把规范化绑死在【一条】
+//   路径上，别处造出的嵌套引用无人收拾：
+//     · 推导 `T := A&` 时 A 本身已是引用（变量的声明类型）⇒ 得到 `int& &` 这种
+//       非法结构，观测量是同一函数被实例化出两个符号（_Z2idIRiE / _Z2idIRRiE）。
+//   放进工厂函数后，"不存在嵌套引用节点"成为类型系统的不变量，四"处"变成零"处"。
+// 对照 clang：折叠的唯一实现点是 Sema::BuildReferenceType
+//   （clang/lib/Sema/SemaType.cpp:1887），函数注释直接引 [dcl.ref]p6，规则一行：
+//     bool LValueRef = SpelledAsLValue || T->getAs<LValueReferenceType>();
+//   clang 允许"拼写形式"保留嵌套节点，但其 canonical type 在
+//   ASTContext::getLValueReferenceType（clang/lib/AST/ASTContext.cpp:4163-4166）
+//   构造时就把内层引用剥掉 —— 同一个思想：规范化在类型诞生的那一刻完成。
+// ★ 顺带说明：本实现没有 canonical type 概念，日志/符号/比较吃的是同一份结构，
+//   所以这里直接返回折叠后的规范形式（而非嵌套形式）。
+//
 // 左值引用 T&。入参 referenced = 被引用的内层类型。
 // demo：makeLValueReference(Int) → LValueReference(Int)，toString="int&"，encodeType→"Ri"
-// 注意：若 referenced 本身已是引用，则构成嵌套引用，实例化时由引用折叠处理。
 TypePtr Type::makeLValueReference(TypePtr referenced) {
+    // T& & → T&：内层已是左值引用，直接复用（结构共享，不造新节点）
+    if (referenced->isLValueReference()) return referenced;
+    // T&& & → T&：'&' 赢 —— 剥掉内层的 '&&'，结果仍是左值引用
+    // （递归调用而非直接取 referencedType，是为了对"万一存在的更深处嵌套"自愈）
+    if (referenced->isRValueReference()) return Type::makeLValueReference(referenced->referencedType);
+
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::LValueReference;
     t->name = referenced->toString() + "&";
@@ -86,8 +110,14 @@ TypePtr Type::makeLValueReference(TypePtr referenced) {
 
 // 右值引用 T&&。入参 referenced = 被引用的内层类型。
 // demo：makeRValueReference(Int) → RValueReference(Int)，toString="int&&"，encodeType→"Oi"
-// 当 T 是模板参数时 T&& 是"万能引用"（[temp.deduct.call]）；折叠规则见 type.h。
+// 当 T 是模板参数时 T&& 是"万能引用"（[temp.deduct.call]）。
 TypePtr Type::makeRValueReference(TypePtr referenced) {
+    // [dcl.ref]/6：右值引用套在【任何】引用上，结果都是那个内层引用本身
+    //   T&  && → T&      T&& && → T&&
+    // 即"内层是什么就还是什么"—— 故直接返回内层，无需区分左右值。
+    // （注意与左值引用的区别：那个是"剥壳取左值"，这个是"原样返回"。）
+    if (referenced->isReference()) return referenced;
+
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::RValueReference;
     t->name = referenced->toString() + "&&";

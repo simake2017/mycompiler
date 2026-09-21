@@ -320,8 +320,15 @@ struct ClassLayout {
 //        template<typename T> void foo(T&& x);
 //        foo(42);   ⇒ T=int,   T&& = int&&           （右值引用）
 //        foo(var);  ⇒ T=int&,  T&& = int& && → int&   （折叠为左值引用）
-//   折叠不在本文件实现，由 TemplateInstantiator::substituteType 完成
-//   （src/template_instantiation.cpp:280），但被折叠的对象正是这里的 Type 节点。
+//   ★ 折叠是【引用类型的不变量】，在构造点完成 —— 见 src/type.cpp 的
+//     Type::makeLValueReference / makeRValueReference（[dcl.ref]/6 四行合一）。
+//     早先只在 TemplateInstantiator::substituteType 里折叠，等于把规范化绑死在
+//     一条路径上：推导万能引用时 bind 出的 `T := A&`（A 本身已是引用）没人收拾，
+//     于是系统里出现非法的嵌套引用节点 `int& &`（伪造符号 _Z2idIRRiE）。
+//     集中到工厂函数后，"不存在嵌套引用节点"成为类型系统的不变量。
+//     对照 clang：Sema::BuildReferenceType（clang/lib/Sema/SemaType.cpp:1887）
+//     是折叠的唯一实现点，canonical type 在构造时即算好
+//     （ASTContext::getLValueReferenceType，clang/lib/AST/ASTContext.cpp:4163）。
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────

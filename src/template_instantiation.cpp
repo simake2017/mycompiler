@@ -245,7 +245,7 @@ ClassDeclPtr TemplateInstantiator::instantiate(
         //                                      → { "T"→{Type,int}, "N"→{Integral,8} }
         //    混排天然可处理——因为分派依据是每一位形参自己的 kind，而非实参长相。
         for (size_t i = 0; i < params.size(); i++) {
-            const TemplateParam& p = params[i];
+            const TemplateParam& p = *params[i];
 
             // 形态自检（SemanticAnalyzer::checkTemplateArguments 已把过关，
             // 此处是 TemplateInstantiator 被直接调用时的兜底）
@@ -356,10 +356,10 @@ ClassDeclPtr TemplateInstantiator::instantiate(
         params.empty() ? "?" :
             [&]() { std::string s; for (size_t i = 0; i < params.size(); i++) {
                 if (i > 0) s += ", ";
-                s += (params[i].kind == TemplateParamKind::Type)
-                         ? "typename " + params[i].name
-                         : (params[i].nonType ? params[i].nonType->toString() : "?")
-                               + " " + params[i].name;
+                s += (params[i]->kind == TemplateParamKind::Type)
+                         ? "typename " + params[i]->name
+                         : (params[i]->nonType ? params[i]->nonType->toString() : "?")
+                               + " " + params[i]->name;
             } return s; }(),
         kindTag);
     if (templateDecl->isSpecialization()) {
@@ -641,12 +641,19 @@ TypePtr TemplateInstantiator::substituteType(
             type->referencedType->toString());
         TypePtr newInner = substituteType(type->referencedType, subst);
 
-        // 引用折叠：如果替换后的类型本身也是引用，需要折叠
-        if (newInner->isLValueReference() || newInner->isRValueReference()) {
-            // T& & → T&  或  T&& & → T&
+        // ── 引用折叠（[dcl.ref]/6）：替换后的内层若本身是引用，外层这个 '&' 要与之折叠 ──
+        //     T& &  → T&          T&& & → T&      —— 只要有一层左值引用，结果就是左值引用
+        // ★ 结果必须【重新构造】，不能 `return newInner`：
+        //   早先此处写的是 `return newInner; // & 总是赢`，而 newInner 是右值引用时
+        //   它把 '&&' 原样返回了 —— 注释写着"& 赢"，代码却让 newInner 赢。
+        //   实测：`Ref<int&&>` 的成员 `T& r` 被判成 `int&&`（clang 给的是 `int&`，
+        //   见 tests/tmpl/test_tmpl_52_reference_collapsing.cpp）。
+        //   makeLValueReference 内部已按 [dcl.ref]/6 归一，"& 赢"这条规则只写一份。
+        if (newInner->isReference()) {
+            TypePtr folded = Type::makeLValueReference(newInner);
             std::cout << std::format("    [subst] ★ Reference collapsing: {}& → {} (& wins)\n",
-                newInner->toString(), newInner->toString());
-            return newInner; // & 总是赢
+                newInner->toString(), folded->toString());
+            return folded;
         }
 
         if (newInner != type->referencedType) {

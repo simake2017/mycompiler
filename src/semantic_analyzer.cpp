@@ -270,7 +270,7 @@ bool SemanticAnalyzer::classSpecAtLeastAsSpecialized(const TemplateDeclPtr& a,
 
     // ② b 的形参名列表 —— 只有它们才是可绑定的"变量"
     std::vector<std::string> paramNames;
-    for (const auto& p : b->templateParams) paramNames.push_back(p.name);
+    for (const auto& p : b->templateParams) paramNames.push_back(p->name);
 
     // ③ 拿合成实参去推 b 的模式
     // ★ SFINAE 吸收点 ③（全项目三处之一，见 include/sfinae.h 的收口点一览）
@@ -534,7 +534,7 @@ TypePtr SemanticAnalyzer::deduceClassTemplateArgs(const VarDeclStmt& decl) {
         for (auto& g : git->second) {
             std::unordered_map<std::string, TypePtr> subst;
             std::vector<std::string> gParams;
-            for (auto& p : g->templateParams) gParams.push_back(p.name);
+            for (auto& p : g->templateParams) gParams.push_back(p->name);
             if (!tryGuide(g->parameters, gParams, "推导指引", subst)) continue;
 
             // 指引的 targetArgs 是"用推导结果参数化"的实参表
@@ -619,7 +619,7 @@ TypePtr SemanticAnalyzer::expandAliasTemplate(
     // ── 逐位绑定：形参名 → 实参（tagged：类型与 NTTP 值混排）──
     TemplateInstantiator::TypeSubstitution subst;
     for (size_t i = 0; i < args.size(); i++) {
-        const auto& param = decl->templateParams[i];
+        const TemplateParam& param = *decl->templateParams[i];
         const auto& arg   = args[i];
 
         // kind 校验（[temp.arg]/1）：类型形参收类型实参，非类型形参收值。
@@ -3933,11 +3933,11 @@ void SemanticAnalyzer::checkTemplateArguments(
     }
     if (args.size() < params.size()) {
         for (size_t i = args.size(); i < params.size(); i++) {
-            if (!params[i].hasDefault) {
+            if (!params[i]->hasDefault) {
                 error(std::format(
                     "class template '{}' expects at least {} argument(s) "
                     "(parameter '{}' has no default), but {} given",
-                    tname, i + 1, params[i].name, args.size()), loc);
+                    tname, i + 1, params[i]->name, args.size()), loc);
             }
         }
     }
@@ -3946,7 +3946,7 @@ void SemanticAnalyzer::checkTemplateArguments(
     // 第 i >= args.size() 位留空是合法的，只要它有默认实参 ——
     // 由 checkTemplateArguments 上方的个数检查把关，这里不再重复。
     for (size_t i = 0; i < std::min(params.size(), args.size()); i++) {
-        const TemplateParam& p = params[i];
+        const TemplateParam& p = *params[i];
         const TemplateArg&   a = args[i];
 
         // 该位"期望什么"的可读描述（供两向报错复用）
@@ -4106,7 +4106,7 @@ SemanticAnalyzer::selectClassTemplate(
             for (const auto& spec : it->second) {
                 // 偏特化的形参名列表（用于识别模式里的可绑定未知量）
                 std::vector<std::string> paramNames;
-                for (const auto& p : spec->templateParams) paramNames.push_back(p.name);
+                for (const auto& p : spec->templateParams) paramNames.push_back(p->name);
 
                 std::unordered_map<std::string, TypePtr> subst;
                 std::string reason;
@@ -4263,11 +4263,40 @@ TypePtr SemanticAnalyzer::getOrInstantiateClass(
     std::vector<TemplateArg> fullArgs = templateIdType->templateArgs;
     if (fullArgs.size() < primary->templateParams.size()) { //wangyang 这里属于将模板参数缺失的参数也带进来
         for (size_t i = fullArgs.size(); i < primary->templateParams.size(); i++) {
-            const TemplateParam& p = primary->templateParams[i];
-            fullArgs.push_back(p.defaultArg);
+            const TemplateParam& p = *primary->templateParams[i];
+
+            // ── ★ 默认实参可能是【依赖】的：先用已绑定的前 i 位替换一遍 ──
+            // demo: template<class T, class U = T> struct Box { T a; U b; };
+            //       Box<int> 里 U 的默认值 `T` 必须当场变成 int。
+            // 【为什么非做不可】默认实参在蓝图里是以【依赖形式】存着的
+            //   （这里就是 TemplateParam("T") 本身），不替换直接塞进 fullArgs，
+            //   下游会连锁答错而且一声不吭：
+            //     实例名成 Box_int_T（而非 Box_int_int）、
+            //     字段 b 的替换结果停在裸的 T 上（大小 0 字节）。
+            //   这正是 CLAUDE.md 记的「替换 ≠ 实例化」：替换完还得落地成具体类型。
+            // 对照 clang：[temp.param]/12 的默认实参在【使用点】才实例化
+            //   （Sema::SubstDefaultTemplateArgument），蓝图里存依赖形式是对的，
+            //   缺的就是这一步。
+            // 前 i 位（即 fullArgs 里已有的）都能用：显式给的那部分 + 前面刚补上的。
+            TemplateArg filled = p.defaultArg;
+            if (i > 0 && filled.isType() && filled.type) {
+                TemplateInstantiator::TypeSubstitution prior;
+                for (size_t j = 0; j < i; j++) {
+                    prior[primary->templateParams[j]->name] = fullArgs[j];
+                }
+                TypePtr resolved = m_instantiator.substituteType(filled.type, prior);
+                if (resolved != filled.type) {
+                    std::cout << std::format(
+                        "  [sema:targ] ⤷ default argument '{}' is dependent: {} → {}\n",
+                        p.name, filled.type->toString(), resolved->toString());
+                    filled = TemplateArg::ofType(resolved);
+                }
+            }
+
+            fullArgs.push_back(filled);
             std::cout << std::format(
                 "  [sema:targ] ⤷ default argument filled: '{}' := {}\n",
-                p.name, p.defaultArg.toString());
+                p.name, filled.toString());
         }
     }
 

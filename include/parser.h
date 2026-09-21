@@ -66,12 +66,50 @@ private:
     std::vector<Token> m_tokens;   // 完整 Token 序列（含末尾哨兵 Eof）
     size_t             m_pos = 0;  // 游标：下一个待消费的 Token 下标
 
-    // ── 模板形参名作用域（对应 clang Sema 的 TemplateParameterDepth/上下文栈）──
-    // parseTemplateDecl 收集完 template<...> 形参后把【类型形参名】压入，
-    // 解析模板体（含类模板成员）期间有效，解析完弹出。
-    // parseType 据此把裸标识符区分为 TemplateParam("T") 而非 Class("T")。
-    std::vector<std::string> m_templateParamScope;
-    bool isInTemplateParamScope(const std::string& name) const;
+    // ── 模板形参作用域：帧链（对应 clang 的 Scope::TemplateParamScope 链）──
+    // 【clang 怎么做的】模板形参作用域**不是**独立容器，而是复用了统一的
+    //   Scope 链：Scope::TemplateParamScope 只是 Scope 的一个【种类位】
+    //   （clang/include/clang/Sema/Scope.h:81），Sema::ActOnTypeParameter
+    //   末尾用 S->AddDecl(Param) 把形参挂进当前 Scope 的声明链
+    //   （SemaTemplate.cpp:1074），进出由 MultiParseScope 这个 RAII 对象负责
+    //   （ParseTemplate.cpp:332）。⇒ "内层优先"是 Scope 链的天然性质，
+    //   clang 不需要手写 parent 指针。
+    // 本项目没有通用 Scope 类，故用等价的【帧链】模拟：一个 template<...>
+    //   一份帧，parent 指针代替 Scope::getParent()。
+    //
+    // 【为什么帧是栈上局部对象】生命周期 == 该 template 声明的解析范围：
+    //   构造即入栈、析构即出栈，异常路径由栈展开自动保证恢复。
+    //   取代了此前 `scopeBase`/`resize` 的手工配对 —— 那种写法在
+    //   error()/errorAt() 抛异常（[[noreturn]]）时会漏掉恢复动作。
+    //   对照 clang：MultiParseScope 同样是"构造 Enter、析构 Exit"。
+    struct TemplateParamFrame {
+        const TemplateDecl* owner  = nullptr;  // 归属：这是哪个 template<>
+        size_t              count  = 0;        // 已注册形参个数（随解析推进增长）
+        TemplateParamFrame* parent = nullptr;  // 外层帧（clang: Scope::getParent()）
+        Parser*             parser = nullptr;  // 出栈时回写 m_currentFrame
+
+        TemplateParamFrame(Parser* p, const TemplateDecl* d)
+            : owner(d), parent(p->m_currentFrame), parser(p) {
+            p->m_currentFrame = this;                        // ← 入栈
+        }
+        ~TemplateParamFrame() {
+            if (parser) parser->m_currentFrame = parent;     // ← 出栈
+        }
+        TemplateParamFrame(const TemplateParamFrame&) = delete;
+        TemplateParamFrame& operator=(const TemplateParamFrame&) = delete;
+    };
+
+    // 当前帧（无模板上下文时为 nullptr）—— 对应 clang 的"当前 Scope"
+    TemplateParamFrame* m_currentFrame = nullptr;
+
+    // 查模板形参：从内层往外层走（内层优先），返回形参本身而非 bool。
+    // 对照 clang：Sema 的名字查找沿 Scope 链上行。
+    //
+    // ★ 每次【现取】&owner->templateParams[i]，绝不缓存指针 —— count 是
+    //   下标（vector 扩容后依然有效），而指针不是。即便 ast.h 已把元素改成
+    //   shared_ptr（节点本身不再搬家），这里仍保留"现取"写法：
+    //   少一个必须记住的不变量。
+    const TemplateParam* lookupTemplateParam(const std::string& name) const;
 
     // ── Token 流操作（LL(1) 前瞻的底层设施）──
     // 前瞻（lookahead）：不移动游标，查看当前 Token，据此决定走哪条产生式分支。
