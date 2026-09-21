@@ -81,14 +81,31 @@ do_build() {
     echo "  ✅      ${TARGET} 构建完成 ($(du -h "${TARGET}" | cut -f1))"
 }
 
+# ── 并行度：★ 默认 -j2，不要改成 -j$(nproc) ──
+# 【为什么封顶】本机 8 核 / 15Gi 内存，但常驻着别的负载（clangd×3 就占 ~3GB、
+#   多开 IDE 与其它会话），实测可用内存常只剩 3GB 上下。
+#   而单个重量级 TU（semantic_analyzer.cpp）峰值 RSS ≈ 326MB ——
+#   -j8 就是 8 × 326MB ≈ 2.6GB，正好顶穿可用内存 ⇒ 进 swap ⇒ 整机卡死十几分钟。
+#   （2026-09-21 实测：一次 `cmake --build build-linux -j$(nproc)` 把机器拖死到
+#     load average 87，命令被超时中断。）
+# 需要更快时用环境变量覆盖，并先 `free -h` 看一眼：
+#     JOBS=4 ./build.sh test
+JOBS="${JOBS:-2}"
+
 do_test() {
     if [ ! -f "${TARGET}" ]; then
         do_build
     fi
-    echo "  TEST    全量回归测试"
-    cmake --build build-linux -j$(nproc) 2>/dev/null && \
-        ctest --test-dir build-linux --output-on-failure || \
-        echo "  ⚠️       build-linux 不存在或 ctest 失败，跳过"
+    echo "  TEST    全量回归测试（并行度 -j${JOBS}，覆盖：JOBS=N ./build.sh test）"
+    if [ ! -d build-linux ]; then
+        echo "  ⚠️       build-linux 不存在，跳过"
+        return 0
+    fi
+    if ! cmake --build build-linux -j"${JOBS}"; then
+        echo "  ❌      构建失败，跳过测试"
+        return 1
+    fi
+    ctest --test-dir build-linux --output-on-failure
 }
 
 case "${1:-build}" in
