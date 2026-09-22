@@ -1,18 +1,19 @@
 // =============================================================================
 // 阶段 4：模板实例化引擎实现（理论见 docs/learn/05、13、18、27）
 // =============================================================================
-// 实例化 = 结构化替换 [temp.subst]：由模板蓝图深拷贝一份 AST，把每个类型位置的
-// 形参换成实参。不是文本替换 —— 复合类型（T*/T&/const T）由 substituteType 递归处理。
-//
-// demo: MyPtr<int> ⇒ 找蓝图 ⇒ 深拷贝类 AST ⇒ {T := int} 替换 ⇒ 新类 MyPtr_int
-//                   ⇒ mangled 符号 _Z5MyPtrIiE ⇒ 注册为真实类
+// 实例化 = 结构化替换 [temp.subst]：深拷贝蓝图 AST，逐【类型位置】换实参；复合类型
+//   （T*/T&/const T）由 substituteType 递归处理，不是文本替换。
+// 蓝图写法 ⇒ 实例（MyPtr<int>，{T := int}）：
+//   class MyPtr<T>   ⇒ 深拷贝类 AST ⇒ 新类 MyPtr_int ⇒ 符号 _Z5MyPtrIiE ⇒ 注册为真实类
+//   T* data          ⇒ int* data              │ T& get() ⇒ int& get()
+//   return N;（NTTP）⇒ return 4;（表达式位置在 cloneExpr 里替换）
+//   Vec<T>（别名）    ⇒ 只解糖成 MyPtr<T>，零新类、零新符号（[temp.alias]/1）
 //
 //   管线位置：Sema 发现 MyPtr<int> 的使用（或推导出函数模板实参）后调用本模块；
 //             产出的具体类/函数注册进全局表，供后续语义检查与 CodeGen 使用。
 //   标准章节：[temp.inst] 隐式实例化的触发（用到才实例化）│ [temp.subst] 实参替换
 //             [dcl.ref]/6 引用折叠 │ [temp.alias]/1 别名只解糖不实例化
-//   clang 对照：SemaTemplateInstantiate.cpp ≈ instantiate*
-//               TreeTransform.h            ≈ cloneExpr / cloneStmt
+//   对照 clang：SemaTemplateInstantiate.cpp ≈ instantiate*，TreeTransform.h ≈ cloneExpr/cloneStmt
 // =============================================================================
 
 #include "template_instantiation.h"
@@ -457,8 +458,18 @@ FuncDeclPtr TemplateInstantiator::instantiateFunction(
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型替换 substituteType —— [temp.subst] 的核心（理论见 docs/learn/02、05、27）
 // ─────────────────────────────────────────────────────────────────────────────
-// 深度优先遍历类型树：TemplateParam 叶节点按 subst 换成实参，复合节点（Pointer/
-// LReference/RReference/Const/Class）递归重建，未命中或非依赖则原样返回。
+// 深度优先遍历类型树：按节点种类分派，未命中或非依赖则原样返回。
+//   扫到哪种类型节点 ⇒ 走哪个 Case ⇒ 结果（以 {T := int} 为例）：
+//     TemplateParam("T") ⇒ Case 1   ⇒ int（不在表中则原样保留，如外层模板的形参）
+//     decltype(e)        ⇒ Case 1.5 ⇒ 替换 e 后求值（延迟求值的兑现时刻）
+//     T*                 ⇒ Case 2   ⇒ int*（pointee 无变化则复用原节点）
+//     T&                 ⇒ Case 3   ⇒ int&；配 {T := int&} ⇒ int& & 折叠为 int&
+//     T&&                ⇒ Case 4   ⇒ int&&；配 {T := int&} ⇒ int& && 折叠为 int&
+//     const T            ⇒ Case 5   ⇒ const int
+//     typename T::type   ⇒ Case 5.5 ⇒ 查类成员别名（查不到 ⇒ 软失败）
+//     MyPtr<T>           ⇒ Case 5.2 ⇒ MyPtr<int>（实参位替换）
+//     X<int>（别名 id）   ⇒ Case 5.8 ⇒ 解糖（展开失败 ⇒ 软失败）
+//     Class("T")         ⇒ Case 6   ⇒ int（parseType 把裸 T 建成了 Class 节点）
 //
 // ★ 引用折叠 [dcl.ref]/6：T& & / T& && / T&& & ⇒ T&，T&& && ⇒ T&& —— 只要有一层
 //   左值引用，结果就是左值引用。这是万能引用（T&& 形参）的根基：
@@ -881,14 +892,17 @@ ExprPtr TemplateInstantiator::cloneExpr(
         }
 
         // ── 变量引用 ──
-        // ★ NTTP 的值替换发生在【表达式位置】（类型位置在 substituteType）：模板体里的
-        //   裸 NTTP 形参名被 Parser 建成 VarExpr，必须在这里换成整数字面量。
-        // demo: template<int N> class Buf { int size() { return N; } }
-        //       Buf<4> ⇒ cloneExpr(VarExpr{"N"}, {N→Integral:4}) ⇒ IntLiteralExpr{4}
-        //       ⇒ 实例方法体变成 `return 4;`，Sema 与 CodeGen 只见到常量。
-        // 对照 clang：TreeTransform::TransformDeclRefExpr 把指向 NonTypeTemplateParmDecl
-        //   的引用换成已求值的 TemplateArgument（真 C++ 还要过 CheckTemplateArgument
-        //   做常量求值，如 Buf<2+2> 折成 4；本项目不做常量折叠，见 ROADMAP 主线 D）。
+        // ★ NTTP 的值替换发生在【表达式位置】（类型位置才归 substituteType）：模板体里
+        //   裸的 NTTP 形参名由 Parser 建成 VarExpr，在这里换成整数字面量。
+        // 扫到的 VarExpr ⇒ 结果：
+        //   VarExpr{"N"} 替换表里绑的是【值】  ⇒ IntLiteralExpr{4}
+        //       （template<int N> class Buf { int size() { return N; } } 的 Buf<4>
+        //         ⇒ 实例方法体变成 `return 4;`，Sema 与 CodeGen 只见到常量）
+        //   VarExpr{"x"} 绑的是类型或未命中 ⇒ 克隆名字本身
+        // ★ explicitTemplateArgs 必须一并替换：declval<T>() 的 T 挂在 VarExpr{declval,[T]}
+        //   上，只克隆名字会让 decltype 求值阶段看到裸 declval()，T 凭空丢失 ⇒ 探测链断裂。
+        // 对照 clang：TreeTransform::TransformDeclRefExpr 换成已求值的 TemplateArgument
+        //   （真 C++ 还要过 CheckTemplateArgument 做常量折叠，如 Buf<2+2> 折成 4，见 ROADMAP D）
         // ⚠ 已知边界：只按"名字命中 NTTP 形参名"判定，未做作用域检查 —— 模板体内同名
         //   局部变量遮蔽 NTTP 时会被误伤（clang 靠 DeclRefExpr 绑定的 ValueDecl* 区分）。
         case NodeKind::Var: {

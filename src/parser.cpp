@@ -10,20 +10,32 @@
 //   输入 std::vector<Token>；输出 TranslationUnit。
 //   只做结构识别，不查符号表、不做类型检查（那是阶段 3 的职责）。
 //
-// 文法骨架（EBNF）：
-//   translation-unit := declaration*
-//   declaration      := template-decl | class-decl | ['virtual'] function-decl
-//   stmt             := '{' stmt* '}' | 'if' | 'while' | 'return' | var-decl | expr-stmt
-//   expr             := 优先级链 || > && > ==/!= > 比较 > +/- > */% > 一元 > 后缀 > primary
+// 文法骨架（EBNF）：translation-unit := declaration* ；declaration := 'template' | class |
+//   'enum' | 'namespace' | alias | ['virtual'] function | global-var（详见 parser.h）。
+//
+// ── ★ 顶层分派速查：扫到哪个记号 ⇒ 走哪条分支 ⇒ 建出哪种节点 ───────────────
+//   'template'                          ⇒ parseTemplateDecl   ⇒ TemplateDecl
+//   'class' | 'struct'                  ⇒ parseClassDecl      ⇒ ClassDecl
+//   'enum' | 'namespace'                ⇒ parseEnum/Namespace ⇒ EnumDecl / NamespaceDecl
+//   'using' | 'typedef'                 ⇒ parseTypeAliasDecl  ⇒ TypeAliasDecl
+//   IDENT '('（配对右括号后跟 '->'）     ⇒ parseDeductionGuide ⇒ DeductionGuideDecl
+//   ['virtual'] 类型 IDENT '('           ⇒ parseFunctionDecl   ⇒ FunctionDecl
+//   类型 IDENT ['=' expr] ';'            ⇒ parseGlobalVarDecl  ⇒ GlobalVarDecl
+//
+// ── ★ 语句层分派速查（parseStatement）：首 Token ⇒ 分支 ⇒ 节点 ────────────
+//   '{'     ⇒ parseBlockStmt   ⇒ BlockStmt        'if'    ⇒ parseIfStmt     ⇒ IfStmt
+//   'while' ⇒ parseWhileStmt   ⇒ WhileStmt        'return'⇒ parseReturnStmt ⇒ ReturnStmt
+//   'delete'⇒ parseDeleteStmt  ⇒ DeleteStmt
+//   类型关键字 int/double/bool/void/auto | IDENT IDENT | IDENT 后跟 '<'..'>' / '::' /
+//   '*' '&' '&&'   ⇒ parseType + parseVarDeclStmt ⇒ VarDeclStmt
+//   其余                                  ⇒ parseExprOrAssignStmt ⇒ ExprStmt / AssignStmt
 //
 // ★ 歧义一律用「存档游标 → 试探解析 → 失败回滚」（speculative parsing）解决：
 //   类体内「方法 vs 字段」、语句层「声明 vs 表达式」、template-id vs 比较表达式。
 //
-// ── clang 对照（llvm-project/clang/lib/Parse/）──────────────────────────────
-//   Parser.cpp        ParseTopLevelDecl / ParseStatement ≈ parseTranslationUnit / parseStatement
-//   ParseDecl.cpp     ParseDeclOrFunctionDefInternal      ≈ parseFunctionDecl / parseClassDecl
-//   ParseTemplate.cpp ParseTemplateDeclaration            ≈ parseTemplateDecl
-//   ParseExpr.cpp     优先级链 │ ParseExprCXX.cpp '<' 试探 ≈ parseExpression* / parsePrimaryExpr
+// 对照 clang（llvm-project/clang/lib/Parse/）：Parser.cpp ParseTopLevelDecl / ParseStatement /
+//   ParseDecl.cpp ParseDeclOrFunctionDefInternal / ParseTemplate.cpp ParseTemplateDeclaration /
+//   ParseExpr.cpp 优先级链 + ParseExprCXX.cpp '<' 试探（≈ parseExpression* / parsePrimaryExpr）。
 // =============================================================================
 
 #include "parser.h"
@@ -65,15 +77,18 @@ const Token& Parser::advance() {
     return tok;
 }
 
-// ── 模板形参查找：从当前帧往外层帧走（内层优先），返回形参本身 ──
-// 供 parseType 区分 TemplateParam("T") 与 Class("T")，并区分【类型形参】与
-// NTTP 名 —— 后者出现在类型位置要报明确错误（见 parseType 的调用点）。
+// ── 模板形参查找：从当前帧往外层帧走（内层优先），返回形参本身（查不到 = nullptr）──
+// 查到的名字 ⇒ parseType 该建哪种节点：
+//   'T'（命中【类型形参】）⇒ TemplateParam("T")  依赖类型，等替换期解糖
+//   'N'（命中【NTTP 值形参】）⇒ 不特殊处理，仍建 Class("N")（parseType 分不清自己是在
+//        类型位还是模板实参位，见 parseType 里的调用点）⇒ 类型位最终报 unknown type name
+//   'U'（未命中 / 无模板上下文）⇒ Class("U")     是谁交给 Sema 查符号表
+// demo：`template<class T, int N> struct A { T v; };` 解析 T 命中帧 ⇒ TemplateParam("T")。
 // 线性扫描即可：形参个数极少（个位数），无需 hash（教学取舍：可讲解 > 高性能）。
-// 对应 clang: Sema 沿 Scope 链上行的名字查找（判定依赖名）。
+// 对照 clang：Sema 沿 Scope 链上行的名字查找（判定依赖名）。
 //
-// ★ 这里【现取】*owner->templateParams[i] 而不缓存指针：
-//   i 是下标，容器扩容后依然有效；而任何缓存的 `const TemplateParam*`
-//   都可能因 vector reallocate 悬空（见 ast.h 里 TemplateParamPtr 的说明）。
+// ★ 这里【现取】*owner->templateParams[i] 而不缓存指针：i 是下标，容器扩容后依然有效
+//   （详见 ast.h 里 TemplateParamPtr 的说明）。
 const TemplateParam* Parser::lookupTemplateParam(const std::string& name) const {
     for (const TemplateParamFrame* f = m_currentFrame; f; f = f->parent) {
         for (size_t i = 0; i < f->count; i++) {
@@ -135,19 +150,31 @@ bool Parser::isAtEnd() const {
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型解析（对应 clang：ParseDeclSpec + ParseDeclarator）
 // ─────────────────────────────────────────────────────────────────────────────
-// 文法：type := ['const'] base-type ('*' | '&' | '&&' | 'const')*
+// 文法：type := ['const'] ['typename'] base-type ('*' | '&' | '&&' | 'const')*
 //
-// demo（C++ 写法 ⇒ AST 类型节点）：
-//   int / double / bool / void / auto ⇒ PrimitiveType(…)
-//   MyClass / T                       ⇒ Class("MyClass") / TemplateParam("T")
-//   std::string                       ⇒ Class("std::string")（限定名拼成一串）
-//   int**                             ⇒ Pointer(Pointer(Int))
-//   int& / int&&                      ⇒ LValueRef(Int) / RValueRef(Int)
-//   int*&                             ⇒ LValueRef(Pointer(Int))
-//   const int                         ⇒ Const(Int)
-//   const MyClass&                    ⇒ LValueRef(Const(MyClass))
-//   const int*                        ⇒ Pointer(Const(Int))  ← 指向 const int 的指针
-//   int* const                        ⇒ Const(Pointer(Int))  ← const 的指针
+// ── ★ 位置 ⇒ 分支 ⇒ 建出什么（扫到哪个记号走哪条路）────────────────────────
+//   [前缀] 'const'                     ⇒ Step 1   记 isConst   ┐ 都在后缀循环【之前】
+//          'typename'                  ⇒ Step 1.5 记前缀      ┘ 给"依赖限定名"发许可
+//   [基础类型] Step 2 按首 Token 分派：
+//     'int'|'double'|'bool'|'void'|'auto' ⇒ PrimitiveType
+//     'decltype' '(' expr ')'             ⇒ Decltype(op, paren)（延迟求值）
+//     标识符                              ⇒ 见下方"标识符四分叉"
+//   [说明符侧 cv] Step 2.5 'const' ⇒ Const(基类型)：const int ⇒ Const(Int)
+//   [后缀循环] Step 3 按扫到的记号分派（作用在"已建好的类型"上）：
+//     '*'     int*         ⇒ Pointer(基)            '&'  int&  ⇒ LValueRef(基)
+//     '&&'    int&&        ⇒ RValueRef(基)          'const' int* const ⇒ Const(基)
+//     链式组合：int** ⇒ Pointer(Pointer(Int)) │ int*& ⇒ LValueRef(Pointer(Int))
+//
+// ── ★ 标识符四分叉（Step 2 内）────────────────────────────────────────────
+//   后跟 '<'           Box<int>       ⇒ 模板 id，实参挂 templateArgs
+//   后跟 '::'          std::string / A::B::C ⇒ 拼成一个名字整体查符号表
+//   命中类型形参（裸名）T              ⇒ TemplateParam("T")
+//   命中类型形参 且后跟 '::' typename T::type ⇒ 依赖限定名，限定者 = TemplateParam
+//
+// ★ 整串 demo（C++ 写法 ⇒ AST 类型节点）：
+//   const MyClass&  ⇒ LValueRef(Const(Class("MyClass")))
+//   const int*      ⇒ Pointer(Const(Int))   ← 指向 const int 的指针
+//   int* const      ⇒ Const(Pointer(Int))   ← const 的指针
 //
 // ★ cv 限定符的归属（[dcl.type.cv] + [dcl.decl]）—— 位置即语义：
 //   【类型说明符侧】`const int` 的 const 修饰【基类型】，Step 2.5 应用，其后每层 */& 套在它外面
@@ -164,15 +191,15 @@ TypePtr Parser::parseType() {
         std::cout << std::format("  [parse:type] ✦ const prefix detected\n");
     }
 
-    // ── Step 1.5: 处理 typename 前缀（依赖限定名消歧，[temp.res]/5）──
-    // 源码形态：typename T::type / typename Box<T>::value_type
-    // 【它到底在说什么】"跟在后面的这个名字是个【类型】，不是值" ——
-    //   编译器在模板里看到一个限定名 `T::x` 时无法只凭语法判断 x 是
-    //   类型还是静态成员，故标准要求写 typename 消歧（C++20 起在
-    //   非依赖上下文里可省）。本实现把它当纯粹的语法前缀收下：
-    //   类型/值之分后面由语义阶段查别名表得出结论。
-    // 对照 clang：Parser::TryAnnotateTypeOrScopeToken 识别 typename 后
-    //   走 ParseTypenameType；被消歧的那个名字建成 DependentNameType。
+    // ── Step 1.5: typename 前缀（依赖限定名消歧，[temp.res]/5）──
+    // 扫到 'typename' ⇒ 收下前缀（不改建树），随后那个限定名按"类型"处理：
+    //   typename T::type            ⇒ 后随名字走 Step 2 的"依赖限定名"分支
+    //   typename Box<T>::value_type ⇒ 同上，限定者是模板 id
+    // 作用只有一句：告诉编译器"后面这个限定名是【类型】不是值" —— `T::x` 单凭语法分不出
+    //   是类型还是静态成员，故标准要求显式写 typename 消歧（C++20 起非依赖上下文可省）。
+    //   本实现当纯语法前缀收下，类型/值之分留给语义阶段查别名表。
+    // 对照 clang：Parser::TryAnnotateTypeOrScopeToken → 走 ParseTypenameType
+    //   （被消歧的那个名字建成 DependentNameType）。
     if (check(TokenType::KwTypename)) {
         advance();
         std::cout << "  [parse:type] ✦ typename prefix (依赖限定名消歧)\n";
@@ -327,9 +354,10 @@ TypePtr Parser::parseType() {
     }
 
     // ── Step 2.5: 应用【类型说明符侧】的 const（必须在后缀循环【之前】）──
-    // ★ 位置即语义：这里的 const 修饰的是【基类型】，之后每套一层 */& 都在它外面。
+    // 扫到的写法 ⇒ 建出什么（本步只管【前缀位】的 const，`const int` 这种）：
     //     const int*  ⇒ Pointer(Const(Int))      指向 const int 的指针
     //     const int&  ⇒ LValueRef(Const(Int))    指向 const int 的引用
+    // ★ 位置即语义：这里的 const 修饰的是【基类型】，之后每套一层 */& 都在它外面。
     //   放错位置会建成 Const(Pointer(Int)) —— 顶层不是 Pointer/引用，下游按结构匹配
     //   的偏特化全部失手（C<T*> 收不到 const int*，见 test_tmpl_47，理论见 docs/learn/23）。
     //   对照 clang：DeclSpec 里的 const 在 GetTypeForDeclarator 中先于声明符算子生效。
@@ -339,14 +367,16 @@ TypePtr Parser::parseType() {
         isConst = false;   // 已消费，Step 4 不再重复套
     }
 
-    // ── Step 3: 处理后缀修饰符（*, &, &&, const），支持链式组合 ──
-    // 样例: int* (单指针), int** (二级指针), int& (左值引用), T&& (右值引用),
-    //       int*& (指针的引用), int* const (const 指针)
-    // ★ 这里出现的 const 属于【声明符侧】（[dcl.decl]）—— 它修饰的是
-    //   "到目前为止已建好的那个类型"，所以套在【最外层】而非基类型上：
-    //       int* const   ⇒ Const(Pointer(Int))    const 的指针
-    //       const int* const ⇒ Const(Pointer(Const(Int)))   两者兼有
-    //   与 Step 2.5 的 const 恰好相反，这正是"位置即语义"的两个端点。
+    // ── Step 3: 后缀循环 —— 按扫到的记号分派（作用在"已建好的类型"上，可链式组合）──
+    //   '*'     int*         ⇒ Pointer(Int)                    '**' ⇒ Pointer(Pointer(Int))
+    //   '&'     int&         ⇒ LValueRef(Int)                  '&&' ⇒ RValueRef(Int)
+    //   'const' int* const   ⇒ Const(Pointer(Int))             const 的指针
+    //   int*&                ⇒ LValueRef(Pointer(Int))         指针的引用
+    //   const int* const     ⇒ Const(Pointer(Const(Int)))      两者兼有
+    // ★ 这里出现的 const 属于【声明符侧】（[dcl.decl]）—— 它修饰的是"到目前为止已建好的
+    //   那个类型"，所以套在【最外层】而非基类型上，与 Step 2.5 恰好相反：
+    //   这正是"位置即语义"的两个端点。const int* 走 Step 2.5 ⇒ Pointer(Const(Int))，
+    //   int* const 走本步 ⇒ Const(Pointer(Int))，二者不可互换。
     while (true) {
         if (match(TokenType::Star)) {
             // 指针: T*
@@ -369,8 +399,13 @@ TypePtr Parser::parseType() {
                 base->toString());
         }
         else if (check(TokenType::KwConst)) {
-            // 声明符侧 const：int* const ⇒ Const(Pointer(Int))
-            // 只在后缀循环里收到（类型说明符侧的那个已在 Step 2.5 消费掉）。
+            // 后缀 const —— 走到这里的【不止】声明符侧一种（[dcl.type.cv]/1：cv 限定符
+            //   与类型名顺序任意，`int const` / `auto const` 的 const 同样是【类型说明符
+            //   侧】的，正是从这个分支进来）：
+            //     声明符侧   int* const  ⇒ Const(Pointer(Int))
+            //     说明符侧   int const   ⇒ Const(Int)  —— 此刻 base 恰等于基类型，
+            //                 故与 Step 2.5 的 `const int` 建出同一个节点（侥幸正确）
+            //     auto const 同理 ⇒ Const(Auto)。
             advance();
             base = Type::makeConst(base);
             std::cout << std::format(
@@ -389,20 +424,25 @@ TypePtr Parser::parseType() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 模板实参表解析（[temp.arg]）—— 类型实参与非类型实参（NTTP）的分流点
 // ─────────────────────────────────────────────────────────────────────────────
-// 吃掉 '<' ... '>' 整段实参表，逐个判定实参是"类型"还是"值"，分别打包成
+// 吃掉 '<' ... '>' 整段实参表，逐个实参判定"类型"还是"值"，分别打包成
 // TemplateArg{Type} / TemplateArg{Integral}（[temp.arg] 另两类：模板模板实参、
 // 包展开，本项目未实现）。
 //
-// 判定依据（LL(1)，只看 1 个 Token）：
-//   IntLiteral / '-' + IntLiteral → 非类型实参 → TemplateArg{Integral, stoll(text)}
-//   其他（类型关键字/标识符）      → 类型实参   → TemplateArg{Type, parseType()}
+// ── ★ 实参位扫到哪种写法 ⇒ 打包成哪种 TemplateArg（LL(1)，只看 1 个 Token）──
+//   IntLiteral       4        ⇒ TemplateArg{Integral, stoll("4")}
+//   '-' IntLiteral   -3       ⇒ TemplateArg{Integral, -3}      ← 负 NTTP 实参
+//   类型关键字       int      ⇒ TemplateArg{Type, Int}
+//   标识符           T / MyCls⇒ TemplateArg{Type, TemplateParam("T") / Class("MyCls")}
+//   后跟 '<' 嵌套     Box<int> ⇒ 递归 parseType ⇒ TemplateArg{Type, Class("Box")+args}
+//   '>>' 结尾        List<Box<int>> ⇒ 词法已切成两个 Greater，无需特殊处理
+// 调用约定：本函数自己消费 '<' 与 '>'（调用前不预消费，返回时整段已吃掉）。
+//
+// demo: Buf<4> ⇒ [(Integral,4)] │ Box<int> ⇒ [(Type,int)] │ Pair<int,8> ⇒ [(Type,int),(Integral,8)]
 //
 // 与 clang 的差距：clang 在 Sema::ActOnNonTypeTemplateArgument 里对
 //   constant-expression 做完整解析 + 常量求值 + 形参类型匹配；本项目只认整数字面量
 //   （Buf<2+2> 不支持，属常量折叠，见 ROADMAP 主线 D），类型匹配推迟到 Sema 实例化前
-//   做（checkTemplateArguments）。
-//
-// demo: Buf<4> ⇒ [(Integral,4)] │ Box<int> ⇒ [(Type,int)] │ Pair<int,8> ⇒ [(Type,int),(Integral,8)]
+//   做（checkTemplateArguments）。对照 clang：Parser::ParseTemplateArgumentList。
 std::vector<TemplateArg> Parser::parseTemplateArgumentList() {
     expect(TokenType::Less, "Expected '<' before template arguments");
 
@@ -522,7 +562,7 @@ DeclPtr Parser::parseDeclaration() {
     }
 
     // 区分函数声明与全局变量声明
-    // 采用试探性前瞻（Tentative Lookahead）：存档 -> 试探跳过类型 -> 检查后续是否为 Identifier + '(' -> 回滚
+    // 试探性前瞻（Tentative Lookahead）：存档 → 试探跳过类型 → 看后续是否 Identifier + '(' → 回滚
     size_t savedPos = m_pos;
     if (isVirtual) {
         advance();
@@ -742,9 +782,12 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 
     std::cout << "  [parse:template]   parsing parameter list <";
 
-    // 解析形参表（类型形参 typename/class T 与 NTTP 如 int N）。
-    // ★ `template<>` 空形参表合法 —— 它是【全特化】的标记（[temp.expl.spec]），
-    //   故先判 '>' 再进循环（不能用 do-while 无条件吃一个形参）。
+    // 解析形参表 —— 形参位扫到哪种写法 ⇒ 建出哪种 TemplateParam：
+    //   'typename'|'class' IDENT      ⇒ {Type, "T"}            类型形参
+    //   'typename'|'class' 后非 IDENT ⇒ {Type, "$unnamedN"}    无名类型形参
+    //   类型 IDENT（如 int N）        ⇒ {NonType, "N"}         NTTP
+    //   '>' —— 一个形参都不写          ⇒ 空表 = 【全特化】标记（[temp.expl.spec]），
+    //       故先判 '>' 再进循环，不能用 do-while 无条件吃一个形参。
     // ── 形参作用域建帧：构造即入栈、析构即出栈，使形参表与模板体解析期间
     //    parseType 能把裸 T 识别为 TemplateParam 节点。对照 clang：
     //    ParseTemplateParameters 的 TemplateScopes.Enter(TemplateParamScope)
@@ -759,14 +802,13 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
             param.location = current().location;
 
             if (check(TokenType::KwTypename) || check(TokenType::KwClass)) {
-                // ── 类型形参：typename T / class T ──
-                // ★ 形参名可以【省略】：`template <typename T, typename = void>`
-                //   是 SFINAE 探测的标配写法（第二个形参只用来承接 void_t 的推导，
-                //   名字根本用不上，标准允许无名，见 [temp.param]/3）。
-                //   判据：后一个 token 是 Identifier 才读名字；否则是 '=' 或 '>' 或 ','
-                //   —— 那说明这是个无名形参。
-                //   无名时给个合成名（"$1" 形式），内部照常有键可用，
-                //   只是用户代码引用不到它 —— 与"没有名字"的语义一致。
+                // ── 类型形参分支：扫到 typename/class ⇒ 建 TemplateParam{Type} ──
+                // 下一个 Token ⇒ 形参名怎么定：
+                //   Identifier        `typename T`        ⇒ name = "T"
+                //   '=' / '>' / ','   `typename = void`   ⇒ 无名 ⇒ 合成 "$unnamedN"
+                // ★ 无名形参合法（[temp.param]/3）：`template <typename T, typename = void>`
+                //   是 SFINAE 探测的标配写法 —— 第二个形参只用来承接 void_t 的推导，名字
+                //   用不上。合成名带 '$' 用户写不出来 ⇒ 引用不到它，与"没有名字"语义一致。
                 param.kind = TemplateParamKind::Type;
                 bool isClassKw = check(TokenType::KwClass);
                 advance();
@@ -837,7 +879,7 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
             // 注册动作必须成对：① push 进 decl->templateParams（数据 —— 答案在这里）；
             //   ② frame.count 跟上（可见范围 —— 下标计数）。二者同步 ⇒ 第 i+1 轮的默认实参
             //   正好能看见第 0..i 位。类型与值形参【都要】注册，否则
-            //   `template<int N> struct A {...};` 里 N 根本查不到（见 lookupTemplateParam 调用点）。
+            //   `template<int N> struct A {...};` 里 N 查不到（见 lookupTemplateParam 调用点）。
             // 对照 clang：Sema::ActOnTypeParameter 末尾的 S->AddDecl(Param)
             //   （SemaTemplate.cpp:1074）才是真正入作用域的动作，同样发生在默认实参解析之后。
             decl->typeParams.push_back(param.name);
@@ -889,15 +931,15 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
         decl->classTemplate = parseClassDecl(&decl->specPattern);
 
         // ── 判定主模板 / 偏特化 / 全特化（[temp.class.spec] / [temp.expl.spec]）──
-        // ★ specPattern 空 ⇔ 类名后【没写】<...>；templateParams 空 ⇔ 写了 `template<>`
-        //   —— 两者量的是两个【独立】维度，不可互相替代。主模板恰好落在
-        //   "specPattern 空、templateParams 非空"这一格，故外层必须先按 specPattern
-        //   摘出主模板，内层才能按 templateParams 区分全/偏特化。
-        //   demo: template<> struct Box<int*,int>       ⇒ 全特化
-        //         template<class T> struct Box<T*,T>    ⇒ 偏特化
-        //         struct Box { ... }                   ⇒ 主模板
-        // ★ 两个都空 = 写了 `template<>` 却没写 `<...>`：不是任何合法形态（全特化必须
-        //   点明实参），若不拦下会被【静默当成主模板】—— 用户以为在特化，实为重定义主模板。
+        // 扫到的写法 ⇒ 判别值（两维度【独立】，不可互相替代）：
+        //   templateParams   specPattern   源码                                   判别值
+        //   非空             空            struct Box {...}                       Primary
+        //   非空             非空          template<class T> struct Box<T*,T>      PartialSpec
+        //   空               非空          template<> struct Box<int*,int>         ExplicitSpec
+        //   空               空            template<> struct Box {...}            ⇒ 报错
+        //     └ 不是任何合法形态（全特化必须点明实参）⇒ err_extraneous_template_spec。
+        //       ★ 若不拦下会被【静默当成主模板】—— 用户以为在特化，实为重定义主模板。
+        // ★ 故外层必须先按 specPattern 摘出主模板，内层才能按 templateParams 分全/偏特化。
         //   对照 clang：err_extraneous_template_spec。
         if (decl->templateParams.empty() && decl->specPattern.empty()) {
             error(std::format(
@@ -1214,7 +1256,8 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
         // 歧义前瞻说明：
         //   当行首标识符等于类名 (current().text == decl->name) 时，有两种可能：
         //   a) 构造函数：Node(...) -> 类名后紧跟 '('
-        //   b) 以自身类作为类型的成员：如 Node* next; / Node& ref; / Node clone(); -> 类名后跟 '*', '&', 标识符等
+        //   b) 以自身类作为类型的成员：Node* next; / Node& ref; / Node clone();
+        //      ⇒ 类名后跟 '*'、'&'、标识符等
         //   注：C++ 标准禁止成员变量与类名同名。因此若类名后跟 '(' 则判定为构造函数；
         //       否则回滚，进入步骤 3 将类名作为类型 (parseType) 解析字段或成员方法。
         if (!isVirtual && check(TokenType::Identifier) && current().text == decl->name) {
@@ -1636,11 +1679,21 @@ StmtPtr Parser::parseExprOrAssignStmt() {
 //     left := 下一层();
 //     while (当前 Token 是本层运算符) { right := 下一层(); left := Binary(op, left, right); }
 //
-// 优先级链（低 → 高）：
-//   || → && → ==/!= → <,>,<=,>= → +,- → *,/,% → 一元 -,!,& → 后缀 call/./->/[] → primary
+// ── ★ 扫到哪个运算符 ⇒ 走哪层函数 ⇒ 建出哪种节点（低优先级 ↑ 越外层、越晚绑定）──
+//   '||'                 ⇒ parseOrExpr           ⇒ Binary(Or)
+//   '&&'                 ⇒ parseAndExpr          ⇒ Binary(And)
+//   '==' | '!='          ⇒ parseEqualityExpr     ⇒ Binary(Eq) / Binary(Neq)
+//   '<' '>' '<=' '>='    ⇒ parseComparisonExpr   ⇒ Binary(Lt/Gt/Le/Ge)
+//        └ ★ 与 template-id 的 '<' 同形，见 parsePrimaryExpr 的三步试探
+//   '+' | '-'            ⇒ parseAdditiveExpr     ⇒ Binary(Add) / Binary(Sub)
+//   '*' | '/' | '%'      ⇒ parseMultiplicativeExpr⇒ Binary(Mul/Div/Mod)
+//   '-' '!' '&'（一元）   ⇒ parseUnaryExpr        ⇒ Unary(Neg/Not/Addr)
+//   后缀 call / '.' '->' / '[]' ⇒ parsePostfixExpr⇒ CallExpr / MemberExpr / IndexExpr
+//   primary              ⇒ parsePrimaryExpr      ⇒ 字面量 / VarExpr / new / this / '(' e ')'
+//
 // demo: `1 + 2*3` ⇒ parseAdditiveExpr 先取 left=Int(1)，见 '+' 再取
 //       right=parseMultiplicativeExpr ⇒ Mul(2,3)（* 先绑定）⇒ Add(1, Mul(2,3)) ✓
-// 对应 clang：ParseExpression / ParseRHSOfBinaryExpression —— clang 用优先级表迭代处理，
+// 对照 clang：ParseExpression / ParseRHSOfBinaryExpression —— clang 用优先级表迭代处理，
 //   本实现用函数嵌套链，原理相同。
 
 ExprPtr Parser::parseExpression() {
@@ -1987,10 +2040,11 @@ ExprPtr Parser::parsePrimaryExpr() {
         expr->location = loc;
 
         // 显式模板实参 template-id：name '<' 类型列表 '>'（[temp.arg.explicit]）。
-        // ★ 歧义消解：`a < b > c` 是比较表达式，`foo<int>(x)` 是 template-id —— 判据是
-        //   试探解析后【紧跟什么】：'(' → 函数模板调用 foo<int>(x)；'::' → 类型限定静态
-        //   成员 Cls<int>::value（std 垫片 is_range<T>::value 依赖此写法）；都不是则回滚，
-        //   把 '<' 交还给比较表达式解析。
+        // ★ 歧义消解：扫到 IDENT '<' ⇒ 试探解析实参表，看【紧跟什么】判定是不是 template-id：
+        //   foo<int>(x)         ⇒ 后跟 '('  ⇒ 函数模板调用
+        //   Cls<int>::value     ⇒ 后跟 '::' ⇒ 类型限定静态成员（std 垫片 is_range<T>::value
+        //                          依赖此写法）
+        //   a < b > c           ⇒ 都不是 ⇒ 回滚，把 '<' 交还给比较表达式解析
         // ★ 试探法三步曲（与类体内方法/字段判定同一模式）：
         //   ① saved = m_pos 存档；② try 块内空跑实参表 —— parseType 中途报错即"这不是
         //   template-id"的信号（异常即失败信号）；③ 失败则 m_pos = saved 回滚。

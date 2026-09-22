@@ -2,23 +2,37 @@
 // =============================================================================
 // 阶段 5：代码生成器 (Code Generator)（理论见 docs/learn/14）
 // =============================================================================
-// 职责：把树状 AST "拍平"成线性的 x86-64 指令（AT&T 语法 .s）。走到这里类型与
-//   字段名彻底消失，只剩地址和数字 —— "运行期看偏移量"的最终体现。
-//   obj.field    ⇒ [rbp+offset]（编译期算好的数字偏移）
-//   ptr->vfunc() ⇒ 读 vptr → 加偏移 → 跳转（三部曲，详见 emitVirtualCall）
+// 职责：把树状 AST "拍平"成线性的 x86-64 指令（AT&T 语法 .s）。类型与字段名在此
+//   彻底消失，只剩地址和数字。
 // 目标：x86-64 System V AMD64 ABI │ 输出：GNU as 可汇编的 .s（.text/.data/.rodata）
 // 管线：Preprocessor → Lexer → Parser → Sema → 模板推导/实例化 → ★CodeGen★
 //   → .s → 自研链接器产出可执行文件。输入：类型全解析、auto 已替换、ClassLayout 已算好。
 //
+// ── 节点 ⇒ 指令 速查表（逐条展开见 codegen.cpp 各 visit 重载）────────────
+//   IntLiteral 42        ⇒ movq $42, %rax
+//   VarExpr(局部 x@-32)   ⇒ movq -32(%rbp), %rax
+//   VarExpr(全局 g)       ⇒ movq g(%rip), %rax
+//   VarExpr(栈类对象 d)   ⇒ leaq -N(%rbp), %rax        # 值语义 = 对象地址
+//   MemberExpr(u.age)    ⇒ 对象地址 %rax → movl off(%rax), %eax（宽度分派）
+//   AssignStmt(u.age=20) ⇒ movl %eax, off(%rcx)
+//   BinaryExpr(a + 1)    ⇒ 左 pushq → 右 %rcx → popq 左 → addq %rcx, %rax
+//   CallExpr(f(a,b))     ⇒ 实参逆序 push → popq rdi/rsi → callq f
+//   NewExpr(new Dog)     ⇒ movq $size,%rdi → callq malloc → 装 _vptr → callq ctor
+//   IfStmt               ⇒ testq %rax,%rax / je else_N ... / jmp endif_N
+//   WhileStmt            ⇒ while_begin_N: 条件 / je while_end_N / body / jmp 回边
+//   ptr->vfunc()         ⇒ movq (%rdi),%rax / movq N(%rax),%rax / callq *%rax
+//   字段宽度分派          ⇒ 1B movb（写）/ movzbq（读）│ 2~4B movl │ 8B movq
+//
 // ── 调用约定（System V AMD64 ABI）──────────────────────────────────────
 //   整数/指针参数依次用 rdi, rsi, rdx, rcx, r8, r9，返回值 rax，栈 16 字节对齐；
 //   成员函数的 this 占第一个参数槽 rdi（Itanium C++ ABI），显式实参从 rsi 起顺延。
+//   callee-saved = %rbp/%rbx/%r12~%r15：谁用谁恢复（emitVirtualCall 用 rbx，
+//   __minicc_dynamic_cast 的 DFS 用 r12~r14，均自行保存/恢复）。
 //   栈帧以 %rbp 为基址（详见 codegen.cpp emitFunction）：-8 起依次是 this、
 //   形参 spill（各 8B），再往下是局部变量，向低地址增长，止于 %rsp（序言 subq 预留）。
 //
 // ── vtable 与名字修饰（Itanium C++ ABI 简化版）─────────────────────────
-//   含虚函数的类 → 一张 vtable（.data），对象偏移 0 处藏 _vptr；虚调用 =
-//     movq (%rdi),%rax ; movq N(%rax),%rax ; callq *%rax
+//   含虚函数的类 → 一张 vtable（.data），对象偏移 0 处藏 _vptr
 //   成员方法 "类名_方法名"（Dog_speak）│ 模板实例 _Z5MyPtrIiE（阶段 4 NameMangler）
 //   vtable/typeinfo：_ZTV7MyClass / _ZTI7MyClass
 //
@@ -187,13 +201,13 @@ private:
     void emitDynamicCastHelper();
 
     // ── 虚函数调用（核心！） ──
-    // ptr->vfunc(args) 的汇编三部曲：
-    //   (a) 从 ptr 读出 _vptr 机器地址
-    //   (b) 加上虚函数在表中的 Index 偏移量
-    //   (c) 跳转至该地址执行
-    // 参数说明：className/methodName 仅用于生成可读注释；args 是实参表达式
-    // 列表（不含 this）；vtableIndex 是语义阶段在 ClassLayout.vtableEntries
-    // 中查得的编译期常数 —— "下标编译期定死，表项内容运行期才定"。
+    // pet->speak()（Animal，vtable[0]）⇒
+    //   (a) movq (%rdi), %rax      # 读出 obj._vptr
+    //   (b) movq 0(%rax), %rax     # vtable[idx*8]
+    //   (c) callq *%rax            # 间接调用
+    // 参数：className/methodName 只用于生成可读注释；args 不含 this；
+    //   vtableIndex 是 Sema 在 ClassLayout.vtableEntries 里查好的编译期常数
+    //   —— "下标编译期定死，表项内容运行期才定"。
     void emitVirtualCall(const std::string& className,
                          const std::string& methodName,
                          const std::vector<ExprPtr>& args,

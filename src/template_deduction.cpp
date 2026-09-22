@@ -2,25 +2,25 @@
 // 模板实参推导引擎 —— S2 逐对推导 / S3 显式实参 / S4 不可推导上下文
 // （理论见 docs/learn/02、03、04）
 // =============================================================================
-// 算法骨架（[temp.deduct.call]）：
-//   1. S3 显式实参占前缀，直接进替换表
-//   2. S2 逐 (P, A) 配对合一：P=const X → 剥顶层 const；P=T& → A 必须左值；
-//      P=T&& → 万能引用（A 左值 ⇒ T := A&）；P=T* → A 必须指针；P=T（裸参数）
-//      → 值传递调整后绑定；P 非依赖 → 要求 P == A（恒等）
-//   3. 绑定一致性：同一 T 两次绑定必须类型相等，否则冲突
-//   4. S4 收尾：仍有未绑定参数 ⇒ 不可推导上下文错误
+// 扫到哪种 P ⇒ 走哪条分支 ⇒ 结果（[temp.deduct.call]）：
+//   P=const X   ⇒ 剥顶层 const 后递归          │ P=T&   ⇒ 实参须左值，否则 ✗
+//   P=T&&       ⇒ 左值实参 ⇒ T := A&（万能引用）│ P=T*   ⇒ 实参须指针，递归 pointee
+//   P=T（裸参数）⇒ 值传递调整后绑定              │ P=C<T1..> ⇒ 同类模板同元数 ⇒ 逐位合一
+//   P 非依赖    ⇒ 要求 P == A（恒等）
+// 三阶段：S3 显式实参占前缀 → S2 逐 (P,A) 配对合一（绑定须一致）→ S4 收尾
+//   （仍有未绑定参数 ⇒ 不可推导上下文错）。
+//
+// 逐对 trace（twice(3)）：S3 无显式 ⇒ S2 P=T A=int ⇒ T := int ✓ ⇒ S4 全绑定
+//   ⇒ { T := int } ──交 S5──▶ twice<int>
+// 实际日志（逐对打印，供教学观测）：
+//   [deduction] ▶ twice — 模板参数 <T>，实参 1 个
+//   [deduction]   P=T          A=int        ⇒ T := int
+//   [deduction] ◀ 推导成功: <T=int>
 //
 //   标准章节：[temp.deduct] 总则 │ [temp.deduct.call] 逐对 P/A 调整规则
 //             [temp.deduct.type] 类型等价/不可推导 │ [temp.arg.explicit] 显式实参
-//   clang 对照：lib/Sema/SemaTemplateDeduction.cpp
-//     Sema::DeduceTemplateArguments     ≈ deduce() 入口
-//     TemplateDeductionCallback::Deduce ≈ deducePair() 逐对合一
-//
-// demo: twice(3) ⇒ deduce() ⇒ ①S3 无显式实参 ②S2 P=T A=int ⇒ T := int ✓
-//                            ③S4 全绑定 ⇒ { T := int } ──交 S5──▶ twice<int>
-//
-// trace 日志（逐对打印，供教学观测）：▶ 推导开始 │ P=… A=… ⇒ T := int（新绑定）│
-//   T := int（一致 ✓）（重复绑定且一致）│ ✗ …（本对失败）│ ◀ 推导成功: <T=int>
+//   对照 clang：Sema::DeduceTemplateArguments（lib/Sema/SemaTemplateDeduction.cpp）
+//     deduce() ≈ 入口 │ deducePair() ≈ 逐对合一回调
 // =============================================================================
 
 #include "template_deduction.h"
@@ -33,12 +33,13 @@ namespace minicc {
 // ─────────────────────────────────────────────────────────────────────────────
 // 偏特化匹配 [temp.class.spec.match] —— 复用同一套合一算法（理论见 docs/learn/19）
 // ─────────────────────────────────────────────────────────────────────────────
-// 【为什么能复用 deducePair】函数模板推导与偏特化匹配在算法上是同一件事：
-//   前者用调用实参 A 推导形参模式 P，后者用使用点实参 A 推导特化模式 P ——
-//   都是"受限合一"（把模式里的未知量解出来）。clang 也共用 DeduceTemplateArguments
-//   一族入口（SemaTemplateDeduction.cpp），只是传入的参数种类不同。
-// 【demo】模式 [T*, T] 对实参 [double*, double] ⇒ T := double ✓（第二位一致 ✓）
-//         模式 [T*, T] 对实参 [int, int]         ⇒ 指针结构失配 ✗ ⇒ 该偏特化不匹配
+// 【为什么能复用 deducePair】与函数模板推导是同一件事 —— 都是"受限合一"，只是 P 的
+//   来源不同：调用点用形参表，这里用特化模式。
+// 逐位 trace（模式 [T*, T]）：
+//   实参 [double*, double] ⇒ ① P=T* A=double* ⇒ T := double ✓ ② P=T A=double ⇒ 一致 ✓ ⇒ 匹配
+//   实参 [int, int]        ⇒ ① P=T* A=int ⇒ 不是指针 ✗ ⇒ 该偏特化不匹配
+// 逐位 trace（模式 [T&, T]，走下方"引用结构前置检查"）：
+//   实参 [int, int]  ⇒ 引用位收到非引用实参 ✗ │ 实参 [int&, int] ⇒ T := int ✓
 // 【职责边界】本函数只回答"这一条偏特化匹配不匹配"（逐条试，不含比较）；
 //   "多条都匹配时谁胜"由调用方 selectClassTemplate 用 dominance 循环裁决
 //   [temp.class.order]（semantic_analyzer.cpp:2994 一带，比较器见同文件 :223
@@ -126,13 +127,13 @@ bool TemplateDeducer::matchPattern(
 // ─────────────────────────────────────────────────────────────────────────────
 // desugarAlias —— 模式位里的别名模板 id 解糖（[temp.alias]/1，理论见 docs/learn/27）
 // ─────────────────────────────────────────────────────────────────────────────
-// ★ 推导比的是【名字】，而别名模板的意义就是"同一个类型的另一个名字"：
+// ★ 推导比的是【名字】，而别名就是"同一个类型的另一个名字" —— 同一次调用两侧各走各的
+//   解糖路径，P 侧不解 ⇒ 合一判"名字不等" ⇒ 候选被静默剔除：
 //     template<class T> using Vec = MyPtr<T>;
 //     template<class T> Vec<T> pass(Vec<T> v);   // P 侧写 Vec<T>
 //     pass(v);                                    // A 侧已在调用点解糖成 MyPtr<int>
-//   同一次调用两侧各走各的解糖路径；P 侧不解 ⇒ 合一判"名字不等"⇒ 候选被静默剔除。
 // 是"解糖"不是"实例化"：T 仍是形参，`MyPtr<T>` 保持依赖，正交给逐位合一去绑定。
-// demo: desugarAlias(Vec<T>, {}) ⇒ MyPtr<T>（保持依赖）│ 配 {T := int} ⇒ MyPtr<int>
+// 逐对：desugarAlias(Vec<T>, {}) ⇒ MyPtr<T>（保持依赖）│ 配 {T := int} ⇒ MyPtr<int>
 // 对照 clang：DeduceTemplateArguments 之前取 getCanonicalType，别名已被完全剥掉。
 TypePtr TemplateDeducer::desugarAlias(
     const TypePtr& P,
@@ -158,15 +159,19 @@ TypePtr TemplateDeducer::desugarAlias(
 // ─────────────────────────────────────────────────────────────────────────────
 // reducePattern —— 把模式位归约成具体类型（void_t / decltype 的求值点）
 // ─────────────────────────────────────────────────────────────────────────────
-// 【理论】void_t 探测惯例（[temp.deduct]/8，CWG 1558）：void_t<E...> 的语义是
-//   "若 E... 全部合法则等价于 void，否则替换失败"，且别名模板的实参替换失败
-//   【也算】SFINAE —— 正是靠这一条，is_range 的偏特化才能"不命中就静默退化"。
-// 【本实现的简化】void_t 以【编译器内建】形式提供（名字命中即按上述语义处理，
-//   不走别名模板机制），详见 SemanticAnalyzer::registerBuiltins。
-// demo: reducePattern(void_t<decltype(declval<T>().begin())>, {T→vector<int>})
-//         ⇒ ① 替换实参 ② 触发 decltype 求值 ⇒ int（合法）③ 全部合法 ⇒ 归约为 void
-//       若 {T→int} ⇒ ② 抛 SubstitutionFailure ⇒ 整个模式位不匹配
-// 对照 clang：TreeTransform 对 void_t 是普通别名模板，替换失败同样被吞掉。
+// 扫到哪种模式位 ⇒ 归约成什么（[temp.deduct]/8，CWG 1558：void_t<E...> 各 E 全合法则等价
+//   于 void，否则替换失败；别名模板的实参替换失败【也算】SFINAE —— is_range 的偏特化
+//   正是靠这条"不命中就静默退化"）：
+//   void_t<E...> ⇒ 逐个替换 E，全合法 ⇒ void；任一不合法 ⇒ 抛 SubstitutionFailure
+//   void_t<>     ⇒ 无实参 ⇒ 直接合法 ⇒ void
+//   decltype(e)  ⇒ 替换 e 后真求值 ⇒ 具体类型
+//   Vec<T>（别名）⇒ 解糖后递归再归约（别名可指向别名）
+// 逐位 trace（void_t<decltype(declval<T>().begin())>）：
+//   {T→vector<int>} ⇒ ① 替换实参 ② decltype 求值 ⇒ int（合法）⇒ 归约为 void ✓
+//   {T→int}         ⇒ ② 抛 SubstitutionFailure ⇒ 整个模式位不匹配 ✓
+// 【本实现的简化】void_t 是【编译器内建】（名字命中即按上述语义处理，不走别名模板机制），
+//   详见 SemanticAnalyzer::registerBuiltins。
+// 对照 clang：TreeTransform 里 void_t 是普通别名模板，替换失败同样被吞掉。
 TypePtr TemplateDeducer::reducePattern(
     const TypePtr& P,
     const std::unordered_map<std::string, TypePtr>& subst) {
@@ -322,18 +327,17 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
         return deducePair(P->referencedType, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
-    // ── P = T&&：万能引用（forwarding reference）──
-    // 左值实参 ⇒ T := A&（实例化时 T&& 折叠为 A&）；右值实参 ⇒ T := A。
-    // [temp.deduct.call]/3：P 为"模板参数的右值引用"且实参为左值时，推导把 A 按左值
-    //   引用处理 —— 这是 std::forward 完美转发的根基。
-    // ★ A 这里取自变量的【声明类型】，可能本身就是引用（`int& rr` 的 A 就是 int&）：
-    //   再套一层即得嵌套引用 `int& &`，会让 id(rr) 推出 T := int& & ⇒ 符号 _Z2idIRRiE，
-    //   与 id(a) 的 T := int& ⇒ _Z2idIRiE 分叉（clang 只产出后者）。
-    //   修复不在这里补剥壳，而是由 Type::makeLValueReference 按 [dcl.ref]/6 在构造点
-    //   归一 —— 折叠规则只写一份。（[expr.type]/1：表达式永远没有引用类型，故 clang
-    //   里 A 到这一步已是裸类型，天然不产生嵌套。）
-    // ★ 万能引用是【调用】独有的规则：偏特化匹配只做结构等价，structuralMatch 时
-    //   【必须跳过】本分支 —— 否则 `Kind<T&&>` 匹配 `Kind<int&&>` 会 bind 出 T := int&
+    // ── P = T&&：万能引用（forwarding reference，[temp.deduct.call]/3）──
+    // 扫到的形态 ⇒ 绑定（std::forward 完美转发的根基）：
+    //   A 左值（argIsLValue）⇒ T := A&（实例化时 T&& 折叠为 A&）
+    //   A 右值               ⇒ T := A
+    //   structuralMatch=true ⇒ 【跳过本分支】，只做结构等价：`T&&` 配 `int&&` ⇒ T := int
+    // ★ A 取自变量的【声明类型】，可能本身就是引用（`int& rr` 的 A 就是 int&）：再套一层
+    //   即得嵌套引用 `int& &` ⇒ id(rr) 推出 T := int& & ⇒ 符号 _Z2idIRRiE，与 id(a) 的
+    //   T := int& ⇒ _Z2idIRiE 分叉（clang 只产出后者）。修复不在本处补剥壳，而是由
+    //   Type::makeLValueReference 按 [dcl.ref]/6 在构造点归一 —— 折叠规则只写一份。
+    //   （[expr.type]/1：表达式永远没有引用类型，故 clang 里 A 到这一步已是裸类型。）
+    // ★ 偏特化匹配若套用本分支，`Kind<T&&>` 匹配 `Kind<int&&>` 会 bind 出 T := int&
     //   （把"实参是引用"当成"实参是左值"），而正确答案是 T := int。
     if (P->isRValueReference()) {
         TypePtr inner = P->referencedType;
@@ -374,14 +378,15 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
         return bind(paramKey(P), adjusted, subst, out, pStr, aStr);
     }
 
-    // ── P = C<T1...>：类模板 id 的结构合一 ──
-    // [temp.deduct.type]/8 的 "T<T1,...,Tn>" 情形：同类模板、实参个数相同则逐位递归合一。
-    // demo: P=MyPtr<T>、A=MyPtr<int>（实例类型 MyPtr_int）⇒ 第 1 位 T ↔ int ⇒ T := int ✓
-    // ★ A 侧是【实例化后】的类型，名字已被改写成 MyPtr_int，靠名字反推是错的（清洗规则
-    //   不是单射）；必须查实例记下的出身（templateOriginName/templateOriginArgs，见
-    //   getOrInstantiateClass）。clang 不需要出身字段 —— 它的实例仍带实参表。
-    // ★ 别名模板全靠这条：`Vec<T>` 解糖成 `MyPtr<T>` 后能不能推出 T 全看本分支 ——
-    //   没有它，别名只能当"写出来好看"的糖，一放进函数模板形参就废。
+    // ── P = C<T1...>：类模板 id 的结构合一（[temp.deduct.type]/8 的 "T<T1,...,Tn>" 情形）──
+    //   P=MyPtr<T> A=MyPtr<int>（实例类型 MyPtr_int）⇒ 第 1 位 T ↔ int ⇒ T := int ✓
+    //   P=MyPtr<T> A=Box<int>                        ⇒ 不同模板 ✗
+    //   P=Box<T*>  A=Box<int,double>                 ⇒ 元数不同 ✗
+    //   模式位是值（NTTP）                            ⇒ 要求 toString() 逐位相等（不做算式反推）
+    // ★ A 侧是【实例化后】的类型，名字已被改写成 MyPtr_int，靠名字反推是错的（清洗规则不是
+    //   单射）；必须查实例记下的出身（templateOriginName/templateOriginArgs，见
+    //   getOrInstantiateClass）。clang 不需要出身字段（它的实例仍带实参表）。
+    // ★ 别名模板全靠这条：`Vec<T>` 解糖成 `MyPtr<T>` 后能不能推出 T 全看本分支。
     if (P->isClass() && !P->templateArgs.empty()) {
         bool sameTemplate =
             A->isClass() &&

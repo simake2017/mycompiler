@@ -1,16 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // linker.cpp —— minicc 教学链接器（主线 B）实现
 // ─────────────────────────────────────────────────────────────────────────────
-// 五步流水线（与 docs/learn/15 一一对应）：
+// 五步流水线（与 docs/learn/15 一一对应）—— 每步做什么 + 一个例子：
 //   ① readObject        解析 .o（ELF64 节表 / 符号表 / .rela）
+//                       例：.text 节 + .rela.text 一条 R_X86_64_PLT32 指向 main
 //   ② layoutSections    合并同类节，分配虚地址（非 PIE，基址 0x400000）
+//                       例：0x400000 头部 → _start 槽 64B → 用户 .text → 页对齐后 RW 段
 //   ③ injectRuntime     注入 _start / malloc / free 机器码（不依赖 crt/libc）
+//                       例：_start 里 call main 的 rel32 链接期直接算出；malloc 溢出即返回 NULL
 //   ④ resolveSymbols    符号决议：定义(全局) 对上 引用(未定义)，报错列表化
+//                       例：无定义 ⇒ undefined reference to 'main'；重复定义 ⇒ 符号重复定义
 //   ⑤ applyRelocations  重定位回填：把 as 留下的 e8 00 00 00 00 欠条还清
-//   最后 writeExecutable 吐出只含 2 个 PT_LOAD 的最小可执行 ELF
+//                       例：R_X86_64_PLT32 填 call 位移；R_X86_64_32S 溢出即报错
+//   最后 writeExecutable 吐出只含 2 个 PT_LOAD 的最小可执行 ELF（e_entry = _start，不是 main）
 //
-// clang 对照：lld/ELF/Writer.cpp::writeResult() 做同样的事，但多了
-//   动态段/线程局部存储/异常帧/多架构等约 20 倍复杂度。
+// 对照 clang：lld/ELF/Writer.cpp::writeResult() 做同样的事，但多动态段/线程局部存储/
+//   异常帧/多架构，约 20 倍复杂度。
 // ─────────────────────────────────────────────────────────────────────────────
 #include "linker.h"
 

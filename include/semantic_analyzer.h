@@ -2,32 +2,27 @@
 // =============================================================================
 // 阶段 3：语义分析与类型系统 (Semantic Analysis)（理论见 docs/learn/29）
 // =============================================================================
-// 职责：
-//   1. 构建符号表（Symbol Table）：记录每个变量、函数、类的类型信息
-//   2. 类型检查：确保所有操作在类型上合法
-//   3. auto 类型推导：把 auto 占位符换成真实类型
-//   4. 类内存布局与虚表：字段偏移量、vtable 结构、RTTI 注入
+// 哲学：编译期看"符号"（类型名/字段名），运行期看"偏移量"（内存布局）—— 本阶段就是把
+//   "符号"变成"偏移量"。三遍扫描（analyze）：注册类/模板 → 注册函数名 → 分析函数体。
 //
-// 哲学：编译期看"符号"（类型名、字段名），运行期看"偏移量"（内存布局）—— 本阶段的
-//   任务就是把"符号"转化为"偏移量"。三遍扫描（见 analyze）：注册类/模板 → 注册函数名 → 分析函数体。
+// ── 扫到哪种写法 ⇒ 本阶段做什么 ────────────────────────────────────────
+//   `int x = 1;`           ⇒ 入符号表 {name=x, kind=Variable, type=int, stack@-8}
+//   `int f(int a)`         ⇒ 入表 {name=f, kind=Function, type=int(返回类型)}
+//   `auto v = e;`          ⇒ auto 换成 e 的类型（inferType）
+//   `Animal* p = new Dog;` ⇒ 查布局表得 vptr@0 / 字段偏移 / RTTI 符号
+//   `Box<int> b;`          ⇒ 按需实例化出 Box_int 后当普通类处理
+//   `Box<int>::value`      ⇒ 静态常量折叠成字面量（foldStaticConst）
 //
-// 管线：源码 → Preprocessor → Lexer → Parser → 【SemanticAnalyzer】 → 模板推导/
-//   实例化 → CodeGen(x86-64 .s)
-//   输入：TranslationUnit（AST，此时类型只是语法标记，名字均未决议）
-//   输出：① 标注 resolvedType 的 AST（auto 已抹去，每个表达式类型已定）
-//         ② 符号表快照（Scope 作用域链 + 栈偏移，可 dump 观察）
-//         ③ 类布局表（字段偏移 / vtable / RTTI，CodeGen 直接消费）
+// 输入：TranslationUnit（AST，此时类型只是语法标记，名字均未决议）
+// 输出：① 标注 resolvedType 的 AST（auto 已抹去，每个表达式类型已定）
+//       ② 符号表快照（Scope 作用域链 + 栈偏移，可 dump 观察）
+//       ③ 类布局表（字段偏移 / vtable / RTTI，CodeGen 直接消费）
+// 管线：源码 → Preprocessor → Lexer → Parser → 【SemanticAnalyzer】 → 模板推导/实例化 → CodeGen
 //
-// ── 标准章节 → 本文件 ──────────────────────────────────────────────────
-//   [basic.scope] 符号表与作用域链：名字从最内层作用域逐层向外解析（Scope / SymbolTable）
-//   [expr]        类型检查与值类别：每个表达式有类型与左/右值性（inferType 系列）
-//   [over.match]  重载决议：候选 → 可行 → 最优（resolveTemplateCall / isAtLeastAsSpecialized）
-//   [temp.names]  两阶段查找（简化）：蓝图先注册不查体，实例化后才用具体类型检查函数体
-//
-// ── clang 模块对照（教学级简化）────────────────────────────────────────
-//   lib/Sema/SemaDecl.cpp      声明处理      → processClassDecl / registerFunction
-//   lib/Sema/SemaExpr.cpp      表达式类型检查 → inferType 系列 / Scope::lookup
-//   lib/Sema/SemaOverload.cpp  重载决议与偏序 → resolveTemplateCall / isAtLeastAsSpecialized
+// 标准章节：[basic.scope] Scope/SymbolTable │ [expr] inferType 系列（类型 + 左/右值性）
+//   │ [over.match] resolveTemplateCall / isAtLeastAsSpecialized │ [temp.names] 两阶段查找（简化）
+// 对照 clang：SemaDecl.cpp → processClassDecl/registerFunction │ SemaExpr.cpp → inferType
+//   │ SemaOverload.cpp → resolveTemplateCall / isAtLeastAsSpecialized
 // =============================================================================
 
 #include "ast.h"
@@ -84,14 +79,15 @@ struct Symbol {
 // ─────────────────────────────────────────────────────────────────────────────
 // Scope：作用域（支持嵌套）
 // ─────────────────────────────────────────────────────────────────────────────
-// 符号表是编译器在"编译期"记住所有名字及其含义的核心数据结构；每个作用域一张，
-//   作用域可嵌套（函数内的代码块）。查找时从当前作用域向外逐层搜索，直到命中或到达
-//   全局作用域。理论依据：[basic.scope] 作用域树 + [basic.scope.scope] 可见性规则。
+// 每个作用域一张表，可嵌套（[basic.scope] 作用域树 + [basic.scope.scope] 可见性规则）；
+//   查找从当前作用域沿链向外，直到命中或到全局。
 // 作用域链（f 内又有一个 `{ }` 块时）：
 //     global(depth=0) ← f(depth=1)[basic.scope.function] ← block(depth=2)[basic.scope.block]
 //
-// 在 block 层 lookup("t")：block ✗ → f ✓ 命中（由内向外）
-// 在 f     层 lookup("u")（u 声明于 block 内）：✗ —— 可见性单向，外不见内
+// 查哪个名字 ⇒ 结果：
+//     block 层 lookup("t")（t 声明于 f）    ⇒ block ✗ → f ✓ 命中（由内向外）
+//     f 层 lookup("u")（u 声明于 block 内） ⇒ ✗ —— 可见性单向，外不见内
+//     lookupLocal("t")                      ⇒ ✗ —— 只查本层，不上链
 // ─────────────────────────────────────────────────────────────────────────────
 class Scope {
 public:
@@ -178,21 +174,22 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // SemanticAnalyzer：语义分析器
 // ─────────────────────────────────────────────────────────────────────────────
-// 设计决策——"名字→单符号"教学模型：Scope/SymbolTable 保持一个名字只对应一个符号
-//   （不支持重载的符号表），真正的重载集（函数模板候选集）单独挂在
-//   m_functionTemplateCandidates。对照 clang：普通名字查找走 DeclContext::lookup，
-//   重载集是挂在 DeclContext 上的 Decl 链，二者也是分开的。
 // ── 本类如何做 AST 分派（两种手法，各有其位）────────────────────────────────
 // ★ 判据（本项目唯一权威表述）：**handler 只要引用 → 访问者（accept 虚分派）；
-//   还要 shared_ptr 所有权或返回值 → 标签分派（switch）**。clang 同此分法：
-//   RecursiveASTVisitor 只服务遍历，类型计算走 dyn_cast/switch。
-// ① 【访问者】语句处理链（processStmt）走 accept 虚表分派：handler 签名统一是
-//    void visit(Stmt&)，不需要所有权也不返回值 —— 正是访问者的形状。
-// ② 【NodeKind 标签分派】声明链（processDecl）与类型推导（inferType）用 switch：
-//    · 声明链 handler 需要 shared_ptr 所有权（m_classDecls / m_globalVars 等注册表存的
-//      就是它），而 visit 只拿得到引用 —— 从引用还原 shared_ptr 不安全，硬套访问者
-//      就得引入隐藏的"当前节点暂存槽"，反而更难读；
-//    · inferType / isLValueExpr 是【取值型】递归，而 visit 返回 void。
+//   还要 shared_ptr 所有权或返回值 → 标签分派（switch）**。
+// 位置 ⇒ 走哪条（各配一个真实 handler）：
+//   ① 访问者    processStmt(BlockStmt) ⇒ void visit(Stmt&)：只要引用、不返回值
+//   ② 标签分派  processDecl(ClassDecl) ⇒ 要存进 m_classDecls（shared_ptr 所有权），
+//                而 visit 只给引用 —— 从引用还原 shared_ptr 不安全，硬套访问者就得引入
+//                隐藏的"当前节点暂存槽"，反而更难读
+//   ② 标签分派  inferType(CallExpr)    ⇒ 【取值型】递归要返回 TypePtr，而 visit 返回 void
+// ① 【访问者】语句处理链（processStmt）走 accept 虚表分派。
+// ② 【NodeKind 标签分派】声明链（processDecl）与类型推导（inferType / isLValueExpr）用 switch。
+// 对照 clang：RecursiveASTVisitor 只服务遍历，类型计算走 dyn_cast/switch。
+// ── "名字→单符号"教学模型 ──────────────────────────────────────────────
+// Scope/SymbolTable 一个名字只对应一个符号（不支持重载）；重载集（函数模板候选集）
+//   单独挂 m_functionTemplateCandidates。
+// 对照 clang：普通名字查找走 DeclContext::lookup，重载集是挂在 DeclContext 上的 Decl 链。
 class SemanticAnalyzer : public DecltypeEvaluator,
                          public MemberTypeResolver,
                          public AliasTemplateResolver,
@@ -425,10 +422,11 @@ private:
     TypePtr resolveType(TypePtr type);
 
     // ── decltype 求值（实现 DecltypeEvaluator 接口，理论见 docs/learn/20）──
-    // [dcl.type.decltype] 两套规则：decltype(e) 里 e 是【未加括号】的 id-expression
-    //   或成员访问 → 取【声明类型】（static type）；decltype((e)) 加了括号 →
-    //   取【表达式类型】，左值表达式带 &。
-    // demo: int a;  decltype(a) → int（声明类型）│ decltype((a)) → int&（左值）
+    // [dcl.type.decltype] 两套规则，按原文形态分派（int a; int& r = a;）：
+    //   decltype(a)     未加括号的 id-expression / 成员访问 ⇒ 取【声明类型】⇒ int
+    //   decltype(r)     同上                                ⇒ 声明类型就是引用 ⇒ int&
+    //   decltype((a))   加了括号                            ⇒ 取【表达式类型】⇒ int&（左值带 &）
+    //   decltype(a + 1) 非 id-expression                    ⇒ 表达式类型 ⇒ int（右值不加 &）
     // 抛 SubstitutionFailure —— 表达式不合法（immediate context），调用方按 SFINAE
     //   处理（移出候选集），而非报错。
     // 对照 clang：Sema::ActOnDecltypeExpression + BuildDecltypeType。

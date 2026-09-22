@@ -14,6 +14,7 @@
 //   ├── Statement   无值执行动作 ExprStmt VarDecl Return If While Block Assign DeleteStmt
 //   └── Declaration 引入新名字   Function Class Template GlobalVar Enum Namespace
 //                                TypeAlias Constructor Destructor DeductionGuide
+// demo：`int a = 1 + 2;` ⇒ VarDeclStmt{ BinaryExpr{op=Add, IntLiteral(1), IntLiteral(2)} }
 //
 // 【标准章节】[expr.*] 表达式 / [stmt.*] 语句 / [dcl.fct] 函数
 //             [class] [class.derived] [class.virtual] 类与继承 / [temp] 模板蓝图
@@ -530,7 +531,8 @@ struct DestructorDecl : FunctionDecl {
 using DtorDeclPtr = std::shared_ptr<DestructorDecl>;
 
 // ─── 全局变量声明 ─────────────────────────────────────────────────────────────
-// 对应 [dcl.dcl] / [dcl.init]；clang: VarDecl (isStaticDataMember() == false && hasGlobalStorage())。
+// 对应 [dcl.dcl] / [dcl.init]；clang: VarDecl（全局变量 ⇒ isStaticDataMember() == false、
+//   hasGlobalStorage() == true）。
 // demo：int g_counter = 0;
 struct GlobalVarDecl : Declaration {
     std::string name;
@@ -696,17 +698,18 @@ struct TemplateParam {
 //   永不移动、永不单独释放 —— 故缓存形参指针永远安全。
 // 本项目无 arena，用 shared_ptr 拿到同样两条性质：① 节点不随容器扩容而搬家（vector
 //   扩容搬的是【指针值】，不是节点本身）；② 生命周期覆盖全部引用方。
-// ★ 值语义会悬空：元素住在 vector 堆块里，解析期一路 push_back 会 reallocate，先前取得
-//   的 `const TemplateParam*` 立刻失效 —— 而模板形参作用域的查询恰发生在 push_back
-//   进行中（见 parser.h 的帧）。
+// ★ 别改成值语义 `std::vector<TemplateParam>` —— 元素住在 vector 堆块里，解析期一路
+//   push_back 会 reallocate，先前取得的 `const TemplateParam*` 立刻失效：
+//   demo：`template<class T, class U>` 解析到 T 时又 push_back(U) ⇒ 指向 T 的指针作废，
+//   而模板形参作用域的查询恰发生在 push_back 进行中（见 parser.h 的帧）。
 using TemplateParamPtr = std::shared_ptr<TemplateParam>;
 
 // ─── 模板声明的种类（[temp.class.spec] / [temp.expl.spec]）──────────────────
 // 一个类模板可以有三种"版本"，同名共存，靠实参匹配择优：
 //
-//   template<class T, class U = void> struct Box {...};   Primary      主模板
-//   template<class T> struct Box<T*, T> {...};            PartialSpec  偏特化
-//   template<> struct Box<int*, int> {...};               ExplicitSpec 全特化
+//   template<class T, class U = void> struct Box {...};   ⇒ Primary      主模板
+//   template<class T> struct Box<T*, T> {...};            ⇒ PartialSpec  偏特化
+//   template<> struct Box<int*, int> {...};               ⇒ ExplicitSpec 全特化
 //
 // 【择优顺序】[temp.class.spec.match] + [temp.expl.spec]/6：① 全特化精确匹配（命中即用）
 //   ② 偏特化逐个推导，取匹配成功者 ③ 都不中 → 主模板 + 默认实参补全。

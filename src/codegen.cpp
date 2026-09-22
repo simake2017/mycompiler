@@ -21,12 +21,20 @@
 //   成员方法 "类名_方法名"（Dog::speak → Dog_speak）│ 模板实例 _Z + 名 + I<码>E
 //   vtable _ZTV<长度><名>（_ZTV3Dog）│ typeinfo _ZTI<长度><名>（_ZTI3Dog）
 //
-// 本文件组织：
+// 本文件组织（节点 ⇒ 指令 速查表；每行展开见对应 visit 重载）：
 //   generate()       主入口，拼装 .text/.data/.rodata 三段
 //   emitVTable/RTTI  数据段：vtable 与 type_info
 //   emitFunction     函数框架（序言 / 形参 spill / 尾声）
 //   emitStmt*        语句降级  │  emitExpr*  表达式降级（结果一律落 rax）
 //   emitVirtualCall  虚函数调用三部曲
+//   IntLiteral 42     ⇒ movq $42,%rax          │ VarExpr(x@-32) ⇒ movq -32(%rbp),%rax
+//   BinaryExpr(a + 1) ⇒ pushq 左 / movq %rax,%rcx(右) / popq 左 / addq %rcx,%rax
+//   CallExpr(f(a,b))  ⇒ a,b 逆序 push / popq rdi,rsi / callq f
+//   NewExpr(new Dog)  ⇒ movq $size,%rdi / callq malloc / 装 _vptr / callq Dog_Dog
+//   MemberExpr(u.age) ⇒ 对象地址 → %rax / movl off(%rax),%eax（按字段宽度分派）
+//   ptr->vfunc()      ⇒ movq (%rdi),%rax / movq idx*8(%rax),%rax / callq *%rax
+//   IfStmt/WhileStmt  ⇒ testq %rax,%rax / je <跳转标签>（循环另有 jmp 回边）
+//   字段宽度分派       ⇒ 1B movb/movzbq │ 2~4B movl │ 8B movq
 //
 // 对应 LLVM 模块（详见 codegen.h 头注）：指令选择 ≈ SelectionDAG │ 调用约定 ≈
 //   X86ISelLowering │ 寄存器分配 ≈ RegAlloc（本项目退化为"单累加器 rax + 栈
@@ -81,9 +89,8 @@ void CodeGen::emitComment(const std::string& comment) {
 }
 
 // 登记一个字符串字面量，返回引用它的标签。
-// 理论：字符串属于只读数据，不能内联在指令流中，要放 .rodata 再用
-//       RIP 相对寻址取地址。此处只"登记"，真正发射推迟到 generate()
-//       末尾的 emitStringLiterals()，保证常量池集中在一处。
+// 字符串属只读数据不能内联进指令流，要放 .rodata 再 RIP 相对取址；此处只"登记"，
+// 真正发射推迟到 generate() 末尾的 emitStringLiterals()（常量池集中在一处）。
 // demo: addStringLiteral("hello") → 登记 ("str_0", "hello")，返回 "str_0"
 //       最终 .rodata 中出现： str_0:  .string "hello"
 std::string CodeGen::addStringLiteral(const std::string& value) {
@@ -92,14 +99,15 @@ std::string CodeGen::addStringLiteral(const std::string& value) {
     return label;
 }
 
- // 汇编符号净化——gas 标签只允许 [A-Za-z0-9_.$]，源码层符号
-// 里的 "::"（命名空间限定）、"<>&,*"（模板实参）都会让汇编器报
-// "junk at end of line"。统一替换为下划线得到合法标签，如
-// Math::scale → Math__scale。这是教学版 name mangling 的一小步；
-// 对照 clang/GCC 的真 mangling：_ZN4Math5scaleEi（Itanium ABI，
-// 可编码任意类型签名且双向可逆）。
-// 注意成对一致：标签发射端（函数/全局变量）与使用端（callq / %rip 读写）
-// 必须走同一个净化函数，否则汇编期报 undefined reference。
+// 汇编符号净化 —— 非法字符替换倒查表（gas 标签只允许 [A-Za-z0-9_.$]，其余字符
+// 会让汇编器报 "junk at end of line"）：
+//   Math::scale   ⇒ Math__scale     # ':' → '_'（命名空间限定）
+//   Box<int*>     ⇒ Box_int__       # '<' '>' '*' → '_'（模板实参）
+//   Box<int&>     ⇒ Box_int__       # '&' → '_'（★ 与上一行撞名，见 docs/learn/22）
+//   f(int,int)    ⇒ f_int_int_      # '(' ')' ',' → '_'
+// ★ 必须成对一致：标签发射端（函数/全局变量）与使用端（callq / %rip 读写）走同一个
+//   净化函数，否则汇编期报 undefined reference。
+// 对照 clang/GCC 真 mangling：_ZN4Math5scaleEi（Itanium ABI，可编码任意类型签名且可逆）。
 static std::string asmSymbol(const std::string& name) {
     std::string out;
     out.reserve(name.size());
@@ -117,12 +125,14 @@ static std::string asmSymbol(const std::string& name) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 主入口：生成整个编译单元的汇编
 // ─────────────────────────────────────────────────────────────────────────────
-// 流程：① 数据段 —— 每个含虚函数的类发射 vtable 与 RTTI
-//       ② 代码段 —— 逐个发射函数（序言/形参 spill/函数体/尾声）
-//       ③ 只读段 —— 统一发射生成期间收集的字符串字面量
-//       ④ 拼装   —— 按 .text → .data → .rodata 串接返回
-// 理论：段内顺序不影响正确性 —— 汇编器允许前向引用（call 尚未定义的标签、
-//       引用后面的数据标签），真正的地址在汇编/链接期重定位填回。
+// 四步 ⇒ 各自的输入与产物：
+//   ① 类表里有虚函数的类  ⇒ .data 里 _ZTV<类>（.quad 数组）+ _ZTI<类>（typeinfo）
+//   ② 顶层 GlobalVarDecl  ⇒ .data 里 <sym>: .quad <初值>（无初值则 0）
+//   ③ functions 里的函数  ⇒ .text 里 emitFunction（序言/spill/函数体/尾声）
+//   ④ m_stringLiterals    ⇒ .rodata 里 str_N: .string "..."（emitStringLiterals）
+//   最后按 .text → .data → .rodata 串接返回
+// 段内顺序不影响正确性：汇编器允许前向引用（call 尚未定义的标签、引用后面的数据
+//   标签），真正的地址在汇编/链接期重定位填回。
 // demo: class Animal { virtual int speak(); }; + main 调用之 ⇒
 //       .text    Animal_speak: pushq %rbp ...   │  main: ...
 //       .data    _ZTV6Animal: .quad 0 / _ZTI6Animal / Animal_speak
@@ -135,9 +145,9 @@ std::string CodeGen::generate(
     // 保存全局类类型表指针：发射成员函数、虚调用、new 时都要回头查它
     m_classTypes = &classTypes;
 
-    // ── 建立"类名 → 基类名"表：typeinfo 第三槽（基类 typeinfo 指针）要用 ──
-    // 递归遍历顶层声明（含命名空间内），ClassLayout 里不存基类名，
-    // 继承关系的唯一事实来源是 AST 的 ClassDecl.baseClassNames。
+    // ── 建立"类名 → 基类名"表：emitRTTI 的基类表要用（旧格式兼容路径）──
+    // 递归遍历顶层声明（含命名空间内）：ClassLayout 里不存基类名，继承关系的唯一
+    // 事实来源是 AST 的 ClassDecl.baseClassNames。
     std::unordered_map<std::string, std::string> baseClassOf;
     std::function<void(const std::vector<DeclPtr>&)> collectBases =
         [&](const std::vector<DeclPtr>& decls) {
@@ -280,8 +290,8 @@ std::string CodeGen::generate(
 //       .quad MyClass_foo       # vtable[0]:  第一个虚函数
 //       .quad MyClass_bar       # vtable[1]:  第二个虚函数
 //
-// 理论：vtable 是"每类一张、每对象一个指针"的间接分派结构；继承/override 的
-//       差异在语义阶段已固化进 vtableEntries，这里只是把那张表写成 .quad 数组。
+// vtable = "每类一张、每对象一个指针"的间接分派结构；继承/override 的差异在语义
+//   阶段已固化进 vtableEntries，这里只是把那张表写成 .quad 数组。
 // demo: className="Dog", vtableEntries=[{Dog_speak, index=0}] ⇒
 //       .globl _ZTV3Dog / .align 8 / _ZTV3Dog:
 //       .quad 0 / .quad _ZTI3Dog / .quad Dog_speak
@@ -347,12 +357,14 @@ void CodeGen::emitVTable(const std::string& className, TypePtr classType) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Thunk 跳板发射（多继承覆写调整）
 // ─────────────────────────────────────────────────────────────────────────────
-// 理论（Itanium ABI §2.4）：次基类虚函数被派生类覆写时，调用方传的是次基类
-//   指针（this = obj + 子对象偏移），而覆写函数期待最派生类 this。Thunk 在
-//   运行期读 vptr[-2]（= offset-to-top = -(子对象偏移)），加到 this 上归顶。
-// 简化：读 vptr[-2] 而非硬编码偏移（与真实 ABI 一致），但跳板名用简化 mangling。
-// demo: thunkLabel="D_g_thunk16", funcLabel="D_g" ⇒
+// 场景（Itanium ABI §2.4）：次基类虚函数被派生类覆写 ⇒ 调用方传的是次基类 this
+//   （obj + 子对象偏移），覆写函数却要最派生类 this。三条指令：
+//   ① movq (%rdi), %rax       读 _vptr
+//   ② movq -16(%rax), %rcx    vptr[-2] = offset-to-top = -(子对象偏移)
+//   ③ addq %rcx, %rdi         this 归顶，再 jmp 真函数
+// demo: 次基类子对象偏移 16 的 D::g 覆写 ⇒
 //   D_g_thunk16: movq (%rdi),%rax / movq -16(%rax),%rcx / addq %rcx,%rdi / jmp D_g
+// 简化：读 vptr[-2] 而非硬编码偏移（与真实 ABI 一致），但跳板名用简化 mangling。
 void CodeGen::emitThunk(const std::string& thunkLabel,
                         const std::string& funcLabel, int thunkAdjust) {
     emitComment(std::format("thunk {} → {} (adjust={})", thunkLabel, funcLabel, thunkAdjust));
@@ -368,20 +380,16 @@ void CodeGen::emitThunk(const std::string& thunkLabel,
 // ═════════════════════════════════════════════════════════════════════════════
 // RTTI type_info 生成
 // ═════════════════════════════════════════════════════════════════════════════
-// 三槽布局（简化版 Itanium __si_class_type_info）：
-//   _ZTI7MyClass:
-//       .quad 0                    # type_info 自身的 vtable（简化为 0）
-//       .quad .Ltype_name_MyClass  # 类型名字符串
-//       .quad _ZTI<Base>（或 0）    # 基类 typeinfo —— dynamic_cast 的关键
-//
-// ★ 第三槽是 dynamic_cast 的关键：运行时助手沿它逐级向上走继承链，与目标
-//   typeinfo 地址比较，命中即转型成功。
-// 理论：真实 ABI 中 type_info 本身有虚表，且按继承形态分三种（无基类
-//   __class_type_info / 单继承 __si_class_type_info / 多继承 __vmi_...）。
-//   本项目只支持单继承：统一三槽布局，无基类时填 0 —— 运行时助手把"空基类
-//   指针"当作继承链终点，语义等价。
-// demo: className="Dog", base="Animal" ⇒
-//   _ZTI3Dog: .quad 0 / .quad .Ltype_name_Dog / .quad _ZTI6Animal
+// 计数式布局（简化版 __vmi_class_type_info，0/1/N 个基类统一处理）：
+//   [+0] vptr（恒 0，本实现未接真实 type_info 虚表）
+//   [+8] 类型名字符串指针
+//   [+16] 基类计数 N │ [+24+16i] bases[i].typeinfo │ [+32+16i] bases[i].offset
+// ★ 基类表是 dynamic_cast 的关键：运行时助手沿它 DFS 继承链，typeinfo 地址相等
+//   即命中；N = 0（无基类）即继承链终点。
+// 真 ABI 按继承形态分三种（__class_type_info / __si_class_type_info / __vmi_...），
+//   本项目统一用计数式一种，故 0/1/N 个基类走同一发射路径。
+// demo: class Dog : Animal ⇒
+//   _ZTI3Dog: .quad 0 / .quad .Ltype_name_Dog / .quad 1 / .quad _ZTI6Animal / .quad 0
 //   .rodata   .Ltype_name_Dog: .string "Dog"
 void CodeGen::emitRTTI(const std::string& className, TypePtr classType,
                        const std::string& baseClassName) {
@@ -430,10 +438,9 @@ void CodeGen::emitRTTI(const std::string& className, TypePtr classType,
 // ─────────────────────────────────────────────────────────────────────────────
 // 字符串字面量
 // ─────────────────────────────────────────────────────────────────────────────
-// 做什么：把生成期间 addStringLiteral 收集的所有字符串统一发射到 .rodata。
-// 理论：字符串常量池（constant pool）——同类只读数据集中存放，段的
-//       只读/可共享属性由 ELF section 标志统一管理，指令流只引用标签。
-// demo: 收集了 ("str_0", "hello") → 输出
+// 做什么：把生成期间 addStringLiteral 收集的全部字符串统一发射到 .rodata（字符串
+//   常量池思想：只读数据集中在 .rodata，指令流只引用标签）。
+// demo: m_stringLiterals = [("str_0","hello")] ⇒
 //       str_0:
 //           .string "hello"        # GAS 自动追加 '\0' 结尾
 void CodeGen::emitStringLiterals() {
@@ -451,12 +458,16 @@ void CodeGen::emitStringLiterals() {
 //         ... 函数体 ...
 //         leave │ ret                                   # 尾声：撤帧 + 返回
 //
-// 一个完整函数 = 序言 + 形参 spill + 函数体 + 尾声。三个理论要点：
-//   · 序言/尾声：建立与撤销栈帧，对应 LLVM 的 PrologEpilogInserter。
-//   · 形参 spill：System V 用寄存器传参，本实现统一存回栈槽（教学简化：
-//     访问路径单一，无需寄存器存活分析）。
-//   · 成员函数：this 占第一个参数寄存器 rdi（Itanium C++ ABI），显式形参
-//     从 rsi 起后移（regIdx = i + 1）。
+// 四段 ⇒ 各发什么：
+//   序言   pushq %rbp / movq %rsp,%rbp / subq $N,%rsp   # N 由 estimateFrameSize 先数后减
+//   spill  成员函数 this → -8(%rbp)；形参 i → paramRegs[regIdx]，槽位自 -8 起递减
+//   体     逐条 emitStmt（结果一律落 rax）
+//   尾声   leave / ret（leave = movq %rbp,%rsp; popq %rbp）
+// ★ 形参一律 spill 回栈槽：System V 用寄存器传参，本实现让局部/形参/this 全走
+//   m_localVars 查表 → -N(%rbp)，访问路径单一，不做寄存器存活分析。
+// ★ 成员函数：this 占 rdi（Itanium C++ ABI，隐式第 0 参数），显式形参从 rsi 起
+//   右移一位（regIdx = i + 1）。
+// 对照 clang：CodeGenFunction::GenerateCode + PrologEpilogInserter（序言/尾声）。
 // demo: int add(int a, int b) { return a + b; } ⇒
 //   .globl add │ add: pushq %rbp / movq %rsp,%rbp / subq $64,%rsp
 //                    movq %rdi,-8(%rbp)  # a │ movq %rsi,-16(%rbp)  # b
@@ -493,22 +504,19 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     emitComment(std::format("Function: {} (params: {})",
         func->name, func->parameters.size()));
 
-    // 函数序言（Prologue）
-    // 理论：pushq %rbp 保存调用者的帧基址（rbp 是 callee-saved 寄存器）；
-    //       movq %rsp,%rbp 让新帧获得稳定锚点——此后所有局部访问都是
-    //       %rbp+常数偏移，与 %rsp 的瞬时位置（push/pop 变化）无关。
+    // 函数序言（Prologue）：pushq %rbp 保存调用者的帧基址（%rbp 是 callee-saved，
+    //   离开前必须还原）；movq %rsp,%rbp 让新帧获得稳定锚点 —— 此后所有局部访问都是
+    //   %rbp+常数偏移，与 %rsp 的瞬时位置（push/pop 变化）无关。
     emit("pushq %rbp                    # 保存调用者的帧基址到栈上");
     emit("movq %rsp, %rbp               # 建立新栈帧：rbp = rsp（此后用 rbp+偏移访问局部）");
 
-    // 预留局部变量空间
-    // ★ P1：不再固定 64 字节——栈上类对象可能远超 8 字节，固定预留会
-    //   在"类对象稍多几个"时写穿帧底（踩坏调用者栈）。先扫一遍函数体
-    //   数出所有局部声明的总尺寸（类对象按布局 totalSize 对齐 8，其余
-    //   按 8 字节槽），再一次性减出来。
-    //   对照真实编译器：即 LLVM PrologEpilogInserter 的帧大小计算，
-    //   此处为"先数后减"的朴素一遍扫描；嵌套块里的声明也数进去
-    //   （宁可多留，不做精确复用——与槽位不回收的语义保持一致）。
-    //   保底 64 字节：兼顾临时 pushq 周转（表达式求值的栈暂存）。
+    // 预留局部变量空间：subq $N,%rsp，N 由 estimateFrameSize 先数后减
+    //   int x;                  ⇒ 计 8B（8 字节槽）
+    //   Dog d;                  ⇒ 计 sizeof(Dog) 对齐 8（可能远超 8B）
+    //   嵌套块里的声明          ⇒ 也数（槽位不回收，宁可帧大）
+    // 保底 64B：覆盖表达式求值的临时 pushq 周转。
+    // ★ P1 教训：不可固定 64 字节 —— 栈上类对象稍多几个就写穿帧底（踩坏调用者栈）。
+    // 对照 clang：PrologEpilogInserter / X86FrameLowering::determineFrameLayout。
     uint32_t frameSize = estimateFrameSize(func);
     if (frameSize < 64) frameSize = 64;
     frameSize = (frameSize + 15) / 16 * 16;   // 16 字节对齐（System V）
@@ -620,8 +628,7 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
                         // 子对象内联在 this+field->offset 处，构造调用与基类构造同构：
                         // 实参进寄存器，this = 原始 this + 字段偏移。
                         // ★ 类类型字段不可按标量处理（踩坑史 C2）。
-                        // 对照 clang：初始化列表 f(7,9) 生成对 Five::Five(int,int)
-                        // 的直接调用（this 已调整）。
+                        // 对照 clang：初始化列表直接调 Five::Five(int,int)（this 已调整）
                         const std::string& cn = field->type->name;
                         std::string ctorName = cn + "_" + cn + "_" +
                             std::to_string(init.arguments.size());
@@ -638,9 +645,10 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
                             field->offset, field->name, field->offset));
                         emit(std::format("callq {}                # 调用嵌套类构造函数", ctorName));
                     } else {
-                        // ── 标量字段：【必须】按宽度选存储指令 ──
-                        // 一律 movq 会踩坏相邻字段（踩坑史 C3）。
-                        // 对照 clang：按 TI.Width 选 movl/movb/movq。
+                        // ── 标量字段：【必须】按宽度选存储指令，与读路径对称 ──
+                        //   1B ⇒ movb │ ≤4B ⇒ movl │ 8B ⇒ movq
+                        // ★ 一律 movq 会踩坏相邻字段（踩坑史 C3）。
+                        // 对照 clang：CodeGenFunction::EmitStoreOfScalar（按 TI.Width 选指令）。
                         emitExpr(init.arguments[0]);
                         emit("movq -8(%rbp), %rcx       # 加载 this 指针");
                         if (field->size == 1) {
@@ -729,27 +737,26 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
 // ═════════════════════════════════════════════════════════════════════════════
 // 语句生成
 // ═════════════════════════════════════════════════════════════════════════════
-// 做什么：语句分发器——按 AST 节点动态类型派发到对应 emit 函数。
-// 理论：这就是"lowering（降级）"的入口：高级结构（声明/赋值/if/while）
-//       逐层展开为线性指令序列。对应 LLVM SelectionDAG 的类型匹配与
-//       Legalize 阶段，区别是这里用 dynamic_pointer_cast 手写派发。
+// 做什么：语句分发器——stmt->accept(*this) 一次虚表跳转落到对应 visit 重载（分派
+//   判据见 ast_visitor.h / semantic_analyzer.h），是"lowering（降级）"的入口。
+// 节点 ⇒ 目标 visit（高级结构就此逐层展开为线性指令序列）：
+//   BlockStmt/IfStmt/WhileStmt/VarDeclStmt/AssignStmt/ReturnStmt/DeleteStmt/ExprStmt
+//   ⇒ 同名 visit(…) 重载；对应 LLVM SelectionDAG 的类型匹配与 Legalize 阶段。
 void CodeGen::emitStmt(const StmtPtr& stmt) {
     if (!stmt) return;
     // 一次虚表跳转就落到对应的 visit（改造前是逐级 dynamic_pointer_cast 试探）。
     stmt->accept(*this);
 }
 
-// 复合语句：顺序发射各子语句 + ★块尾逆序析构本块声明的类对象（RAII）★。
-// 理论（[basic.stc.dcl] + [class.dtor]）：块作用域存储期的对象，其析构
-//       在控制流离开块时自动发生，且顺序与构造相反（LIFO）——先构造的
-//       后析构。这正是 RAII 的机器实现：不需要任何显式调用，编译器在块尾
-//       "代劳"。
-// 实现：进入块时在 m_blockDtorStack 压一层空列表；块内 emitVarDecl 每声明
-//       一个类对象就往当前层追加名字；块结束时逆序发射析构调用后弹层。
-//       嵌套块天然正确：内层弹层只析构自己那层的对象，外层列表原封不动
-//       （与符号表 enterScope/exitScope 同构）。
-// 简化：中途 return（emitReturn 直接 leave/ret）会跳过析构——真实编译器
-//       会在每个退栈点补析构调用，教学版接受此差距并在文档中注明。
+// 复合语句：顺序发射子语句 + ★块尾逆序析构本块声明的类对象（RAII）★。
+// 机制（[basic.stc.dcl] + [class.dtor]）：进块在 m_blockDtorStack 压一层空表
+//   → 块内每个类对象声明 push_back 名字 → 出块逆序发射 ~T() 后弹层。
+// demo: { Dog a; Dog b; } ⇒ Dog_Dog / Dog_Dog / 块尾 ~Dog(b) / ~Dog(a)（LIFO）
+//   （int x; 之类标量不进此表，不析构）
+// 嵌套块天然正确：内层弹层只析构自己那层，外层列表原封不动（与符号表
+//   enterScope/exitScope 同构）。
+// 简化：中途 return（直接 leave/ret）跳过析构——真实编译器会在每个退栈点补析构
+//   调用，教学版接受此差距（见文档 12）。
 void CodeGen::visit(BlockStmt& block) {
     m_blockDtorStack.push_back({});   // enter scope：本块专属析构层
 
@@ -773,14 +780,14 @@ void CodeGen::visit(BlockStmt& block) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 栈对象析构调用（块尾析构与"析构但不 free"的统一发射点）
 // ─────────────────────────────────────────────────────────────────────────────
-// 做什么：发射"对栈上对象调用析构函数"的完整序列：
-//   ① leaq off(%rbp), %rdi —— this = 对象地址（栈对象没有指针变量，
-//      地址是编译期常数，直接取址）；
-//   ② 定虚实：查该类 vtable 条目有无 "dtor"（与 emitDelete 同一判据）——
-//      虚析构走 emitVirtualCall 三部曲（运行期定派，[class.dtor]/4），
-//      否则静态 callq {Class}_dtor（符号约定见 registerFunction）。
-// 与 emitDelete 的区别：没有后续 `callq free`——栈帧空间随函数返回自动
-//      回收（[basic.stc.dcl]），这正是栈对象相对堆对象的便宜之处。
+// 两条路径（判据：该类 vtableEntries 里有没有 "dtor"，同 visit(DeleteStmt)）：
+//   虚析构 ⇒ leaq off(%rbp),%rdi → emitVirtualCall 三部曲（运行期定派，[class.dtor]/4）
+//   非虚   ⇒ leaq off(%rbp),%rdi → callq {Class}_dtor（符号约定见 registerFunction）
+// demo: { Dog d; } 块尾 ⇒ leaq -16(%rbp),%rdi / movq (%rdi),%rax /
+//                        movq 0(%rax),%rax / callq *%rax
+// ★ this = 对象地址，栈对象没有指针变量 ⇒ 编译期常数偏移，直接 leaq 取址。
+// 与 visit(DeleteStmt) 的区别：没有后续 callq free——栈帧随函数返回自动回收
+//   （[basic.stc.dcl]），这正是栈对象相对堆对象的便宜之处。
 void CodeGen::emitClassDtorCall(const std::string& className, int rbpOffset) {
     emit(std::format("leaq {}(%rbp), %rdi       # this = 栈上对象地址（直接取址，无指针变量）", rbpOffset));
 
@@ -803,13 +810,12 @@ void CodeGen::emitClassDtorCall(const std::string& className, int rbpOffset) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 帧大小预估（序言的 subq $N 用）
 // ─────────────────────────────────────────────────────────────────────────────
-// 做什么：扫一遍函数体，累加每条变量声明的栈占用：
-//   · 类类型局部 → ClassLayout.totalSize 对齐 8（与 emitVarDecl 同规则）
-//   · 其余（int/指针/形参外局部）→ 8 字节槽
-// 递归进 if/while/嵌套块——块尾析构后槽位并不复用（emitBlockStmt 的
-// 简化语义），所以最保守的算法是"全部加起来"：宁可帧大，不可写穿。
-// 注意：只数声明，不数表达式求值用的临时 push 空间（emitFunction 保底
-// 64 字节已覆盖常见深度；嵌套极深的表达式属可接受的教学差距）。
+// 节点 ⇒ 计入字节数（switch 按 NodeKind 标签分派）：
+//   VarDecl + 类类型 ⇒ totalSize 对齐 8（至少 8）│ VarDecl 其余 ⇒ 8 字节槽
+//   Block / If / While ⇒ 递归进子块（嵌套块里的声明也数进去）
+//   其余（表达式/return/delete…）⇒ 0
+// ★ 只数声明，不数表达式求值的临时 push 空间（保底 64B 覆盖常见深度）。
+// ★ 最保守算法："全部加起来"——块尾析构后槽位并不复用，宁可帧大，不可写穿。
 uint32_t CodeGen::estimateBlockSize(std::shared_ptr<BlockStmt> block) {
     if (!block) return 0;
     uint32_t total = 0;
@@ -856,12 +862,11 @@ uint32_t CodeGen::estimateBlockSize(std::shared_ptr<BlockStmt> block) {
 }
 
 // 帧大小 = 局部变量总尺寸 + 序言区（帧基 + 形参 spill 槽）。
-//
+// demo: int f(int a, int b) { int x; } ⇒ 8B(帧基) + 16B(两形参槽) + 8B(x) = 32B
 // ★ 序言区【必须】计入：漏算会让最深的局部落到 rsp 之下，被表达式求值的
 //   `pushq %rax` 与 `callq` 压入的返回地址踩掉（症状极具迷惑性，见踩坑史 C1）。
-//   对照真实编译器：帧大小是序言与局部布局【同一份】分配器的产物
-//   （LLVM PrologEpilogInserter / X86FrameLowering::determineFrameLayout），
-//   不存在"两处各算一份、彼此对不上"的可能。
+// 对照 clang：PrologEpilogInserter / X86FrameLowering::determineFrameLayout ——
+//   帧大小是序言与局部布局【同一份】分配器的产物，不存在两处各算一份却对不上。
 uint32_t CodeGen::estimateFrameSize(FuncDeclPtr func) {
     uint32_t total = estimateBlockSize(func->body);
 
@@ -918,19 +923,18 @@ uint32_t CodeGen::getBaseOffset(const std::string& derivedClassName,
 // ─────────────────────────────────────────────────────────────────────────────
 // 变量声明
 // ─────────────────────────────────────────────────────────────────────────────
-// 为新变量分配栈槽并生成初始化（auto 到这里已被替换为具体类型）。
-// 两条路径：
-//   ① 标量（int/bool/指针）：8 字节槽 + 初始化式求值写入。
-//   ② ★类对象（[basic.stc.dcl] 栈对象）：分配 totalSize（对齐 8）→ 零初始化
-//      → 安装 _vptr（如有）→ 调构造函数（this = leaq 取栈上地址）。对象地址
-//      登记进 m_classLocals，块尾由 emitBlockStmt 逆序发射析构。
-//      对照真实编译器：即"栈上 placement 构造"—— new 在堆上做的事这里直接
-//      在帧内完成（无 malloc，故析构后也无需 free）。
-// demo: int x = 10;  ⇒ movq $10,%rax / movq %rax,-32(%rbp)   # store to x
-//       int y;       ⇒ movq $0,-40(%rbp)                     # 无初始化式则清零
-//       Dog d;       ⇒ 帧内留 sizeof(Dog) 字节 → 全部清零 →
-//                      leaq _ZTV3Dog(%rip)+16,%rcx / movq %rcx,off(%rbp)
-//                      leaq off(%rbp),%rdi / callq Dog_Dog
+// 路径分派（declaredType 命中全局类表 ⇒ ②，否则 ①；auto 此时已被替换为具体类型）：
+//   ① 标量 int/bool/指针 ⇒ 槽 8B；有初值 emitExpr → movq %rax,off(%rbp)，无则 movq $0
+//   ② 类对象 Dog d;      ⇒ 槽 totalSize 对齐 8 → 整对象按 8B 一拍清零
+//                         → 装 _vptr（多态类）→ leaq off(%rbp),%rdi / callq Dog_Dog
+// ★ ②是"栈上 placement 构造"（[basic.stc.dcl]）：地址登记进 m_classLocals，块尾
+//   由 visit(BlockStmt) 逆序析构 —— new 在堆上做的事这里直接在帧内完成，无 malloc
+//   故析构后也无需 free。
+// demo: int x = 10; ⇒ movq $10,%rax / movq %rax,-32(%rbp)
+//       int y;      ⇒ movq $0,-40(%rbp)                     # 无初始化式则清零
+//       Dog d;      ⇒ movq $0,off(%rbp)（按 8B 拍清零）/
+//                     leaq _ZTV3Dog(%rip),%rcx / addq $16,%rcx / movq %rcx,off(%rbp) /
+//                     leaq off(%rbp),%rdi / callq Dog_Dog
 void CodeGen::visit(VarDeclStmt& decl) {
     // ── 路径②：声明类型是类 → 栈对象（RAII 的地基）──
     // 判据：declaredType 的类名命中全局类表（auto 已在 Sema 阶段替换完，
@@ -1060,15 +1064,17 @@ void CodeGen::visit(VarDeclStmt& decl) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 赋值语句
 // ─────────────────────────────────────────────────────────────────────────────
-// 字段名在此"降级"为数字偏移量：u.age = 20;（age 偏移 4）⇒ movl $20, 4(%rax)
-// 两条路径：
-//   ① 普通变量 x = e   → e 求值进 rax，写入 x 的栈槽
-//   ② 字段赋值 o.f = e → 对象地址进 rcx，按 ClassLayout 查到的偏移生成
-//                        movl %eax, off(%rcx)
-// demo: u.age = 20;（偏移 0）⇒ movq $20,%rax / <对象地址 → %rcx> /
-//                             movq $20,%rax / movl %eax,0(%rcx)
-// 注：字段路径把右值【求值两次】（先算一遍、算完对象地址再重算）—— 教学
-//     简化，假定右值无副作用；真实编译器用寄存器分配避免重复求值。
+// 赋值目标三态 ⇒ 各自落点（按 NodeKind 一次 switch，三者互斥）：
+//   Index  v[i] = e ⇒ 糖化 v.set(i, e)：右值 pushq 暂存 / 下标 → %rsi / this → %rdi / callq V_set
+//   Var    x = e    ⇒ ① 裸字段名 age = e ≡ this->age = e（查类字段 + 偏移写入）
+//                     ② m_localVars 命中 ⇒ movq %rax, off(%rbp)
+//                     ③ 兜底全局        ⇒ movq %rax, <sym>(%rip)
+//   Member o.f = e  ⇒ 对象地址 → %rcx，按字段宽度写：≤4B movl %eax,off(%rcx) │ 8B movq
+// demo: u.age = 20;（age 偏移 0）⇒ <右值 → %rax> / <对象地址 → %rcx> / movl %eax,0(%rcx)
+// ★ 裸字段名必须在全局兜底【之前】判：否则降级成 movq %rax, age(%rip) ⇒ 链接期
+//   undefined reference。
+// 注：字段路径把右值【求值两次】（先算一遍、算完对象地址再重算）—— 教学简化，
+//   假定右值无副作用；真实编译器用寄存器分配避免重复求值。
 void CodeGen::visit(AssignStmt& stmt) {
     // 计算右值到 rax
     emitExpr(stmt.value);
@@ -1188,10 +1194,9 @@ void CodeGen::visit(AssignStmt& stmt) {
 // ─────────────────────────────────────────────────────────────────────────────
 // return 语句
 // ─────────────────────────────────────────────────────────────────────────────
-// 把返回值算进 rax，就地撤销栈帧返回。System V 规定整数返回值在 rax；
-// leave 等价于 movq %rbp,%rsp; popq %rbp，ret 弹返回地址跳回调用方。
-// 这里的 leave/ret 与 emitFunction 尾声相同 —— 任意位置 return 都能正确
-// 退栈，因为所有局部都锚定在 %rbp 上。
+// 返回值算进 rax 后就地 leave / ret 撤帧（System V 规定整数返回值在 rax）。
+// ★ 任意位置 return 都能正确退栈：所有局部都锚定在 %rbp 上，leave 一步还原
+//   （leave = movq %rbp,%rsp; popq %rbp，ret 弹返回地址跳回调用方）。
 // demo: return a + 1;（a 在 -8(%rbp)）⇒ movq -8(%rbp),%rax /
 //       pushq %rax / movq $1,%rax / movq %rax,%rcx / popq %rax /
 //       addq %rcx,%rax / leave / ret
@@ -1208,7 +1213,8 @@ void CodeGen::visit(ReturnStmt& stmt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// delete 语句
+// delete 语句：析构（vtableEntries 有 "dtor" ⇒ 虚析构走三部曲，否则静态 callq）
+//   + callq free。对应真 C++ 的 delete = 析构 + operator delete。
 // ─────────────────────────────────────────────────────────────────────────────
 void CodeGen::visit(DeleteStmt& stmt) {
     emitComment("delete pointer");
@@ -1250,30 +1256,18 @@ void CodeGen::visit(DeleteStmt& stmt) {
 // ─────────────────────────────────────────────────────────────────────────────
 // if 语句
 // ─────────────────────────────────────────────────────────────────────────────
-// 生成模式：
-//   <condition>
-//   testq %rax, %rax
-//   je .L_else_N
-//   <then branch>
-//   jmp .L_end_N
-//   .L_else_N:
-//   <else branch>
-//   .L_end_N:
-// ─────────────────────────────────────────────────────────────────────────────
-// 做什么：把 if/else 降级为"条件跳转 + 标签"。
-// 理论：结构化控制流在机器层面只剩两条原语——测试与跳转。
-//       testq %rax,%rax 用 rax 与自身按位与来置标志位（结果非 0 则
-//       ZF=0）；je（jump if zero）在 ZF=1 即"条件为假"时跳走。
-//       无 else 时，条件为假直接跳到 endif 标签。
-// demo: if (x > 0) { y = 1; } else { y = 2; }  →
-//       <x 与 0 的比较>           # rax = 条件值（0 或 1）
-//       testq %rax, %rax
-//       je else_0                 # 为假 → 跳 else
-//       <then 分支>
-//       jmp endif_1               # 为真 → 跳过 else
+// 降级模板（条件跳转 + 标签）：
+//   <condition>                   # rax = 条件值（0 或 1）
+//   testq %rax, %rax              # rax 与自身按位与置 ZF（非 0 ⇒ ZF=0）
+//   je else_0                     # ZF=1 即"条件为假"时跳走
+//   <then 分支>
+//   jmp endif_1                   # 为真 → 跳过 else
 //   else_0:
-//       <else 分支>
+//   <else 分支>
 //   endif_1:
+// 无 else 时 je 直接跳 endif（不生成 else_0）。testq + je 是机器层仅剩的两条
+// 控制流原语。
+// demo: if (x > 0) { y = 1; } else { y = 2; } ⇒ 上面这张图（标签即实际所见）
 void CodeGen::visit(IfStmt& stmt) {
     std::string elseLabel = newLabel("else");
     std::string endLabel = newLabel("endif");
@@ -1299,16 +1293,15 @@ void CodeGen::visit(IfStmt& stmt) {
 // ─────────────────────────────────────────────────────────────────────────────
 // while 语句
 // ─────────────────────────────────────────────────────────────────────────────
-// 降级为"标签 + 条件跳出 + 回边跳转"：
-//   while_begin_N: <condition> / testq %rax,%rax / je while_end_N
-//                  <body> / jmp while_begin_N          # 回边
-//   while_end_N:
-// 理论：循环 = 条件测试在前的基本块 + 一条回边（back edge）。这也是流图
-//       reducibility 的经典形状 —— 自然循环的识别就靠回边。
-// demo: while (i > 0) { i = i - 1; } ⇒
-//   while_begin_2: <i 与 0 的比较> / testq %rax,%rax / je while_end_3
-//                  <循环体> / jmp while_begin_2
+// 降级模板（标签 + 条件跳出 + 回边跳转）：
+//   while_begin_2: <condition>              # i > 0 的比较，rax = 0/1
+//                  testq %rax, %rax / je while_end_3   # 条件为假跳出
+//                  <body>                  # i = i - 1
+//                  jmp while_begin_2       # 回边（back edge）
 //   while_end_3:
+// 回边 = 自然循环的识别依据（流图 reducibility 的经典形状：条件测试在前的基本块
+//   + 一条回边）。
+// demo: while (i > 0) { i = i - 1; } ⇒ 上面这张图
 void CodeGen::visit(WhileStmt& stmt) {
     std::string beginLabel = newLabel("while_begin");
     std::string endLabel = newLabel("while_end");
@@ -1337,11 +1330,14 @@ void CodeGen::visit(ExprStmt& stmt) {
 // ═════════════════════════════════════════════════════════════════════════════
 // 核心约定：每个表达式的结果放在 rax 寄存器中
 // ═════════════════════════════════════════════════════════════════════════════
-// 做什么：表达式分发器——与 emitStmt 同构，按节点动态类型派发。
-// 约定（再强调）：无论表达式多复杂，结果一律落在 rax（单累加器模型）；
-//       子表达式的中间值靠 push/pop 经栈周转（见 emitBinary）。
-// 注意：nullptr 没有单独的 emit 函数，直接内联在此——xorq 自异或清零
-//       是 x86 惯用的"置 0"写法（比 movq $0 更短且不依赖立即数）。
+// 做什么：表达式分发器——与 emitStmt 同构，expr->accept(*this) 一次虚表跳转落到
+//   对应 visit 重载。
+// ★ 单累加器模型：无论表达式多复杂，结果一律落在 rax；子表达式的中间值靠
+//   push/pop 经栈周转（见 visit(BinaryExpr)）。
+// 节点 ⇒ 目标 visit：IntLiteral/BoolLiteral/StringLiteral/Var/Binary/Unary/Call/
+//   Member/Index/New/This/NullptrLiteral/DynamicCast ⇒ 同名 visit(…) 重载。
+// 注意：nullptr 没有独立的 emit 函数，就地以 visit(NullptrLiteralExpr&) 发射
+//   （改造前它就在这条链的末尾）。
 void CodeGen::emitExpr(const ExprPtr& expr) {
     if (!expr) return;
     // 同上：accept 虚表分派。
@@ -1370,9 +1366,8 @@ void CodeGen::visit(BoolLiteralExpr& expr) {
 }
 
 // 字符串字面量：登记进常量池取标签，再用 RIP 相对寻址取地址。
-// 理论：leaq str_N(%rip), %rax 是位置无关的地址计算方式——
-//       目标地址 = 执行本条指令时的 RIP + 汇编器算好的偏移，
-//       由重定位在汇编/链接期填回，代码段无需知道绝对地址。
+// leaq str_N(%rip),%rax 是位置无关的地址计算：目标 = 本条指令的 RIP + 汇编器算好的
+// 偏移，由重定位在汇编/链接期填回，代码段无需知道绝对地址。
 // demo: "hello" → .rodata 中 str_0: .string "hello"
 //                 此处发射 leaq str_0(%rip), %rax
 void CodeGen::visit(StringLiteralExpr& expr) {
@@ -1380,15 +1375,17 @@ void CodeGen::visit(StringLiteralExpr& expr) {
     emit(std::format("leaq {}(%rip), %rax      # 加载字符串字面量地址（PIC）", label));
 }
 
-// 做什么：把变量的值加载进 rax。两级查找：
-//   ① 局部变量表（含 this 与 spill 下来的形参）→ movq off(%rbp), %rax
-//   ② 类方法体内的裸字段名 → 隐含 this->field：先加载 this，
-//      再按字段偏移 movl off(%rax), %eax（名字 → 偏移的降级）
-// demo: x（局部，槽位 -32）→ movq -32(%rbp), %rax
-//       age（Animal 字段，偏移 0）→ movq -8(%rbp), %rax   # load this
-//                                   movl 0(%rax), %eax    # load .age
-// 兜底：两级都查不到时输出 WARNING 注释并清零（语义阶段本应已拦截，
-//       这里是双保险，保证 .s 仍然合法可汇编）。
+// 做什么：把变量的值加载进 rax。四级查找（顺序即优先级）：
+//   ① m_classLocals 栈类对象   ⇒ leaq off(%rbp),%rax（★ 值语义 = 对象地址）
+//   ② m_localVars 局部/形参/this ⇒ movq off(%rbp),%rax
+//   ③ 裸字段名（方法体内 age ≡ this->age）⇒ movq this(%rbp),%rax / movl off(%rax),%eax
+//   ④ 兜底：全局变量            ⇒ movq <sym>(%rip),%rax（asmSymbol 净化 "::"）
+// demo: x（槽位 -32）⇒ movq -32(%rbp),%rax │ g（全局）⇒ movq g(%rip),%rax
+//       age（Animal 字段，偏移 0）⇒ movq -8(%rbp),%rax # load this
+//                                  movl 0(%rax),%eax  # load .age
+// ★ ①必须排在②前：类对象槽里存的是对象内容首 8 字节（_vptr），直接加载会得到
+//   _vptr 而非对象地址（虚调用碰巧能跑，字段访问与析构取址全错）。
+// 兜底④保证 .s 仍合法可汇编（符号表查不到的路径 Sema 本应拦截，见 docs/learn/22 ⑦）。
 void CodeGen::visit(VarExpr& expr) {
     // ★ 栈上类对象：值语义 = 对象地址（与指针表达式的值一致）——
     //   后续 emitMember/emitCall 对 "." 的约定就是"地址已在 rax"，
@@ -1436,10 +1433,14 @@ void CodeGen::visit(VarExpr& expr) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 指令模式：<left> → rax │ pushq %rax │ <right> → rax │ movq %rax,%rcx │
 //           popq %rax │ <operation>
-// 理论（单累加器求值）：本实现只有 rax 一个万能结果寄存器，求右操作数会冲掉
-//       左操作数，故左值先压栈暂存、算完右值再弹回 —— 这是"表达式树 → 线性
-//       指令序列"的经典调度问题（LLVM 由寄存器分配器全局优化；教学实现用栈
-//       周转，正确但多访存）。
+// ★ 左值为什么要压栈：只有 rax 一个结果寄存器，求右值会冲掉左值 —— 表达式树 →
+//   线性指令的经典调度问题（LLVM 交给寄存器分配器全局优化，本实现用栈周转）。
+// 按 op 分派 ⇒ 运算指令：
+//   + ⇒ addq %rcx,%rax │ - ⇒ subq │ * ⇒ imulq（有符号）
+//   / ⇒ cqto + idivq（rax=商）│ % ⇒ 同上 + movq %rdx,%rax（余数在 rdx）
+//   == ⇒ cmpq + sete %al + movzbq（!= < > <= >= 同理，只换 setcc 后缀）
+//   && ⇒ andq │ || ⇒ orq（⚠ 短路求值未实现：真 &&/|| 需条件跳转，形状等价两个嵌套 if）
+// ⚠ 除法族必须先 cqto：idivq 算的是 128 位被除数 rdx:rax ÷ rcx，rdx 里的垃圾值会毁掉被除数。
 // demo: a + 1（a 在 -8(%rbp)）⇒ movq -8(%rbp),%rax / pushq %rax /
 //       movq $1,%rax / movq %rax,%rcx / popq %rax / addq %rcx,%rax
 void CodeGen::visit(BinaryExpr& expr) {
@@ -1532,11 +1533,10 @@ void CodeGen::visit(BinaryExpr& expr) {
 // demo: -x → <加载 x 进 rax>; negq %rax
 //       !x → <加载 x 进 rax>; testq %rax, %rax; sete %al; movzbq %al, %rax
 void CodeGen::visit(UnaryExpr& expr) {
-    // ── 取地址 &x：要的是【地址】而不是值，故不能先 emitExpr(operand) ──
-    // 对栈上的局部变量，地址就是 leaq off(%rbp)；先加载值再取址会得到
-    // "值所在的内存地址"这种毫无意义的指针。
-    // 对照 clang：CodeGenFunction::EmitUnaryOp 中 UO_AddrOf 走
-    //   EmitLValue(E) + EmitLValueAsAddr（求左值地址，而非求值）。
+    // ── &x 要的是【地址】而不是值，故不能先 emitExpr(operand) ──
+    // 操作数形态 ⇒ 指令：栈对象/局部变量 ⇒ leaq off(%rbp),%rax
+    //   其它形态（字段地址、数组元素地址…）尚未实现 ⇒ 明确报错，不静默给错值。
+    // 对照 clang：CodeGenFunction::EmitUnaryOp 的 UO_AddrOf 走 EmitLValue + EmitLValueAsAddr。
     if (expr.op == UnaryOp::Addr) {
         if (expr.operand->kind == NodeKind::Var) {
             auto var = std::static_pointer_cast<VarExpr>(expr.operand);
@@ -1581,13 +1581,13 @@ void CodeGen::visit(UnaryExpr& expr) {
 // 函数调用
 // ─────────────────────────────────────────────────────────────────────────────
 // System V AMD64 参数传递：rdi / rsi / rdx / rcx / r8 / r9，返回值 rax。
-// 三路分发：
-//   ① callee 是成员表达式且命中 vtable 条目 → 虚调用 emitVirtualCall
-//   ② callee 是成员表达式但非虚方法          → 直接 call "类名_方法名"，this 进 rdi
-//   ③ 普通自由函数                           → 实参进 rdi/rsi/... 后 call 函数名
-// 理论：实参为何先逐个压栈、再逆序弹出到寄存器？因为求第 i+1 个实参会破坏
-//       rax 中第 i 个的值，栈是天然暂存区；逆序弹出恰好让"第 1 个实参"最后
-//       进入第 1 个参数寄存器。
+// callee 形态 ⇒ 走哪条路：
+//   obj.vf() / p->vf() 且命中 vtable 条目 ⇒ 虚调用 emitVirtualCall（三部曲）
+//   obj.m()  / p->m()  非虚方法          ⇒ emitExpr(obj) → pushq → popq %rdi，
+//                                          实参逆序 popq 到 rsi/rdx/…，callq 类名_方法名
+//   f(a,b)             自由函数          ⇒ 实参逆序 push → popq rdi/rsi/… → callq f
+// ★ 实参为什么先逐个压栈再逆序弹出：求第 i+1 个实参会破坏 rax 中第 i 个的值，
+//   栈是天然暂存区；逆序弹出恰好让"第 1 个实参"最后进入第 1 个参数寄存器。
 // demo: add(1,2) ⇒ movq $1,%rax / pushq %rax / movq $2,%rax / pushq %rax /
 //                   popq %rsi / popq %rdi / callq add
 //       d.get(5)（非虚）⇒ this(d 的地址) → rdi，5 → rsi，callq Dog_get
@@ -1699,33 +1699,27 @@ void CodeGen::visit(CallExpr& expr) {
 // 虚函数调用 —— 编译器最精彩的"三部曲"
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// ptr->vfunc(args) 在机器码层面【不能】直接 call vfunc —— 编译期不知道 ptr
-// 指向哪个具体类型，必须经虚函数表在运行期查出真正的函数地址：
+// ptr->vfunc(args) 在机器码层面【不能】直接 call —— 编译期不知道 ptr 的具体类型，
+// 必须经 vtable 在运行期查出真地址："编译期看符号，运行期看偏移量"：
 //
-//   (a) movq (objAddr), %rax        # rax = obj._vptr
-//   (b) movq index*8(%rax), %rax    # rax = vtable[index]
-//   (c) callq *%rax                 # 间接调用
+//   编译期  ptr->vfunc()  ⇒ 查符号表得 vtable 下标（= 本函数的 vtableIndex 参数）
+//   运行期  [obj+0] → vtable → [vtable+index*8] → 真地址
 //
-// 这就是"编译期看符号，运行期看偏移量"的终极体现：
-//   编译期  ptr->vfunc() → 查符号表得 vtable index
-//   运行期  [ptr+0] → vtable → [vtable+index*8] → 真实函数地址 → 执行
+// 实际发射（demo: pet->speak()，Animal，speak 在 vtable[0]，无实参）：
+//   pushq %rdi             # 暂存 this（求实参要用 rax 与参数寄存器）
+//   popq %rdi              # 弹回 this —— 排在逆序弹实参之后，兼作第 0 实参
+//   movq (%rdi), %rax      # (a) 对象首 8 字节 = _vptr
+//   movq 0(%rax), %rax     # (b) vtable[index]（下标编译期定死）
+//   callq *%rax            # (c) 间接调用（表项内容运行期才定）
 //
-// className/methodName 仅用于生成可读注释；args 不含 this；vtableIndex 是
-// 编译期常数。
-// demo: pet->speak()（Animal，speak 在 vtable[0]，无实参）⇒
-//   movq %rdi,%rbx / movq %rbx,%rdi / movq (%rdi),%rax /
-//   movq 0(%rax),%rax / callq *%rax
+// className/methodName 仅用于生成可读注释；args 不含 this；vtableIndex 是编译期常数。
 //
 // ⚠ 两条约定必须统一，否则就是段错误：
-//   1. this 来源：进入本函数时对象地址必须已在 rdi —— emitCall 走
-//      "emitExpr(object) → pushq → popq %rdi" 喂入；块尾/emitDelete 走
+//   1. this 来源：进入本函数时对象地址必须已在 rdi —— visit(CallExpr) 走
+//      "emitExpr(object) → movq %rax,%rdi" 喂入，块尾析构/visit(DeleteStmt) 走
 //      "leaq off(%rbp),%rdi"（栈对象）喂入。
-//      rbx 是 callee-saved：本函数用它暂存对象地址后【自行恢复】，保证离开时
-//      调用者的 rbx 原值不变（P1 修正：原先直接挪用不恢复，栈对象的析构经
-//      虚表分派时依赖此约定）。
-//   2. 偏移公式 index*8：emitNew 与构造函数把 _vptr 写成表首+16（已指向
-//      vtable[0]），从 _vptr 起按 index*8 取项即可；误用 (index+2)*8 会越过
-//      表尾读到垃圾地址。
+//   2. 偏移公式 index*8：emitNew 与构造函数把 _vptr 写成表首+16（已指向 vtable[0]），
+//      从 _vptr 起按 index*8 取项即可；误用 (index+2)*8 会越过表尾读到垃圾地址。
 void CodeGen::emitVirtualCall(
     const std::string& className,
     const std::string& methodName,
@@ -1737,7 +1731,7 @@ void CodeGen::emitVirtualCall(
 
     // ─── 保存对象地址 ───
     // this 进入时在 rdi；先压栈保护（下面求/弹实参会反复使用 rax 与
-    // 参数寄存器），最后弹回 rdi 兼作第 0 实参（rbx 只做中途暂存）
+    // 参数寄存器），最后弹回 rdi 兼作第 0 实参
     emit("pushq %rdi                   # 暂存 this（对象地址）到栈上保护");
 
     // ─── 准备参数 ───
@@ -1783,21 +1777,19 @@ void CodeGen::emitVirtualCall(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 成员访问
+// 成员访问 obj.field（字段名在此彻底消失，只剩 ClassLayout 算好的数字偏移量）
 // ─────────────────────────────────────────────────────────────────────────────
-// obj.field 的消除过程：
-//   编译期：查 ClassLayout 得到 field 的偏移量
-//   汇编：  [objAddr + fieldOffset] → rax
-//   字段名在此刻彻底消失，只剩下数字偏移量。
-// ─────────────────────────────────────────────────────────────────────────────
-// 做什么：生成 obj.field 的读取，三个步骤：
-//   ① 对 object 求值进 rax（-> 情形下对象表达式的值本身就是地址）
-//   ② 解析出类的 ClassLayout，findField 查到字段偏移（语义阶段已算好）
-//   ③ movq off(%rax), %rax 取出字段值
-// demo: p->age（age 偏移 0，p 在 -8(%rbp)）→
+// 三步：① 对象地址 → rax（"." 走 leaq 栈对象地址 / "->" 对象表达式本身就是指针值）
+//       ② findField 查 ClassLayout 得偏移（语义阶段已算好）
+//       ③ 按字段宽度从 [rax+off] 取值 → rax
+//   字段宽度分派 ⇒ 1B movzbq（bool）│ ≤4B movl（int，32 位加载自动零扩展）│ 8B movq（指针/long）
+// ★ 类类型字段 ⇒ leaq off(%rax),%rax 取【地址】而非取值：子对象内联在父对象里，
+//   走 movq 取值会把子对象头 8 字节当指针解引用 ⇒ 段错误（踩坑史 C5）；下一层 .a 再叠偏移。
+// demo: p->age（age 偏移 0，p 在 -8(%rbp)）⇒
 //       movq -8(%rbp), %rax      # load p（对象地址）
-//       movq 0(%rax), %rax       # .age (offset 0)
+//       movl 0(%rax), %eax       # .age（偏移 0，4B int）
 // 兜底：查不到偏移时按偏移 0 读取并留注释（语义阶段本应已拦截）。
+// 对照 clang：CodeGenFunction::EmitMemberExpr（链式访问折叠为常量总偏移，本实现逐层 leaq）。
 void CodeGen::visit(MemberExpr& expr) {
     emitComment(std::format("member access: .{}", expr.memberName));
 
@@ -1859,11 +1851,9 @@ void CodeGen::visit(MemberExpr& expr) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 下标表达式 v[i]（读值形态）→ 糖化为 v.at(i) 成员调用
 // ─────────────────────────────────────────────────────────────────────────────
-// 理论（语法糖的降级时机）：真 C++ 里 v[i] 是 operator[] 重载调用（[over.sub]），
-//       重载决议在语义阶段完成。minicc 无运算符重载，于是把重载决议"固化"成
-//       约定：类提供 at() 即获得下标【读】能力（【写】走 set()，在 emitAssign
-//       里）。语义阶段的 inferIndex 已校验 at() 存在且形参匹配 —— 代码生成
-//       只管按约定发射。
+// 真 C++ 里 v[i] 是 operator[] 重载调用（[over.sub]），决议在语义阶段完成；minicc
+//   无运算符重载，把决议"固化"成约定：类提供 at() 获得下标【读】能力，【写】走
+//   set()（在 visit(AssignStmt) 里）。inferIndex 已校验 at() 存在且形参匹配。
 // demo: v[i]（v 是栈上容器对象，i 在 -16(%rbp)）⇒
 //       leaq -24(%rbp),%rax / pushq %rax / movq -16(%rbp),%rax / pushq %rax /
 //       popq %rsi / popq %rdi / callq Vector_at
@@ -1893,11 +1883,14 @@ void CodeGen::visit(IndexExpr& expr) {
 // ─────────────────────────────────────────────────────────────────────────────
 // new 表达式（简化版：调用 malloc）
 // ─────────────────────────────────────────────────────────────────────────────
-// 降级为"分配内存 + 安装 _vptr"两步。
-// 理论对照：标准 C++ 的 new 表达式 = 调用 operator new(sizeof T)（全局分配
-//       函数，GCC mangling 为 _Znwm）+ 构造函数调用。本项目简化为直接
-//       callq malloc：不抛 bad_alloc、不调用构造函数，但 _vptr 的安装方式
-//       与真实 ABI 完全一致。
+// 步骤 ⇒ 指令：
+//   ① 分配   movq $size,%rdi / callq malloc / pushq %rax（暂存对象指针）
+//   ② 装 vptr leaq _ZTV<类>(%rip),%rcx / addq $16,%rcx（跳过 ott 与 RTTI，指向 vtable[0]）
+//             / movq (%rsp),%rax / movq %rcx,(%rax)（次基类再来一遍，偏移不同）
+//   ③ 构造   实参逆序 push → popq rsi..r9 → movq (%rsp),%rdi / callq 类名_类名[_N]
+//   ④ 返回值 popq %rax
+// 真 C++ 的 new = operator new(sizeof T)（GCC mangling _Znwm）+ 构造函数调用；本项目
+//   简化为直接 callq malloc（不抛 bad_alloc），但 _vptr 安装方式与真实 ABI 完全一致。
 // demo: new Dog()（Dog 大小 8，含 vtable）⇒
 //       movq $8,%rdi / callq malloc / leaq _ZTV3Dog(%rip),%rcx /
 //       addq $16,%rcx      # 跳过 offset-to-top 与 RTTI，指向 vtable[0]
@@ -1987,11 +1980,11 @@ void CodeGen::visit(NewExpr& expr) {
 // ─────────────────────────────────────────────────────────────────────────────
 // this 表达式
 // ─────────────────────────────────────────────────────────────────────────────
-// 做什么：把 this 指针加载进 rax。this 在函数序言中已作为隐式形参
-//       spill 进栈槽（见 emitFunction 的成员函数分支），此处按普通
-//       局部变量查表加载即可 —— "this 只是一个普通参数"是 Itanium ABI
-//       的本质。
-// demo: this（成员函数内）→ movq -8(%rbp), %rax
+// 做什么：把 this 指针加载进 rax —— this 已在函数序言里作为隐式形参 spill 进栈槽
+//   （见 emitFunction 的成员函数分支），此处按普通局部变量查表加载即可：
+//   "this 只是一个普通参数"正是 Itanium ABI 的本质。
+// demo: this（成员函数内，槽位 -8）⇒ movq -8(%rbp), %rax
+// 兜底：不在成员函数里 ⇒ 发 WARNING 注释 + xorq %rax,%rax 清零（保证 .s 可汇编）。
 void CodeGen::visit(ThisExpr&) {
     auto it = m_localVars.find("this");
     if (it != m_localVars.end()) {
@@ -2005,13 +1998,13 @@ void CodeGen::visit(ThisExpr&) {
 // ─────────────────────────────────────────────────────────────────────────────
 // dynamic_cast 降级
 // ─────────────────────────────────────────────────────────────────────────────
-// 理论（Itanium ABI，[expr.dynamic.cast]）：真 C++ 的 dynamic_cast 不做编译期
-//   静态变换，而是把问题推迟到运行时 —— 取对象 vptr → vtable[-1] 的 typeinfo
-//   → 沿继承链找目标类型。落地方式：
-//     ① 先求值操作数（结果 = 对象指针，落 %rax）
-//     ② 装入 System V 前两个参数寄存器：%rdi = 对象指针，%rsi = 目标 typeinfo
-//     ③ callq __minicc_dynamic_cast（助手在 generate() 末尾按需发射）
-//     ④ 助手返回值即表达式结果：成功 = 原指针，失败 = 0，统一落 %rax
+// 真 C++ 的 dynamic_cast 不做编译期静态变换（[expr.dynamic.cast]），而是把问题推迟
+//   到运行时：取对象 vptr → vtable[-1] 的 typeinfo → 沿继承链找目标类型（Itanium ABI）。
+// 步骤 ⇒ 指令：
+//   ① 求值操作数  emitExpr(operand)                        # %rax = 源对象指针
+//   ② 装参       movq %rax,%rdi（对象）/ leaq _ZTI<目标>(%rip),%rsi（目标 typeinfo）
+//   ③ 调用       callq __minicc_dynamic_cast（助手由 generate() 末尾按需发射）
+//   ④ 结果       %rax = 成功→原指针 / 失败→0（即表达式结果）
 // demo: dynamic_cast<Dog*>(p) ⇒ emitExpr(p) / leaq _ZTI3Dog(%rip),%rsi /
 //                               movq %rax,%rdi / callq __minicc_dynamic_cast
 void CodeGen::visit(DynamicCastExpr& expr) {
@@ -2031,23 +2024,19 @@ void CodeGen::visit(DynamicCastExpr& expr) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 运行时助手 __minicc_dynamic_cast（整个单元只发射一次）
 // ─────────────────────────────────────────────────────────────────────────────
-// 判断对象的实际类型是否在目标类型的继承链上（单继承路径）。
-// 参数：%rdi = 对象指针，%rsi = 目标 typeinfo；返回：%rax = 成功→原指针，失败→0
-//
-// 依据是发射好的数据结构（与真实 ABI 同构，数字可对照）：
-//   对象首 8 字节 = _vptr，指向 vtable[0] │ vtable[-1] = 本对象的 typeinfo
-//   typeinfo[+16] = 基类 typeinfo（__si_class_type_info 的 __base_type；
-//                   无基类时为 0 = 继承链终点）
-//
-// 算法（线性上溯）：
-//   cur = 对象的 typeinfo
-//   while cur != 0: if cur == target → return obj;  cur = *(cur + 16)
-//   return 0
-// 注意：真 ABI 还要处理多重继承（__vmi）与菱形虚继承的指针偏移调整；单继承
-//       场景指针恒不变，故"成功即原指针"是正确的。多继承版见下方助手。
+// 参数：%rdi = 对象指针，%rsi = 目标 typeinfo │ 返回：%rax = 成功→调整后指针，失败→0
+// 数据依据（emitRTTI 的计数式布局，数字可对照）：
+//   对象首 8B = _vptr → vtable[0] │ vtable[-2] = offset-to-top │ vtable[-1] = 本对象 typeinfo
+//   typeinfo： [+16] 基类计数 N │ [+24+16i] bases[i].typeinfo │ [+32+16i] bases[i].offset
+// ★ 必须归顶：this 可能是次基类子对象指针，结果 = 最派生对象地址 + 累积偏移
+//   （真 ABI 还要处理菱形虚继承，本实现按计数式布局统一 DFS）。
+// demo: dynamic_cast<Dog*>(p)：命中 ⇒ %rax = 调整后指针；未命中 ⇒ %rax = 0
+// 对照 clang：CodeGenFunction::EmitDynamicCast + __dynamic_cast（libc++abi）。
 void CodeGen::emitDynamicCastHelper() {
-    // ── 运行时助手 __minicc_dynamic_cast（多继承版）──
-    // 参数：%rdi = 对象指针，%rsi = 目标 typeinfo；返回：%rax = 成功→调整后指针，失败→0
+    // ── 运行时助手（多继承版）：DFS 遍历 typeinfo 树 ──
+    // demo: class Dog : Animal，p 指向 Dog；dynamic_cast<Animal*>(p) ⇒
+    //   ti = _ZTI3Dog ≠ _ZTI6Animal ⇒ N=1 ⇒ DFS(bases[0].ti=_ZTI6Animal, acc+0) 命中
+    //   ⇒ 返回 top + 0（单继承偏移恒 0；次基类才靠 acc 累加调整）
     //
     // 算法（DFS 遍历 typeinfo 树）：
     //   1. vptr = *obj;  top = obj + vptr[-2]（offset-to-top 归顶）;  ti = vptr[-1]

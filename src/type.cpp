@@ -72,16 +72,18 @@ TypePtr Type::makePointer(TypePtr pointee) {
 }
 
 // ── 引用折叠（[dcl.ref]/6）：★ 在【构造点】就规范化，不留给调用方 ──
-// 四行合一（只要有一层是左值引用，结果就是左值引用）：
-//     T&  &  → T&      T&  && → T&      T&& &  → T&      T&& && → T&&
-// 【为什么必须放在这里】折叠不是"替换时顺手做的一步"，而是【引用类型的不变量】：造引用
-//   的地方有四处 —— 模板替换（substituteType）、实参推导的万能引用 bind、Parser 的声明符、
-//   Sema。只在其中一条路径上折叠，别处造出的嵌套引用就无人收拾：推导 `T := A&` 时 A 本身
-//   已是引用（变量的声明类型）⇒ 得到非法的 `int& &` 结构，观测量是同一函数被实例化出两个
-//   符号（_Z2idIRiE / _Z2idIRRiE）。放进工厂函数后，四"处"变成零"处"。
-// 对照 clang：唯一折叠点是 Sema::BuildReferenceType（clang/lib/Sema/SemaType.cpp:1887），
-//   canonical type 在构造时即算好（ASTContext::getLValueReferenceType，ASTContext.cpp:4163）
-//   —— 同一个思想：规范化在类型诞生的那一刻完成。
+// 【写法 ⇒ 结果】四行合一（只要有一层是左值引用，结果就是左值引用）：
+//     T&  &  ⇒ T&      T&  && ⇒ T&      T&& &  ⇒ T&      T&& && ⇒ T&&
+// 出处：foo(42) ⇒ T=int,  T&& = int&&          （实参是右值 ⇒ A 已是裸类型）
+//       foo(var)⇒ T=int&, T&& = int& && ⇒ int& （实参是变量 ⇒ A 取自声明类型，本身即引用）
+// 【为什么必须在构造点】折叠不是"替换时顺手做的一步"，而是【引用类型的不变量】：造引用的
+//   地方有四处 —— 模板替换（substituteType）、推导的万能引用 bind、Parser 声明符、Sema。
+//   只在其中一条路径折叠，别处造出的嵌套引用就无人收拾：`id(rr)` 得到非法的 `int& &`，
+//   观测量是同一函数被实例化出两个符号（_Z2idIRiE / _Z2idIRRiE）。放进工厂函数后，
+//   四"处"变成零"处"（踩坑史 T3）。
+// 对照 clang：Sema::BuildReferenceType（SemaType.cpp:1887）是唯一折叠点，canonical type 在
+//   ASTContext::getLValueReferenceType（ASTContext.cpp:4163）构造时即算好 —— 同一个思想：
+//   规范化在类型诞生的那一刻完成。
 // ★ 本实现无 canonical type 概念（日志/符号/比较吃同一份结构），故直接返回折叠后的规范
 //   形式，而非 clang 那样保留拼写形式的嵌套节点。
 //

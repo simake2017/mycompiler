@@ -3,27 +3,35 @@
 // =============================================================================
 // include/sfinae.h —— SFINAE：替换失败的处理协议（理论见 docs/learn/20）
 // =============================================================================
-// [temp.deduct]/8「替换失败不是错误」背后是一套【三方协议】：
+// [temp.deduct]/8「替换失败不是错误」背后是一套【三方协议】—— 位置 ⇒ 用例：
 //
-//   | 角色 | 谁 | 动作 |
+//   | 角色 | 位置（谁） | 动作 |
 //   |---|---|---|
 //   | ① 产生方 | substituteType / evaluateDecltype | Sfinae::fail(原因) |
 //   | ② 传播方 | 各层递归、DecltypeEvaluator 回调链 | 不捕获，任其冒泡 |
 //   | ③ 吸收方 | Sfinae::attempt ← 本模块入口 | 捕获 → 移除候选 → 试下一个 |
 //
+//   ① 的例（错误文案与 clang 逐字相同）：查不到 `typename T::type`
+//        ⇒ fail("no type named 'type' in 'WithoutType'")
+//   ② 的例：中间层若捕获 ⇒ 本该报错的程序静默通过
+//   ③ 的例（日志原文）：
+//        [sfinae] ⤵ 候选【偏特化模式第 N 位 '<模式>'】
+//                被移出候选集（SFINAE 软失败，非错误）
+//
 // ★ ② 必须透明：中间层一旦多管闲事地捕获，软失败会在半路被误判成硬错误。
 //
 // ── 直接上下文边界（[temp.deduct]/8）───────────────────────────────────────
 //   错误在【被替换类型/表达式自身的构成过程】里 ⇒ 直接上下文内 ⇒ 软失败，包起来
+//     例：substituteType Case 5.5 查成员表查不到 `T::type`
 //   错误在【被调用函数的函数体】里               ⇒ 上下文外     ⇒ 硬错误，别包
+//     例：抛的不是 SubstitutionFailure（如 std::runtime_error）⇒ 原样穿出 attempt
 //
 // ── 收口点（全项目仅此三处，改动时请同步）──────────────────────────────────
 //   偏特化 matchPattern │ 重载决议 inferCall │ 偏序 classSpecAtLeastAsSpecialized
 //
 // ── clang 对照 ─────────────────────────────────────────────────────────────
-//   SFINAETrap ≈ SfinaeContext │ TDK_SubstitutionFailure ≈ SubstitutionFailure
-//   SubstitutionFailure 的捕获点 ≈ Sfinae::attempt
-//   （clang 用返回码传播，本项目借 C++ 异常做栈回退 —— 语义等价、代码更短）
+//   SFINAETrap ≈ SfinaeContext │ TDK_SubstitutionFailure ≈ SubstitutionFailure │
+//   捕获点 ≈ Sfinae::attempt（clang 用返回码传播，本项目借异常做栈回退 —— 语义等价、代码更短）
 // =============================================================================
 
 #include <cstddef>     // size_t —— 本文件是唯一在【函数声明】里用 size_t 的头文件，

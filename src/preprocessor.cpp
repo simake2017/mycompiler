@@ -1,11 +1,13 @@
 // =============================================================================
 // src/preprocessor.cpp —— 阶段 0：预处理器实现（理论见 docs/learn/07）
 // =============================================================================
-// 算法骨架与 clang 对照：
-//   processText      ~ PP::Lex（指令识别 + 条件栈）     lib/Lex/PPDirectives.cpp
-//   resolveInclude   ~ HeaderSearch::LookupFile         lib/Basic/HeaderSearch.cpp
-//   expand           ~ MacroExpander（重扫描+涂蓝）      lib/Lex/PPMacroExpansion.cpp
-//   evalConstantExpr ~ EvaluateDirectiveExpression      lib/Lex/PPExpressions.cpp
+// demo（一段文本走完阶段 0）：`#define N 10` + `int a[N];` ⇒ 宏表登记一条 ⇒ 输出 `int a[10];`
+//
+// 函数级对照 clang：
+//   processText      ⇒ 对照 clang：PP::Lex（指令识别 + 条件栈）    lib/Lex/PPDirectives.cpp
+//   resolveInclude   ⇒ 对照 clang：HeaderSearch::LookupFile        lib/Basic/HeaderSearch.cpp
+//   expand           ⇒ 对照 clang：MacroExpander（重扫描 + 涂蓝）  lib/Lex/PPMacroExpansion.cpp
+//   evalConstantExpr ⇒ 对照 clang：EvaluateDirectiveExpression     lib/Lex/PPExpressions.cpp
 // 简化清单见 include/preprocessor.h 头注与 docs/learn/07。
 //
 // 管线位置 —— 整条管线唯一的"文本级"阶段，位于 Lexer 之前：
@@ -138,14 +140,21 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
     }
 
     // 条件编译栈（[cpp.cond]）：每进入一层 #if/#ifdef/#ifndef 压入一个 Cond ——
-    //   active       当前分支是否活跃：决定普通行是否输出、其余指令是否生效
-    //   takenBranch  本层是否已有分支取真：#elif/#else 只允许接在前面全假的分支后，
-    //                某分支一旦激活就置真，后续 #elif 一律失活（互斥）
-    //   parentActive 进入本层时外层活跃性的快照：外层不活跃则本层任何分支都不活跃
-    //                ——"死分支里的真条件救不活自己"
-    // demo: #ifdef A（A 未定义）⇒ {active:F, takenBranch:F, parentActive:T}，其内部
-    //       #if 1 因 parent=F 连条件都不求值（嵌套正确失活）
-    // demo: #if 0 / #elif 1 / #else ⇒ 只有 #elif 1 激活（三选一互斥语义）
+    // 字段 ⇒ 含义：
+    //   active       ⇒ 当前分支是否活跃：决定普通行是否输出、其余指令是否生效
+    //   takenBranch  ⇒ 本层是否已有分支取真：某分支一旦激活就置真，后续 #elif 一律失活（互斥）
+    //   parentActive ⇒ 进入本层时外层活跃性的快照："死分支里的真条件救不活自己"
+    //   sawElse      ⇒ 已见过 #else：拦截重复 #else 与 #else 之后的 #elif
+    // 指令 ⇒ 对栈的动作（⇒ 结果）：
+    //   #ifdef A（A 已定义）  ⇒ push{active:T, takenBranch:T, parentActive:T}
+    //                         ⇒ 段内照常输出
+    //   #ifdef A（A 未定义）  ⇒ push{active:F, takenBranch:F, parentActive:T}
+    //                         ⇒ 段内只剩空行
+    //   #if 0 / 段A / #elif 1 / 段B / #else
+    //                         ⇒ 只有段B 输出（命中后 takenBranch=T，#else 失活）
+    //   #if 1 嵌在死分支里    ⇒ ★parent=F ⇒ 条件【不求值】也给 F
+    //                         （表达式可能引用未定义宏，贸然求值会误报；嵌套由此正确失活）
+    //   #endif                ⇒ pop，回到外层活跃性
     struct Cond {
         bool active;       // 当前分支是否活跃
         bool takenBranch;  // 是否已有分支被采纳（#elif/#else 互斥用）
@@ -344,14 +353,16 @@ void Preprocessor::handleUndef(const std::string& rest, int line) {
     m_macros.erase(name);
 }
 
-// ── #include：搜索路径算法（对照 HeaderSearch::LookupFile）──────────────
-// 处理一条 #include，返回值是"被包含文件展开后的全文"，由 processText 直接并合进
-// 当前输出（翻译阶段 4，[cpp.include]）。流程：
-//   ① 解析 "..."（引号形式）或 <...>（尖括号形式）中的文件名
-//   ② resolveInclude 按搜索路径（-I 目录 + 当前目录/系统目录）定位真实文件
-//   ③ canonical 路径已在 m_pragmaOnce ⇒ 跳过（#pragma once 去重）
-//   ④ canonical 路径已在 include 栈上 ⇒ 循环 include，报错
-//   ⑤ 压栈 → 递归 processText（被包含文件里还可再 #include）→ 弹栈
+// ── #include：搜索路径算法 ── 对照 clang：HeaderSearch::LookupFile
+// 扫到的写法 ⇒ 搜索顺序（[cpp.include] 允许实现自定义，这里取最常见约定）：
+//   #include "util.h"        ⇒ ① 当前文件所在目录 → ② -I 目录（按命令行先后）
+//   #include <minicc/util.h> ⇒ ① -I 目录（按命令行先后）→ ② /usr/include（系统头兜底）
+//   全部落空                  ⇒ 报错并列出每个尝试过的路径（模仿 clang 的 'file not found' 诊断）
+// 定位到文件之后（翻译阶段 4，[cpp.include]；返回值 = 展开后全文，由 processText 并合）：
+//   ① 文件名解析：`"..."` ⇒ 引号形式；`<...>` ⇒ 尖括号形式；缺闭合引号/尖括号 ⇒ ppError
+//   ② canonical 路径 ∈ m_pragmaOnce ⇒ 返回空串（#pragma once 去重，同一物理文件只展开一次）
+//   ③ canonical 路径 ∈ include 栈上 ⇒ 报 "circular #include detected"（防无限递归）
+//   ④ 压栈 → 递归 processText（被包含文件里还可再 #include）→ 弹栈
 // demo: main.cpp:3 的 #include "util.h" ⇒ 日志 "[pp] #include "util.h" → tests/pp/util.h"，
 //       util.h 展开后的全文插入到输出中原来 #include 所在的位置。
 std::string Preprocessor::handleInclude(const std::string& rest,

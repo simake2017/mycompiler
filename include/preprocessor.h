@@ -3,27 +3,32 @@
 // include/preprocessor.h —— 阶段 0：预处理器 (Preprocessor)（理论见 docs/learn/07）
 // =============================================================================
 // 对应 [cpp.phase] 翻译阶段 2~4：行拼接 → 指令行识别 → 宏展开 + #include 文件并合。
-// clang 的真实实现是 token 级的（lib/Lex/PP*.cpp）；本教学版用行/文本级实现，
-// 更简单直观，算法骨架（搜索路径、宏重扫描、条件栈）与 clang 一致。
-//
-// 已支持  #include "…" / <…>（搜索路径）、#pragma once（canonical 去重）、
-//         #define/#undef（对象宏 + 函数宏：递归展开、自引用"涂蓝"保护）、
-//         #ifdef/#ifndef/#if/#elif/#else/#endif（条件编译栈）、
-//         #if 表达式（整数字面量与 defined(X)、! && || == != < > <= >= + - * /、括号）、
-//         __LINE__/__FILE__、#error
-// 不支持  # 字符串化、## 记号粘贴、变参宏、_Pragma（明确简化，见 docs/learn/07）
+// 功能 ⇒ 标准章节 ⇒ 本项目的实现程度（支持/不支持一目了然）：
+//   #include "…" / <…>  ⇒ [cpp.include]    ⇒ 支持
+//       搜索顺序："…" 先当前目录再 -I；<…> 先 -I 再 /usr/include
+//   #pragma once        ⇒ [cpp.pragma]     ⇒ 支持（canonical 路径去重）
+//       其余 pragma 警告后忽略
+//   #define / #undef    ⇒ [cpp.define]/[cpp.undef] ⇒ 支持对象宏 + 函数宏
+//       递归展开、自引用"涂蓝"保护（[cpp.rescan] 的简化）
+//   #if/#ifdef/#ifndef/#elif/#else/#endif ⇒ [cpp.cond] ⇒ 支持条件编译栈
+//       死分支里的 #define/#include 等指令一律跳过
+//   #if 表达式          ⇒ [cpp.cond]       ⇒ 支持整数字面量、defined(X)
+//       运算符：! && || == != < > <= >= + - * / 与括号
+//   __LINE__/__FILE__   ⇒ [cpp.predefined] ⇒ 支持（就地生成，不进宏表）
+//   #error              ⇒ [cpp.error]      ⇒ 支持
+//   # 字符串化 / ## 粘贴 / 变参宏 / _Pragma ⇒ 明确不支持（见 docs/learn/07）
 //
 // 管线位置 —— 整条管线唯一的"文本级"阶段，也是六阶段中的阶段 0：
 //   源码.cpp ──► Preprocessor ──► 展开后的纯文本 ──► Lexer ──► Parser ──► Sema ──► ...
 //                （本文件）         （等价 gcc -E 输出）
 // 之后文本里不再有 '#' 指令、未展开的宏、头文件边界，Lexer 看到的是一整段平铺源码。
 //
-// clang 对照（函数级对照见 preprocessor.cpp 头注）：
-//   指令识别与条件编译栈  lib/Lex/PPDirectives.cpp
-//   #include 文件并合     lib/Lex/PPDirectives.cpp (HandleIncludeDirective)
-//   头文件搜索路径        lib/Basic/HeaderSearch.cpp
-//   宏展开/重扫描/涂蓝    lib/Lex/PPMacroExpansion.cpp
-//   #if 常量表达式求值    lib/Lex/PPExpressions.cpp
+// 对照 clang（函数级对照见 preprocessor.cpp 头注）：
+//   指令识别与条件编译栈 ⇒ 对照 clang：PPDirectives.cpp
+//   #include 文件并合     ⇒ 对照 clang：HandleIncludeDirective
+//   头文件搜索路径        ⇒ 对照 clang：HeaderSearch::LookupFile
+//   宏展开/重扫描/涂蓝    ⇒ 对照 clang：PPMacroExpansion.cpp
+//   #if 常量表达式求值    ⇒ 对照 clang：PPExpressions.cpp
 // =============================================================================
 
 #include <cstddef>     // size_t —— readWord 的签名里用到（见下）。

@@ -3,29 +3,35 @@
 // =============================================================================
 // 用法  ./minicc <source.cpp> [-o output] [-I dir] [-S] [-E] [--dump-*]
 //
-//   <source.cpp>    输入源文件（必填）
-//   -o output       输出路径：默认输出可执行文件（缺省取 <source> 去扩展名）；
-//                   -S 模式输出汇编 <source>.s；-E 模式写预处理文本。
-//   -I dir          头文件搜索目录，可重复（-I include -I third_party），
-//                   出现顺序即搜索优先级，原样传给预处理器
-//   -S              只到阶段 5 为止，输出 .s 汇编（等价 gcc -S，不链接）
-//   -E              只执行阶段 0（预处理）并输出结果，等价 gcc -E，调试宏/include 用
-//   --dump-tokens / --dump-ast       阶段 1 / 阶段 2 后打印 Token 流 / AST（调试）
-//   --dump-hierarchy / --dump-layout 阶段 3 后打印类层次结构图 / 类内存布局详图
-//   （多个 --dump-* 可同时使用，如 --dump-hierarchy --dump-layout）
+//   参数 ⇒ 效果（速查；<source.cpp> 必填）：
+//     -o <path>  ⇒ 输出路径：默认去扩展名出可执行文件；-S 出 .s；-E 写预处理文本
+//     -I <dir>   ⇒ 头文件搜索目录，可重复（-I include -I third_party）；
+//                  出现顺序即搜索优先级，原样传给预处理器
+//     -S         ⇒ 只跑到阶段 5 为止，出 .s 汇编（等价 gcc -S，不链接）
+//     -E         ⇒ 只跑阶段 0，输出展开后纯文本（等价 gcc -E，调试宏/include 用）
+//     --dump-tokens / --dump-ast       ⇒ 阶段 1 后打印 Token 流 / 阶段 2 后打印 AST
+//     --dump-hierarchy / --dump-layout ⇒ 阶段 3 后打印类层次图 / 类内存布局详图
+//     （多个 --dump-* 可同时使用，如 --dump-hierarchy --dump-layout）
 //
 // demo: ./minicc tests/test_tmpl_01.cpp             ⇒ 全管线，产出 test_tmpl_01.s
 //       ./minicc tests/pp/main.cpp -I tests/pp -E   ⇒ 只看预处理结果
 //
-// 六阶段全景（阶段 ↔ 实现文件 ↔ 本文件调用点）：
-//   阶段0 预处理     preprocessor.cpp            processFile()   [cpp]/[lex.phases]1~4
-//   阶段1 词法分析   lexer.cpp                   tokenizeAll()
-//   阶段2 语法分析   parser.cpp                  parseTranslationUnit()
-//   阶段3 语义分析   semantic_analyzer.cpp       analyze()   （类型检查/auto/布局/vtable）
-//   阶段4 模板实例化 template_instantiation.cpp  instantiate()（类=结构化替换，函数=推导驱动）
-//   阶段5 代码生成   codegen.cpp                 generate()      ⇒ output.s（x86-64 AT&T）
-//   阶段6 链接       系统 as 出 .o → 内置 MiniLinker（src/linker.cpp，见 docs/learn/15）
-//                    ⇒ 非 PIE 可执行文件（合并节 → 符号决议 → 重定位回填 → 写 ELF）
+// 阶段表 —— 每阶段「把什么变成什么」：
+//   0 预处理     源码.cpp + 头文件  ⇒ 展开后的纯文本（无 '#'、无宏）
+//   1 词法分析   纯文本             ⇒ Token 流（以 Eof 收尾）
+//   2 语法分析   Token 流           ⇒ AST（TranslationUnit）
+//   3 语义分析   AST                ⇒ 类型标注 + 类布局/vtable/RTTI
+//   4 模板实例化 模板蓝图 + 实参    ⇒ 具体类/函数（类=替换，函数=推导）
+//   5 代码生成   带类型的 AST       ⇒ x86-64 AT&T 汇编（.s）
+//   6 链接       .o（系统 as 产出） ⇒ 非 PIE 可执行文件
+// 上表各阶段的实现入口（顺序同表）+ 标准章节：
+//   preprocessor.cpp::processFile()            [cpp]/[lex.phases]1~4
+//   lexer.cpp::tokenizeAll()                   [lex.*]
+//   parser.cpp::parseTranslationUnit()         [gram]
+//   semantic_analyzer.cpp::analyze()           [basic]/[class]
+//   template_instantiation.cpp::instantiate()  [temp.*]
+//   codegen.cpp::generate()                    （x86-64 AT&T 后端，无标准章节）
+//   src/linker.cpp::link()（见 docs/learn/15）
 // =============================================================================
 
 #include "lexer.h"
@@ -101,10 +107,20 @@ static void printNode(const std::string& prefix, bool isLast, const std::string&
 // visit 重载，零 cast（判据见 semantic_analyzer.h 注释；理论见 docs/learn/29）。
 // 未重写的节点类型 = "什么都不做"，与原先 else 分支的语义等价。
 //
-// 【位置信息怎么传】
-//   访问者接口不带 prefix/isLast 这类"每个节点各不相同"的上下文（带了就
-//   不是通用访问者了），所以把它们存成成员变量，由 dumpXxx 在 accept 之前设置好。
-//   ★ 递归约定：每个 visit 必须先把要用的值取进【局部变量】再往下递归 ——
+// 节点 ⇒ 打印出的标签（只列代表性的，其余同形）：
+//   IntLiteralExpr(42)  ⇒ "IntLiteral: 42"
+//   VarExpr(x)          ⇒ "VarExpr: x"
+//   BinaryExpr(Add)     ⇒ "BinaryExpr: +"（左右子树递归下钻）
+//   CallExpr            ⇒ "CallExpr" + arg[i] 子树
+//   MemberExpr          ⇒ "MemberExpr: .x" / "->x"
+//   VarDeclStmt(x:int)  ⇒ "VarDeclStmt: x : int"
+//   IfStmt              ⇒ condition / thenBranch / elseBranch 三支
+//   FunctionDecl(f)     ⇒ "FunctionDecl: f() → 返回类型"（构造/析构共用同一分支）
+//
+// 【位置信息怎么传】prefix/isLast 是"每个节点各不相同"的上下文，塞不进通用访问者接口
+// ⇒ 存成成员变量，由 dumpXxx 在 accept 之前设好：
+//   dumpExpr(e, "  ", true) ⇒ setPos("  ",true) ⇒ e->accept(*this) ⇒ visit 读 m_prefix/m_isLast
+//   ★ 递归约定：每个 visit 必须先把 m_prefix/m_isLast 取进【局部变量】再往下递归 ——
 //   子节点的 dumpXxx 会覆写成员，回来后读到的就是别人的前缀。
 class AstDumper : public AstVisitor {
 public:

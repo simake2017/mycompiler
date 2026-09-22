@@ -4,11 +4,11 @@
 // 核心思想：根据当前字符决定进入哪个"扫描分支"，每个分支消费若干字符、产出一个 Token。
 //
 // 管线位置  源码 → Preprocessor → ★Lexer★ → Parser → Sema → 模板推导/实例化 → CodeGen
-// 标准章节  [lex.phases]（翻译阶段）│ [lex.token]（token 定义）
-//           [lex.pptoken]（最长匹配的注记在此）
+// 标准章节  [lex.phases]（翻译阶段）│ [lex.token] │ [lex.pptoken]（最长匹配的注记在此）
 //           [lex.name] [lex.icon] [lex.string] [lex.operators]
-// clang 对照 lib/Lex/Lexer.cpp —— Lexer::LexTokenInternal 是 clang 的切词主循环，
-//           本文件的 nextToken() 是它的教学简化版。
+// 对照 clang：Lexer::LexTokenInternal —— 本文件 nextToken() 是它的教学简化版。
+//
+// demo: "int x = 42;" ⇒ [KwInt][Identifier "x"][Assign "="][IntLiteral "42"][Semicolon][Eof]
 // 本文件结构
 //   tokenTypeName()             —— 枚举 → 可读名（供诊断消息）
 //   字符级操作                    peek/peekNext/advance/isAtEnd/currentLocation/makeToken
@@ -169,13 +169,15 @@ Token Lexer::makeToken(TokenType type, std::string text, SourceLocation loc) con
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 跳过空白和注释
+// 跳过空白和注释（[lex.comment]：注释不是 token，词法上等价一个空格 ⇒ 直接吃掉）
 // ─────────────────────────────────────────────────────────────────────────────
-// C++ 有两种注释：单行 // ...、多行 /* ... */
-// ─────────────────────────────────────────────────────────────────────────────
-// 理论依据（[lex.comment]）：注释不是 token，词法上等价于一个空格，
-// 因此这里的处理是"直接吃掉"（连占位 token 都不生成）。
-// 用 while 循环的原因：一个 token 前可能交替出现"空白 //注释 /*注释*/ 空白…"，
+// 扫到的字符 ⇒ 动作（不产 Token，连占位 token 都不生成）：
+//   ` ` `\t` `\r` `\n` ⇒ advance() 后继续循环
+//   `//`               ⇒ 跳到行尾（消费 `//`，再吞到 '\n' 或文件尾）
+//   `/*`               ⇒ 吞到 `*/`（★ 直到文件尾仍未见 `*/` ⇒ 当作"注释延续到文件末尾"，
+//                         不报错；clang 会报 unterminated comment，属可接受的简化）
+//   其他               ⇒ break，交回 nextToken() 分派
+// 用 while 而非 if：一个 token 前可能交替出现"空白 //注释 /*注释*/ 空白…"，
 // 必须反复跳，直到撞上真正的 token 首字符或文件尾。
 // demo: "  // hi\n/*c*/ 42" ⇒ 调用后光标指向 '4'
 void Lexer::skipWhitespaceAndComments() {
@@ -220,13 +222,13 @@ void Lexer::skipWhitespaceAndComments() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 扫描数字字面量（仅支持整数）
 // ─────────────────────────────────────────────────────────────────────────────
-// 数字状态机（[lex.icon] 的极简版，只支持十进制整数）：
-//
-//   起始 ──数字──► [数字态] ──数字──► [数字态] ──非数字──► 返回 IntLiteral
-//
-// 真实 C++ 还有十六进制/八进制/二进制前缀、浮点、后缀（u/l/f…）、数字分隔符 '，
-// 本项目全部省略 —— 教学重点是状态机形态本身。
-// demo: "42;" ⇒ 返回 Token{IntLiteral,"42"}，光标停在 ';'
+// 状态机（[lex.icon] 的极简版）：
+//   起始 ──数字──► [数字态] ──数字──► [数字态] ──非数字/EOF──► 返回 IntLiteral
+// 扫到的字符 ⇒ 动作：
+//   `0`~`9`  ⇒ advance() 收进 text，继续贪心（这是数字分支内部的"最长匹配"）
+//   其他/EOF ⇒ 停，产 Token{IntLiteral, text}
+// demo: "42;" ⇒ Token{IntLiteral,"42"}，光标停在 ';'（贪心保证 42 不会被切成 4 和 2）
+// 省略：十六进制/八进制/二进制前缀、浮点、后缀（u/l/f…）、数字分隔符 '（教学重点是状态机形态本身）
 Token Lexer::scanNumber() {
     // 先拍位置快照：token 位置指向第一个数字（若扫完再取就指向后面的字符了）
     auto loc = currentLocation();
@@ -242,14 +244,18 @@ Token Lexer::scanNumber() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 扫描标识符或关键字：先按标识符规则（字母/数字/下划线）扫完整单词，再查关键字表 ——
+// 扫描标识符或关键字：先按标识符规则扫完整单词，再查关键字表 kKeywordMap ——
 // auto/virtual/template 等关键字与普通标识符的区分点就在这里。
-// 标识符状态机（[lex.name]：首字符字母/下划线，后续字母/数字/下划线）：
+// 状态机（[lex.name]：首字符字母/下划线，后续字母/数字/下划线）：
 //   起始 ──字母/_──► [词体态] ──字母/数字/_──► [词体态] ──其他字符──► 查 kKeywordMap
-//                                                             ├─ 命中 → 关键字 token
-//                                                             └─ 未中 → Identifier token
-// 为什么"先扫后查"而不给关键字写状态机？新增关键字只需改 kKeywordMap 一行、状态机完全
-// 不动（clang 同思路：IdentifierTable 哈希查表）。
+// 扫到的字符 ⇒ 动作：
+//   字母 / `_`   ⇒ advance() 收进 text（`_` 可作首字符）
+//   数字         ⇒ advance() 收进 text（数字可作续字符，但不能开头）
+//   其他 / EOF   ⇒ 停，用 text 查 kKeywordMap 分派：
+//                    ├─ 命中 "if"     ⇒ Token{KwIf, "if"}
+//                    ├─ 命中 "return" ⇒ Token{KwReturn, "return"}
+//                    └─ 未中 "foo2"   ⇒ Token{Identifier, "foo2"}
+// 好处：新增关键字只改 kKeywordMap 一行、状态机不动。对照 clang：IdentifierTable 哈希查表。
 // demo: "if(x" ⇒ Token{KwIf,"if"}；"foo2 " ⇒ Token{Identifier,"foo2"}
 Token Lexer::scanIdentifierOrKeyword() {
     auto loc = currentLocation();
@@ -312,14 +318,19 @@ Token Lexer::scanString() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 扫描运算符和分隔符：采用"最长匹配"原则 —— 先看两个字符能否组成运算符，不能则取单字符。
+// 扫描运算符和分隔符：★最长匹配（maximal munch，[lex.pptoken] 注）
 // ─────────────────────────────────────────────────────────────────────────────
-// 最长匹配（maximal munch，标准 [lex.pptoken] 注）："如果下一个字符合法地把当前
-//   序列延长为一个更长的 token，就必须延长。" 例："a<=b" 必须切成 a、<=、b，
-//   而不能切成 a、<、=、b。
-// 实现技巧：本项目运算符词表只有 1 字符与 2 字符两种，故"首字符 c + 前瞻 n"就够了
-//   —— 能组成已知双字符运算符则消费 n 返回双字符 token，否则退回单字符。
-//   （clang 还要处理 "<<="、"..."、三字符组等更长的情况。）
+// 最长匹配原则："若下一个字符合法地把当前序列延长为一个更长的 token，就必须延长"
+//   ⇒ `a<=b` 必须切成 a | <= | b，而不能切成 a | < | = | b。
+// 扫到的记号 ⇒ 产出（先试 2 字符，组成不了已知双字符运算符再退回 1 字符）：
+//   双字符：`<=` `>=` `==` `!=` `&&` `||` `+=` `-=` `*=` `/=` `->` `::`
+//           ⇒ 消费前瞻的 n，产对应双字符 token
+//   单字符（不消费 n，产对应单字符 token）：
+//     `<` `>` `=` `!` `&` `|` `+` `-` `*` `/` `:`      可作双字符首字符的那批
+//     `%` `^` `~` `.` `,` `;` `(` `)` `{` `}` `[` `]`  只能单字符的那批
+//   其他  ⇒ 抛 "Unexpected character 'x' at 行:列"
+// 实现技巧：本项目词表只有 1/2 字符两种 ⇒ "首字符 c + 前瞻 n" 即够
+//   （clang 还要处理 `<<=`、`...` 等更长串）。
 // demo: "<=" ⇒ Token{LessEqual}；"<x" ⇒ Token{Less}，光标停在 'x'；"->" ⇒ Token{Arrow}
 Token Lexer::scanOperator() {
     auto loc = currentLocation();

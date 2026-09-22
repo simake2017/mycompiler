@@ -2,11 +2,13 @@
 // =============================================================================
 // 阶段 4：模板实例化引擎 (Template Instantiation Engine)（理论见 docs/learn/05、13）
 // =============================================================================
-// 实例化 = AST 层面的结构化克隆 + 类型替换 —— 编译期的"复制粘贴"，但【不是】
-// 文本替换：蓝图里的模板参数占位符（T）换成实参（int），并生成全局唯一符号名。
-//   template<typename T> class MyPtr  ──{T→int}──▶  MyPtr_int
-//   field data : T*  ⇒  field data : int*   │   method get() : T&  ⇒  get() : int&
-//   符号名：_Z5MyPtrIiE（Itanium ABI mangling，见 docs/learn/13）
+// 实例化 = AST 结构化克隆 + 类型替换 [temp.subst]，不是文本替换；产物带全局唯一符号名。
+// 蓝图写法 ⇒ 实例写法（MyPtr<int>，即 {T→int}）：
+//   class MyPtr<T>   ⇒ 类改名 ⇒ MyPtr_int，符号 _Z5MyPtrIiE（Itanium mangling，见 docs/learn/13）
+//   T* data          ⇒ int* data
+//   T& get()         ⇒ int& get()
+//   return N;（NTTP）⇒ return 4;（表达式位置也替换，见 cloneExpr）
+//   Vec<T>（别名）    ⇒ 只有解糖，零新类、零新符号（[temp.alias]/1）
 //
 // ── 本文件的组成 ───────────────────────────────────────────────────────
 //   DecltypeEvaluator     │ decltype 求值回调（[dcl.type.decltype]）
@@ -14,14 +16,13 @@
 //   AliasTemplateResolver │ 别名模板 id `X<...>` 展开回调（[temp.alias]）
 //   NameMangler           │ 符号修饰（Itanium ABI 子集）
 //   TemplateInstantiator  │ 引擎本体：[temp.inst] 实例化时机 │ [temp.subst] 实参替换 │
-//                           [dcl.ref] 引用折叠（万能引用实例化的关键）
-//   三个回调接口同构：蓝图与查表能力住在 Sema，调用它们的是替换引擎 —— 抽成接口
-//   即避免 Sema ⇄ Instantiator 双向依赖，也让单元测试不必拖进整个 Sema。
+//                           [dcl.ref]/6 引用折叠（万能引用实例化的关键）
+//   三个回调接口同构（第三次出现同一形状）：蓝图与查表能力住在 Sema，调用它们的是替换
+//   引擎 —— 抽成接口即避免 Sema ⇄ Instantiator 双向依赖，也让单元测试不必拖进整个 Sema。
 //
-// ── clang 对照 ─────────────────────────────────────────────────────────
-//   lib/Sema/SemaTemplateInstantiate.cpp → 声明级实例化（本文件 instantiate*）
-//   lib/Sema/TreeTransform.h             → AST 递归重建（本文件 cloneExpr/cloneStmt）
-//   区别：clang 用 SubstTemplateTypeParmType 类型节点记录替换，minicc 在克隆时直接换类型
+// 对照 clang：SemaTemplateInstantiate.cpp（声明级实例化 ≈ instantiate*）│
+//   TreeTransform.h（AST 递归重建 ≈ cloneExpr/cloneStmt）；区别：clang 用
+//   SubstTemplateTypeParmType 类型节点记录替换，minicc 在克隆时直接换类型
 //
 // 管线：Parser(蓝图) → Sema(发现实例化需求) → TemplateDeducer(推导实参)
 //   → 【本文件：按实参克隆 + 替换，产出具体类/函数】→ Sema(对实例做类型检查) → CodeGen
@@ -46,15 +47,13 @@ namespace minicc {
 // ─────────────────────────────────────────────────────────────────────────────
 // DecltypeEvaluator：decltype 求值的回调接口
 // ─────────────────────────────────────────────────────────────────────────────
-// 【要解决的分层问题】decltype 的求值能力（"表达式 → 类型"）住在 SemanticAnalyzer 里
-//   （inferType），而要触发求值的是 TemplateInstantiator::substituteType。直接依赖
-//   Sema 会 ① 形成 Sema ⇄ Instantiator 双向依赖；② 让 tests/unit/ 里那些【裸构造】
-//   TemplateDeducer / TemplateInstantiator 的单元测试被迫拖进整个 Sema。
-//   故抽成抽象接口：Sema 实现它，instantiator 只持一个可选指针。
-// 【可选语义】指针为 nullptr 时（单元测试路径），decltype 节点**不求值**，原样保留 ——
-//   调用方据此可观察到"延迟求值"这一事实本身。
-// 对照 clang：Sema::SubstType 内部直接调 BuildDecltypeType，因为 clang 的 Instantiator
-//   本身就是 Sema 的一部分（TreeTransform 派生自 Sema）；本实现外提成接口换取可单测。
+// 【分层问题】求值能力（"表达式 → 类型"）住在 SemanticAnalyzer（inferType），触发方是
+//   TemplateInstantiator::substituteType 的 Case 1.5。直接依赖 = ① Sema ⇄ Instantiator
+//   双向依赖；② tests/unit/ 里【裸构造】TemplateDeducer / TemplateInstantiator 的单元测试
+//   被迫拖进整个 Sema。故抽成接口：Sema 实现它，instantiator 只持一个可选指针。
+// 【可选语义】指针为 nullptr（单元测试路径）⇒ decltype 节点**不求值**、原样保留：
+//   substituteType(makeDecltype(e), {}) ⇒ 仍是 Decltype 节点（"延迟求值"本身可观察）
+// 对照 clang：Sema::SubstType 内直接调 BuildDecltypeType（clang 的 Instantiator = Sema 的一部分）
 class DecltypeEvaluator {
 public:
     virtual ~DecltypeEvaluator() = default;
@@ -70,17 +69,17 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 // MemberTypeResolver：依赖类型名 `typename T::type` 的成员查表回调
 // ─────────────────────────────────────────────────────────────────────────────
-// 【要解决的分层问题】与 DecltypeEvaluator 完全同构：查成员类型别名这件事住在 Sema
-//   （它才有 m_classDecls / typeAliases / 按需实例化能力），而需要它的是替换引擎
-//   substituteType（以及推导器 reducePattern 里临时建的 instantiator）。直接依赖 Sema
-//   会把 Sema ⇄ Instantiator 变成双向依赖。
-// 【为什么必须在【替换】阶段就查、不能拖到 Sema 解析期】因为这里是 [temp.deduct]/8
-//   的**直接上下文**：
+// 【分层问题】与 DecltypeEvaluator 同构：查成员别名住在 Sema（才有 m_classDecls /
+//   typeAliases / 按需实例化），需要它的是替换引擎 substituteType 的 Case 5.5（以及
+//   推导器 reducePattern 里临时建的 instantiator）。
+// 写法 ⇒ 替换期当场的结果（[temp.res]/5）：
+//   typename Plain::type          ⇒ 替换成 Plain 里的别名目标
+//   typename T::type，T := Plain  ⇒ 查 Plain.typeAliases ⇒ 命中即解糖
+//   typename T::type，T := int    ⇒ 查不到 ⇒ Sfinae::fail（软失败，该候选出局）
+// ★ 必须在这里（替换当场）失败：这正是 [temp.deduct]/8 的**直接上下文** ——
 //     template<class T> using has_type = void_t<typename T::type>;
-//   对 T := int 替换时 `int::type` 不存在 ⇒ 必须在替换的当场失败，由 Sfinae::attempt
-//   吸收成"该候选不成立"；拖到后面就变成硬错误，SFINAE 探测惯例整个失效。
-// 对照 clang：Sema::SubstType 里对 DependentNameType 直接调 Sema::getTypeName +
-//   LookupQualifiedName，失败即 Sema::SubstitutionFailure（TreeTransform 即 Sema 的一部分）。
+//   拖到 Sema 解析期就成硬错误，SFINAE 探测惯例整个失效。
+// 对照 clang：Sema::SubstType 对 DependentNameType 走 getTypeName + LookupQualifiedName
 class MemberTypeResolver {
 public:
     virtual ~MemberTypeResolver() = default;
@@ -96,16 +95,16 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 // AliasTemplateResolver：别名模板 id `X<...>` 的展开回调（[temp.alias]）
 // ─────────────────────────────────────────────────────────────────────────────
-// 【要解决的分层问题】与上面两个接口同构，第三次出现同一个形状 —— 别名模板蓝图住在
-//   Sema（它才有模板注册表），需要用它的地方是替换引擎；故仍是"接口在低层、实现由
-//   Sema 注入"，否则 Sema ⇄ Instantiator 立刻变成双向依赖。
-// 【为什么替换阶段也必须能展开】这是 [temp.alias]/1 与 [temp.deduct]/8 的交汇：
-//     template<class T> std::enable_if_t<sizeof(T) >= 4, T> f(T x);
-//   返回类型里的 enable_if_t<...> 是【依赖】的 —— 定义期 T 未知，两阶段查找的第一阶段
-//   根本查不动它；必须等调用点推出 T := int 后在替换的当口展开成 int（或展开失败 ⇒
-//   该候选被 SFINAE 剔除）。拖到 Sema 解析期就晚了：那时已不在直接上下文里，失败变硬错误。
-// 对照 clang：Sema::SubstType 里对 TemplateSpecializationType 判 isTypeAlias() 后
-//   直接走 Sema::CheckAliasTemplateId + getCanonicalType 解糖。
+// 【分层问题】与上面两个接口同构（第三次出现同一形状）：别名蓝图住在 Sema（它才有模板
+//   注册表），用它的地方是替换引擎的 Case 5.8 与推导器；故仍"接口在低层、实现由 Sema
+//   注入"，否则 Sema ⇄ Instantiator 立刻变成双向依赖。
+// 写法 ⇒ 替换期当场的结果（[temp.alias]/1 与 [temp.deduct]/8 的交汇）：
+//   enable_if_t<true, T>   ⇒ 解糖 ⇒ T（候选保留）
+//   enable_if_t<false, T>  ⇒ 展开失败 ⇒ Sfinae::fail ⇒ 该候选被剔除（不是硬错误）
+//   Vec<int>               ⇒ 解糖 ⇒ MyPtr<int>（同一个类，零新符号）
+// 定义期根本查不动它（T 未知，两阶段查找的第一阶段），必须等调用点推出 T 后在替换的
+//   当口展开 —— 拖到 Sema 解析期就晚了：那时已不在直接上下文里，失败变硬错误。
+// 对照 clang：Sema::SubstType 判 isTypeAlias() 后走 CheckAliasTemplateId + getCanonicalType
 class AliasTemplateResolver {
 public:
     virtual ~AliasTemplateResolver() = default;
@@ -127,11 +126,12 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 // NameMangler：符号修饰器（理论见 docs/learn/13）
 // ─────────────────────────────────────────────────────────────────────────────
-// 为什么需要：C++ 支持重载与模板，但汇编器/链接器只认唯一名字 —— mangling 把
-//   函数的完整签名编码成一个全球唯一的字符串。
-// demo: MyPtr<int> → _Z5MyPtrIiE │ MyClass::foo(int) → _ZN7MyClass3fooEi
-// 编码规则对齐 Itanium C++ ABI（GCC/Clang 所用）：_Z 前缀、<长度><名字> 的
-//   source-name、I…E 模板实参表、N…E 嵌套限定名。
+// 汇编器/链接器只认唯一名字 ⇒ mangling 把完整签名编码成唯一串。
+// 源码写法 ⇒ 符号（Itanium C++ ABI，GCC/Clang 所用）：
+//   MyPtr<int>        ⇒ _Z5MyPtrIiE        （_Z + <长度><名字> 的 source-name + I…E 模板实参表）
+//   MyClass::foo(int) ⇒ _ZN7MyClass3fooEi  （N…E 嵌套限定名）
+//   Buf<4>            ⇒ _Z3BufILi4EE       （NTTP 走 <expr-primary> L<类型编码><值>E）
+//   Buf<-3>           ⇒ _Z3BufILin3EE      （负数编 n<绝对值>：'-' 不是合法 mangling 字符）
 // =============================================================================
 class NameMangler {
 public:
@@ -183,28 +183,28 @@ public:
     using TypeSubstitution = std::unordered_map<std::string, TemplateArg>;
 
     // 实例化一个模板类 [temp.inst]：深拷贝蓝图 + 结构化替换 [temp.subst]。
-    // demo: MyPtr<int> —— 替换表 {T→int}，字段 T* data → int* data，新类名 MyPtr_int，
-    //         符号 _Z5MyPtrIiE；Buf<4>（NTTP）—— 替换表 {N→TemplateArg{Integral,4}}，
-    //         方法体 `return N;` 的 VarExpr{N} → IntLiteral{4}。
-    // templateDecl: 蓝图 │ args: 实际实参（类型与值混排，如 [Type:int] / [Integral:4]），
+    // 实参形态 ⇒ 替换表 ⇒ 产物：
+    //   MyPtr<int> ⇒ {T→TemplateArg{Type,int}} ⇒ 字段 T* data → int* data，
+    //                类名 MyPtr_int，符号 _Z5MyPtrIiE
+    //   Buf<4>     ⇒ {N→TemplateArg{Integral,4}} ⇒ 方法体 `return N;` 的 VarExpr{N} → IntLiteral{4}
+    // templateDecl: 蓝图 │ args: 实参（类型与值混排，如 [Type:int] / [Integral:4]），
     //   顺序与 templateDecl->templateParams 一一对应 │ 返回实例化后的 ClassDecl。
-    // substOverride：特化路径的替换表覆盖 —— nullptr（默认）走主模板路径：按
-    //   templateParams 的 kind 逐位分派并校验；非 nullptr 走特化路径：直接采用该表，
-    //   跳过逐位校验与个数校验。
-    // ★ 为什么用指针而不是"空表即主模板"：全特化（template<> struct Box<int*,int>）
-    //   的形参表为空，匹配推导出的替换表**本来就是空的** —— 用 empty() 当判别条件
-    //   会把全特化误判成主模板，进而撞上"expects 0 argument(s), got 2"的个数错位。
-    //   路径归属是调用方的知识（Sema::selectClassTemplate 已经判定过），必须显式传入。
+    // substOverride：nullptr（默认）= 主模板路径：按 templateParams 的 kind 逐位分派并校验；
+    //   非 nullptr = 特化路径：直接采用该表，跳过逐位校验与个数校验。
+    // ★ 用指针而不是"空表即主模板"：全特化（template<> struct Box<int*,int>）的形参表为空，
+    //   匹配推导出的替换表**本来就是空的** —— 用 empty() 当判别条件会把全特化误判成主模板，
+    //   进而撞上"expects 0 argument(s), got 2"的个数错位。路径归属是调用方的知识
+    //   （Sema::selectClassTemplate 已经判定过），必须显式传入。
     ClassDeclPtr instantiate(
         TemplateDeclPtr templateDecl,
         const std::vector<TemplateArg>& args,
         const TypeSubstitution* substOverride = nullptr);
 
-    // 实例化一个函数模板（S5）：typeArgs 由推导引擎（S2~S4）产出；克隆蓝图函数并
-    //   替换所有 T，生成 mangled 符号名（_Z5twiceIiE 风格）。
-    // 理论：实例化 = 结构化替换 substitution —— 把 {T := int} 应用到蓝图的每个类型
-    //   位置（返回类型/形参/函数体局部变量），而非文本替换。
-    // demo: twice(3) 推出 T := int ⇒ void twice(T x) → void twice(int x)，符号 _Z5twiceIiE
+    // 实例化一个函数模板（S5）：typeArgs 由推导引擎（S2~S4）产出。
+    // 蓝图写法 ⇒ 实例（{T := int} 应用到每个类型位置，不是文本替换）：
+    //   void twice(T x)   ⇒ void twice(int x)      符号 _Z5twiceIiE
+    //   T max(T a, T b)   ⇒ int max(int a, int b)
+    //   T tmp = a;（局部）⇒ int tmp = a;           （cloneStmt 的 VarDecl 分支也替换）
     // 注：形参仍是裸 TypePtr 列表 —— 函数模板的非类型形参（NTTP）尚未实现（推导引擎
     //   只产出类型），需要时在函数体内包成 TemplateArg::ofType；类模板走上面的
     //   instantiate()，形参已可类型/值混排。

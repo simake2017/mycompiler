@@ -3,12 +3,29 @@
 // 阶段 2：语法分析器 (Parser)（理论见 docs/learn/09、30）
 // =============================================================================
 // 职责：把线性的 Token 流转成树状 AST。手法：递归下降（Recursive Descent）——
-// 文法中每个非终结符对应一个解析函数，互相调用形成递归；若文法为 LL(1) 则每步只需
-// 1 个前瞻 Token，遇歧义用"存游标 + 回溯"（speculative parsing）消解。
+// 文法中每个非终结符对应一个解析函数，互相调用形成递归；每步只看 1 个前瞻 Token
+// （LL(1)），遇歧义用"存游标 + 试探 + 回滚"（speculative parsing）消解。
 //
 // 管线：预处理器 → Lexer → ★Parser★ → Sema → 模板推导/实例化 → CodeGen(.s)
 //   输入 std::vector<Token>（Lexer 产物，含末尾哨兵 Eof）
 //   输出 TranslationUnit（AST 根节点，内含声明列表）
+//
+// ── ★ 顶层分派速查：扫到哪个记号 ⇒ parseDeclaration 走哪条分支 ⇒ 建出哪种节点 ──
+//   'template'                        ⇒ parseTemplateDecl   ⇒ TemplateDecl
+//   'class' | 'struct'                ⇒ parseClassDecl      ⇒ ClassDecl
+//   'enum' | 'namespace'              ⇒ parseEnum/Namespace ⇒ EnumDecl / NamespaceDecl
+//   'using' | 'typedef'               ⇒ parseTypeAliasDecl  ⇒ TypeAliasDecl
+//   IDENT '('（配对右括号后跟 '->'）   ⇒ parseDeductionGuide ⇒ DeductionGuideDecl
+//   ['virtual'] 类型 IDENT '('        ⇒ parseFunctionDecl   ⇒ FunctionDecl
+//   类型 IDENT ['=' expr] ';'          ⇒ parseGlobalVarDecl  ⇒ GlobalVarDecl
+//
+// ── ★ 语句层分派速查（parseStatement）：首 Token ⇒ 分支 ⇒ 节点 ───────────
+//   '{' | 'if' | 'while' | 'return' | 'delete'
+//         ⇒ parseBlock/If/While/Return/Delete ⇒ BlockStmt | IfStmt | WhileStmt |
+//                                                ReturnStmt | DeleteStmt
+//   类型关键字 int/double/bool/void/auto | IDENT IDENT | IDENT 后跟 '<'..'>' / '::' /
+//   '*' '&' '&&'  ⇒ parseType + parseVarDeclStmt ⇒ VarDeclStmt
+//   其余                                       ⇒ parseExprOrAssignStmt ⇒ ExprStmt / AssignStmt
 //
 // ── 本编译器接受的语法（EBNF 概览）──────────────────────────────────────
 //   translation-unit := declaration*
@@ -23,11 +40,9 @@
 //   从源头回避该歧义 —— 语句级变量声明只认【类型关键字】或【标识符 + 标识符/(*)】
 //   开头（不支持括号初始化 `T x(...)`），类体内同样用"标识符后是否跟 '(' "区分方法与字段。
 //
-// ── clang 对照（参照源码 llvm-project/clang/lib/Parse/）─────────────────
-//   Parser.cpp                    → parseTranslationUnit / 语句分派 / Token 流操作
-//   ParseDecl.cpp                 → ParseDeclOrFunctionDefInternal（声明与类成员解析）
-//   ParseTemplate.cpp             → ParseTemplateDeclaration（模板声明解析）
-//   ParseExpr.cpp / ParseExprCXX  → 表达式优先级链与 template-id 歧义消解
+// 对照 clang（llvm-project/clang/lib/Parse/）：Parser.cpp parseTranslationUnit / 语句分派 /
+//   ParseDecl.cpp ParseDeclOrFunctionDefInternal / ParseTemplate.cpp ParseTemplateDeclaration /
+//   ParseExpr.cpp 优先级链 + ParseExprCXX.cpp template-id 歧义消解。
 // =============================================================================
 
 #include "token.h"
@@ -55,16 +70,16 @@ private:
     size_t             m_pos = 0;  // 游标：下一个待消费的 Token 下标
 
     // ── 模板形参作用域：帧链（对应 clang 的 Scope::TemplateParamScope 链）──
-    // clang 的模板形参作用域**不是**独立容器，只是统一 Scope 链上的一个【种类位】
+    // 帧的粒度 ⇒ 查名字的结果（本项目无通用 Scope 类，用等价的【帧链】代替）：
+    //   一个 template<...> 一份帧（栈上局部对象，构造即入栈 / 析构即出栈）
+    //     ⇒ 解析 `template<class T> struct A { T v; };` 时 T 命中本帧 ⇒ TemplateParam("T")
+    //   沿 parent 上溯 ⇒ 内层优先（parent 指针顶替 Scope::getParent()）
+    // ★ 帧的生命周期 == 该 template 声明的解析范围，异常路径由栈展开保证出栈
+    //   （对照 clang：MultiParseScope 同样"构造 Enter、析构 Exit"，ParseTemplate.cpp:332）。
+    // clang 的模板形参作用域不是独立容器，只是统一 Scope 链上的一个【种类位】
     //   （clang/include/clang/Sema/Scope.h:81）：Sema::ActOnTypeParameter 末尾用
-    //   S->AddDecl(Param) 把形参挂进当前 Scope 的声明链（SemaTemplate.cpp:1074），
-    //   进出由 RAII 的 MultiParseScope 负责（ParseTemplate.cpp:332）⇒"内层优先"是
-    //   Scope 链的天然性质，无需手写 parent。
-    // 本项目没有通用 Scope 类，故用等价的【帧链】：一个 template<...> 一份帧，
-    //   parent 指针顶替 Scope::getParent()。
-    // 【为什么帧是栈上局部对象】生命周期 == 该 template 声明的解析范围：构造即入栈、
-    //   析构即出栈，异常路径由栈展开自动保证恢复（对照 clang：MultiParseScope 同样是
-    //   "构造 Enter、析构 Exit"）。
+    //   S->AddDecl(Param) 把形参挂进当前 Scope 的声明链（SemaTemplate.cpp:1074）
+    //   ⇒"内层优先"是 Scope 链的天然性质，无需手写 parent。
     struct TemplateParamFrame {
         const TemplateDecl* owner  = nullptr;  // 归属：这是哪个 template<>
         size_t              count  = 0;        // 已注册形参个数（随解析推进增长）
@@ -86,15 +101,16 @@ private:
     TemplateParamFrame* m_currentFrame = nullptr;
 
     // 查模板形参：从当前帧往外层帧走（内层优先），返回形参本身而非 bool（查不到即
-    //   nullptr）。对照 clang：Sema 的名字查找沿 Scope 链上行。
+    //   nullptr）。demo：`template<class T, int N>` 下查 "T" ⇒ Type 形参；查 "N" ⇒
+    //   NonType 形参；查 "U"（未命中）⇒ nullptr ⇒ 调用点退回建 Class("U")。
     // ★ 分水岭是「存下标 vs 存地址」，不是「存什么类型的指针」：帧里只留 owner + count，
     //   count 是上界，查询时现取 `owner->templateParams[i]` —— 下标描述的始终是同一
     //   逻辑位置，与 vector 扩容无关。
     // ★ 别把因果说反：防悬空【不是】只存下标的功劳。ast.h 的元素早已是 shared_ptr，节点
     //   住在 vector 之外的稳定地址上（扩容搬的只是指针值），缓存 `const TemplateParam*`
     //   本就不会悬空；只存下标的收益是【少一条必须记住的不变量】，防悬空由 shared_ptr 承担。
-    //   对照 clang：TemplateParameterList 只存 NamedDecl* 数组 + 长度，节点的命由
-    //   ASTContext 的 arena 保，二者分工一致。
+    //   对照 clang：Sema 的名字查找沿 Scope 链上行；TemplateParameterList 只存 NamedDecl*
+    //   数组 + 长度，节点的命由 ASTContext 的 arena 保，二者分工一致。
     const TemplateParam* lookupTemplateParam(const std::string& name) const;
 
     // ── Token 流操作（LL(1) 前瞻的底层设施）──

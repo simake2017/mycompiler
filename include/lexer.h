@@ -2,19 +2,25 @@
 // =============================================================================
 // include/lexer.h —— 阶段 1：词法分析器 (Lexer / Scanner)
 // =============================================================================
-// 职责：源码字符串逐字符扫描 ⇒ Token 流。实现是手写的确定性有限自动机（DFA）：
-// 只看首字符就决定走哪个扫描分支，每个分支消费若干字符、产出一个完整 Token。
+// 职责：源码字符串逐字符扫描 ⇒ Token 流。手写 DFA：按【首字符】分派，每个分支产出一个 Token。
 //
 // 管线位置  源码(.cpp) → Preprocessor → ★Lexer★ → Parser → Sema → … → CodeGen
 //           输入 = 预处理后的整段源码；输出 = std::vector<Token>（以 Eof 收尾）
-// 标准章节  [lex.phases] 阶段 3/7（本项目合并两级，直接产出语法 token）
-//           [lex.token] / [lex.operators] —— 即本 DFA 所实现的划分规则
-// clang     lib/Lex/Lexer.cpp（Lexer::LexTokenInternal 是它的切词主循环）
-//           include/clang/Lex/Lexer.h
+// 标准章节  [lex.phases] 阶段 3/7（合并两级，直接产语法 token）│ [lex.token] / [lex.operators]
+// 对照 clang：Lexer::LexTokenInternal —— 即本 DFA 所实现的划分规则
 //
-// 为什么手写而不是 lex/flex：词法对象理论上是正则语言，教科书路线是
-// 正则式 → NFA → DFA；工业编译器（clang/gcc）却普遍手写"按首字符分派"的扫描器
-// —— 等价于手工特化的 DFA，但更易调试、报错更友好。本项目选手写，
+// 首字符分派表（扫到什么 ⇒ 走哪条分支 ⇒ 产出什么）：
+//   `0-9`        ⇒ scanNumber()              ⇒ "42"   → Token{IntLiteral,"42"}
+//   `a-z A-Z _`  ⇒ scanIdentifierOrKeyword() ⇒ "x"    → Token{Identifier,"x"}
+//                                            ⇒ "int"  → Token{KwInt,"int"}
+//   `"`          ⇒ scanString()              ⇒ "hi\n" → Token{StringLiteral, 转义后的内容}
+//   其他         ⇒ scanOperator()            ⇒ "=" → Token{Assign}；"<=" → {LessEqual}
+//                                            ⇒ "->" → Token{Arrow}
+//   EOF（消费尽）⇒ 不再分派                    ⇒ Token{Eof,""}，★重复调用恒返回 Eof（幂等）
+// 空白与 `//` `/*` 在分派之前被 skipWhitespaceAndComments() 吃掉 ⇒ 不产 Token。
+//
+// 为什么手写而不是 lex/flex：教科书路线是正则式 → NFA → DFA；工业编译器（clang/gcc）却普遍手写
+// "按首字符分派"的扫描器 —— 等价于手工特化的 DFA，但更易调试、报错更友好。本项目选手写，
 // 正是为了把自动机的每一步都摊开给人看。
 // =============================================================================
 
@@ -28,7 +34,7 @@ namespace minicc {
 // ─────────────────────────────────────────────────────────────────────────────
 // Lexer：词法分析主体（一次性、单向推进的扫描器）
 // ─────────────────────────────────────────────────────────────────────────────
-// demo: Lexer("int x = 42;").tokenizeAll() ⇒ [KwInt][Identifier][Assign][IntLiteral][Semicolon][Eof]
+// demo: Lexer("int x = 42;").tokenizeAll() ⇒ [KwInt][Identifier][Assign][IntLiteral][;][Eof]
 // 外层分派（nextToken() 每次调用的流程）：
 //
 //     skipWhitespaceAndComments()      ← 循环吃掉空白/注释

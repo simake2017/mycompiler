@@ -1,28 +1,23 @@
 // =============================================================================
 // include/ast_visitor.h —— AST 访问者（Visitor 模式）—— 理论见 docs/learn/29
 // =============================================================================
-// 【解决什么】每个 AST 消费者各写一条 if-else + dynamic_pointer_cast 链（Sema::inferType
-// 14 级 / CodeGen::emitExpr 13 级 / emitStmt 8 级 / dumpExpr 14 级）的毛病有二：
-//   ① 性能 O(n) —— 一个 CallExpr 要试穿前面 7 个 cast 才轮到；
-//   ② 结构上新增节点类型时四条链都要手动补，漏一条不报错、只是静默走 else。
-//
-// 【Visitor 怎么解决】把"按动态类型分派"收进类型系统：
-//   · 每个节点重写 accept(AstVisitor&)，函数体是 v.visit(*this)；
-//   · accept 是虚函数 ⇒ 一次虚表跳转（O(1)）就落到正确的 visit 重载；
-//   · 重载决议在【编译期】完成 —— *this 的静态类型就是节点自己，故绑定精确重载、无需 cast。
+// 【旧写法的问题】改一处动态类型 ⇒ 四条 cast 链都要补：
+//   Sema::inferType 14 级 / CodeGen::emitExpr 13 级 / emitStmt 8 级 / dumpExpr 14 级
+//   漏一条不报错，只是静默走 else（O(n)：CallExpr 要试穿前面 7 个 cast）。
+// 【新写法】每个节点一行，分派交给虚表：
+//   BinaryExpr::accept(v) { v.visit(*this); }   // 虚表跳转 O(1)，重载编译期定
+//   重载决议在【编译期】完成 —— *this 的静态类型就是节点自己，故绑定精确重载、无需 cast。
 //
 // 【为什么本文件只有前置声明】visit 参数是【引用】，只要求类型被声明、不要求被定义，故只
 //   前置声明 32 个节点即可把 AstVisitor 定义完整，依赖单向无环：
 //     ast.h ──include──▶ ast_visitor.h（节点实现 accept 需要访问者完整）｜反向 ──✗──▶ ast.h
 //
-// ★ 陷阱：accept 的【函数体】必须写在类内 inline。类里声明、类外定义的虚函数会成为该类
-//   的【键函数】（Itanium ABI），而 vtable 只在定义键函数的那个 TU 里发射 —— 本项目 .cpp
-//   大多只 include ast.h，于是谁也没发射 vtable，链接期满屏 undefined reference to
-//   `vtable for minicc::DeleteExpr`。类内 inline 定义隐含 inline ⇒ 不构成键函数，vtable
-//   即在每个用到的 TU 里以弱符号发射。
+// ★ 陷阱：accept 的【函数体】必须写在类内 inline —— 类里声明、类外定义的虚函数是该类的
+//   【键函数】（Itanium ABI），vtable 只在定义它的 TU 发射 ⇒ 链接期满屏 undefined
+//   reference to `vtable for minicc::DeleteExpr`。类内 inline 隐含 inline，不构成键函数。
 //
-// 【clang 对照】RecursiveASTVisitor 由 TableGen 从 StmtNodes.td / DeclNodes.td 生成，本文件是
-//   那份生成结果的手写版，同样给每个节点空默认体：
+// 对照 clang：RecursiveASTVisitor（TableGen 从 StmtNodes.td / DeclNodes.td 生成，本文件是
+//   那份生成结果的手写版，同样给每个节点空默认体）：
 //     clang : bool VisitBinaryOperator(BinaryOperator *B) { return true; }
 //     本项目: virtual void visit(BinaryExpr&) {}
 // 【怎么用】继承 AstVisitor、重写关心的 visit 重载，然后 node.accept(v)；想递归就在 visit

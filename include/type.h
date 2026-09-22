@@ -2,20 +2,22 @@
 // =============================================================================
 // 类型系统（Type System）—— 理论见 docs/learn/12（类型封装）、23（cv 位置与同一性）
 // =============================================================================
-// 编译期看"符号"（类型名、字段名），运行期看"偏移量"（内存布局）。本文件负责：
-//   ① 表示所有类型（基础 / 类 / 指针 / 引用 / const / 模板参数 / decltype）
-//   ② 存类的内存布局（字段偏移、vtable 槽位、多继承子对象）
-//   ③ 支持类型比较（equals）与推导
+// 一句话：编译期看"符号"（类型名、字段名），运行期看"偏移量"（内存布局）。
+//
+// 【本文件提供什么 ⇒ 谁在用】
+//   Type 类型树（基础/类/指针/引用/const/模板参数/decltype）⇒ Parser 建、Sema 填、CodeGen 读
+//   ClassLayout（字段偏移 / vtable 槽位 / 多继承子对象）      ⇒ CodeGen 照抄，不再自己算
+//   equals / stripReferences / stripConst（结构比较与去修饰）⇒ 语义检查、模板推导的合一
 //
 // 【管线位置】type.h 横跨所有阶段，是语义信息的"通货"：
 //   Parser parseType() 构造 Type → Sema 填 Expression::resolvedType、算 ClassLayout →
 //   TemplateInstantiator::substituteType 结构化替换（含引用折叠）→
 //   NameMangler::encodeType 编成 Itanium mangling。
 //
-// 【标准章节】[basic.type] [basic.fundamental] / [dcl.ptr] [dcl.ref] [dcl.type.cv]
-//   [dcl.spec.auto] / [class] [class.mem] [class.virtual] / [temp.param] [temp.deduct]
-// 【clang 对照】clang/AST/Type.h（Type / BuiltinType / PointerType / 各类 ReferenceType
-//   / RecordType / TemplateTypeParmType / AutoType）、Decl.h（FieldDecl ≈ FieldInfo）、
+// 【标准章节】[basic.type] [basic.fundamental] [class] / [dcl.ptr] [dcl.ref] [dcl.type.cv]
+//   [dcl.spec.auto] / [class.mem] [class.virtual] / [temp.param] [temp.deduct]
+// 对照 clang：AST/Type.h（Type / BuiltinType / PointerType / ReferenceType / RecordType /
+//   TemplateTypeParmType / AutoType）、Decl.h（FieldDecl ≈ FieldInfo）、
 //   RecordLayout.h（ASTRecordLayout ≈ ClassLayout）。
 //   ★ 差异：clang 用 QualType + Qualifiers 承载 const（不单独建节点），本实现把 const
 //     建成独立的 TypeKind::Const 节点，便于观察与讲解。
@@ -187,17 +189,18 @@ struct TemplateArg {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ClassLayout：类的完整内存布局
+// ClassLayout：类的完整内存布局（"运行期看偏移量"的核心结构）
 // ─────────────────────────────────────────────────────────────────────────────
-// "运行期看偏移量"的核心结构：编译器在此算好每个字段的绝对偏移量，CodeGen 直接用。
-// 布局计算的落点见 src/semantic_analyzer.cpp 的类注册路径（约 :226~:373）：先并入基类的
+// 编译器在此算好每个字段的绝对偏移量，CodeGen 照抄，不再自己算；布局计算落点见
+// src/semantic_analyzer.cpp 的类注册路径（约 :226~:373）——先并入基类的
 // fields/vtableEntries，再累加本类字段偏移，最后分配 vtable 槽位。
 //
-// 对象内存示意（class Derived : Base，Base 有虚函数，Derived 新增 int d;）：
+// 【写法 ⇒ 布局】class Derived : Base（Base 有虚函数），Derived 新增 int d;
 //   偏移 0  ┌──────────────┐  vptr(8B) ──► _ZTV7Derived
 //   偏移 8  ├──────────────┤    vtable[-1] = _ZTI7Derived（RTTI type_info）；[0] = Derived::foo
 //           │ Base 字段 ...│
 //           └──────────────┘  其后是 int d；totalSize = 按最大对齐数对齐后的总字节数
+//   再例：class Point { int x; int y; }; ⇒ fields = [{x,offset=0},{y,offset=4}]，totalSize=8
 struct ClassLayout {
     std::string              className;
     uint32_t                 totalSize   = 0;    // 整个对象的字节大小
@@ -234,36 +237,38 @@ struct ClassLayout {
 // =============================================================================
 // 【指针 / 引用 / const 的组合规则】—— 详见 docs/learn/23
 // =============================================================================
-// Type 是"洋葱式"嵌套结构：每个修饰符都是独立的 Type 节点，通过 pointeeType /
-// referencedType / innerType 三条链指向内层被修饰类型。Parser 的组合顺序见
-// src/parser.cpp parseType :168 —— 记下 const 前缀 → 解析基础类型 → 叠加后缀 * / & / &&
-// → 最后才把 const 包到它该在的位置。注意这与"const 一律最外层"的朴素直觉不同：
+// Type 是"洋葱式"嵌套：每个修饰符一个独立节点，靠 pointeeType / referencedType /
+// innerType 三条链指向内层。组合顺序见 src/parser.cpp parseType :168 —— 记下 const 前缀
+// → 解析基础类型 → 叠加后缀 * / & / && → 最后把 const 包到它该在的位置。
 //
-//   源码           Type 结构（外 → 内）             encodeType
-//   int            Int                              i
-//   int*           Pointer(Int)                     Pi
-//   int&           LValueReference(Int)             Ri
-//   int&&          RValueReference(Int)             Oi
-//   const int      Const(Int)                       Ki
-//   int**          Pointer(Pointer(Int))            PPi
-//   const int*     Pointer(Const(Int))              PKi   ← const 在【内层】（说明符侧）
-//   const int&     LValueReference(Const(Int))      KRi   ← const 在【内层】
-//   int* const     Const(Pointer(Int))              KPi   ← const 在【外层】（声明符侧）
+// 【写法 ⇒ 建出哪种节点】（外 → 内；encodeType 见 src/template_instantiation.cpp）
+//   int               ⇒ Int                            i
+//   int*              ⇒ Pointer(Int)                   Pi
+//   int&              ⇒ LValueReference(Int)           Ri
+//   int&&             ⇒ RValueReference(Int)           Oi
+//   const int         ⇒ Const(Int)                     Ki
+//   int**             ⇒ Pointer(Pointer(Int))          PPi
+//   const int*        ⇒ Pointer(Const(Int))            PKi   ← const 在【内层】（说明符侧）
+//   const int&        ⇒ LValueReference(Const(Int))    KRi   ← const 在【内层】
+//   int* const        ⇒ Const(Pointer(Int))            KPi   ← const 在【外层】（声明符侧）
+//   int* const*       ⇒ Pointer(Const(Pointer(Int)))         ← 链式组合
+//   Box<int>::type    ⇒ 实例类的别名表 + nestedQualifier=Box<int>、name="type"
 //
 //   ★ 三者不可混淆：const 写在哪一侧就修饰谁（[dcl.type.cv]）—— 结构不同则打印不同、
-//     mangling 不同、偏特化匹配结果也不同（回归 tests/tmpl/test_tmpl_47_cv_position.cpp）。
+//     mangling 不同、偏特化匹配结果也不同（`C<const int*>` 与 `C<int* const>` 曾撞成同一
+//     条缓存）。回归 tests/tmpl/test_tmpl_47_cv_position.cpp（踩坑史 T1）。
 //
-// 【引用折叠（Reference Collapsing）】[dcl.ref]/6（嵌套情形见 [temp.deduct.call]）：
-//   T& &→T&   T& &&→T&   T&& &→T&   T&& &&→T&&  —— 有一层左值引用，结果就是左值引用。
-//   这是"万能引用/转发引用"的原理：foo(42) ⇒ T=int, T&&=int&&；foo(var) ⇒ T=int&,
-//   T&&=int& &&→int&。普通 C++ 不允许写"引用的引用"，但模板替换会产生它。
-// ★ 折叠必须在【构造点】完成 —— Type::makeLValueReference / makeRValueReference 是唯一
-//   实现处，"不存在嵌套引用节点"由此成为类型系统的不变量。只在某一条路径上折叠是不够
-//   的：推导万能引用时 bind 出的 `T := A&`（A 本身已是引用）无人收拾，会造出非法的嵌套
-//   引用节点 `int& &`（观测量：同一函数实例化出两个符号 _Z2idIRiE / _Z2idIRRiE）。
-//   对照 clang：Sema::BuildReferenceType（clang/lib/Sema/SemaType.cpp:1887）是折叠的唯一
-//   实现点，canonical type 在构造时即算好（ASTContext::getLValueReferenceType，
-//   clang/lib/AST/ASTContext.cpp:4163）。
+// 【引用折叠 Reference Collapsing】[dcl.ref]/6（嵌套情形见 [temp.deduct.call]）——
+//   构造点四行合一，有一层左值引用即左值引用：
+//     T& & →T&    T& && →T&    T&& & →T&    T&& && →T&&
+//   万能引用的来源：foo(42) ⇒ T=int,  T&& = int&&；
+//                   foo(var)⇒ T=int&, T&& = int& && → int&。
+// ★ 折叠必须在【构造点】完成 —— makeLValueReference / makeRValueReference 是唯一实现处，
+//   "不存在嵌套引用节点"由此成为类型系统的不变量。只写在某一条路径上是不够的：推导
+//   `T := A&`（A 本身已是引用）时无人收拾 ⇒ 非法的 `int& &`，观测量是同一函数实例化出
+//   两个符号 _Z2idIRiE / _Z2idIRRiE（踩坑史 T3）。
+// 对照 clang：Sema::BuildReferenceType（SemaType.cpp:1887）是折叠唯一实现点，canonical
+//   type 在 ASTContext::getLValueReferenceType 构造时即算好。
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,28 +303,28 @@ struct Type {
     std::vector<TemplateArg> templateArgs;
 
     // ── 嵌套/依赖类型名（`S<int>::type`、`T::type`）──
-    // 【表示】qualifier 非空 ⇒ 本节点表示"qualifier 所指数类型里的成员类型别名"：
-    //     nestedQualifier = S<int>（半成品，交给 resolveType 按需实例化）
-    //     name            = "type"（成员名）
-    //   `T::type` 里 qualifier 就是 TemplateParam 节点（依赖情形，见 docs/learn/24）。
-    // 【为什么单列一组字段】它既不是"类名"（不能拿去查 m_classTypes），
-    //   也不是"模板 id"（没有实参可实例化）—— 而是一个【待解析的路径】：
-    //   先把 qualifier 解析成具体类，再去那个类的 typeAliases 里取成员。
-    //   对照 clang：DependentNameType / ElaboratedType 的 qualifier + NamedDecl。
+    // 【写法 ⇒ 两个字段 ⇒ 谁来解】
+    //     S<int>::type  ⇒ nestedQualifier=S<int>（半成品）、name="type"
+    //                     ⇒ resolveType 先按需实例化限定者，再查实例类的 typeAliases
+    //     T::type       ⇒ nestedQualifier=TemplateParam(T)、name="type"
+    //                     ⇒ 依赖情形：等 substituteType 在【直接上下文】当场解，查不到即
+    //                       Sfinae::fail（[temp.deduct]/8；见 docs/learn/24/25）
+    // 【为什么单列一组字段】它既不是"类名"（不能拿去查 m_classTypes），也不是"模板 id"
+    //   （没有实参可实例化）—— 而是一条【待解析的路径】，故必须与两者分开存。
+    // 对照 clang：DependentNameType / ElaboratedType（qualifier + NamedDecl）。
     TypePtr     nestedQualifier;    // 限定部分（如 S<int> 或 T）
     bool isNestedName() const { return nestedQualifier != nullptr; }
 
     // ── 实例"出身"（模板实例类型专有）──
-    // 【要解决什么】实例化后的类型叫 `MyPtr_int`，模板 id 的信息（哪个模板、哪些实参）在
-    //   改名那一刻就丢了；而推导必须回答"`MyPtr_int` 是 `MyPtr<T>` 对 T 的一次成功绑定
-    //   吗？"—— 只靠名字反推不可靠（名字是清洗过的可读串，不是单射），故显式记下出身。
-    // demo: MyPtr<int> 实例化后 ⇒ name="MyPtr_int"（参与布局与 mangling）、
-    //   templateOriginName="MyPtr"、templateOriginArgs=[Type:int]；推导时对 P=MyPtr<T> 与
-    //   A=MyPtr_int：出身同名 + 实参个数相等 ⇒ 逐位合一 ⇒ T := int。
-    // 【为什么不复用 templateArgs】那个字段的语义是"待实例化的半成品"（resolveType 见到非
-    //   空实参就触发实例化）；出身字段是【只读记录】，不参与任何解析决策，故必须分开。
-    // clang 对照：ClassTemplateSpecializationDecl 自身就带着 TemplateArgumentList，不存在
-    //   "改名后丢实参"的问题（其实例类型仍是一个 Decl）。
+    // 【要解决什么】实例化后类型名变成 `MyPtr_int`，模板 id 的信息（哪个模板、哪些实参）
+    //   在改名那刻就丢了；推导却必须回答"`MyPtr_int` 是 `MyPtr<T>` 对 T 的一次成功绑定吗？"
+    // demo: MyPtr<int> ⇒ name="MyPtr_int"（参与布局与 mangling）、
+    //                   templateOriginName="MyPtr"、templateOriginArgs=[Type:int]
+    //   推导 P=MyPtr<T> vs A=MyPtr_int：出身同名 + 实参个数相等 ⇒ 逐位合一 ⇒ T := int。
+    // ★ 必须与 templateArgs 分开存：那个字段的语义是"待实例化的半成品"（resolveType 见到
+    //   非空实参就触发实例化），出身是【只读记录】，不参与任何解析决策。名字不可反推 ——
+    //   它是清洗过的可读串、不是单射（踩坑史 T1/T3）。
+    // 对照 clang：ClassTemplateSpecializationDecl 自带 TemplateArgumentList，无此问题。
     std::string              templateOriginName;
     std::vector<TemplateArg> templateOriginArgs;
     bool isTemplateInstance() const { return !templateOriginName.empty(); }

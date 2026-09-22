@@ -4,11 +4,12 @@
 // =============================================================================
 // 管线位置：源码(.cpp) → Preprocessor → ★Lexer★ → Parser → Sema → … → CodeGen(.s)
 //   本文件定义 Lexer 交给 Parser 的"数据格式"：Parser 从此不再看见字符，只看见 Token。
-//   Token 是流水线上第一个"零件" —— 带类型标签与位置信息的最小语法单元。
+//   Token = 流水线上第一个"零件"：带类型标签与位置信息的最小语法单元。
 //
 // 标准章节  [lex.phases] 阶段 3/7（切词）│ [lex.token] 五类终结符 │ [lex.pptoken]
-// 对应 clang Basic/TokenKinds.def（tok:: 大枚举 ／ 本项目 TokenType）
-//            Basic/Token.h（种类+长度+位置 ／ 本项目 Token 结构）
+// 对照 clang：Basic/TokenKinds.def（tok:: 大枚举 ／ 本项目 TokenType）
+//             Basic/Token.h（种类+长度+位置 ／ 本项目 Token 结构）
+// demo: `int x = 42;` ⇒ [KwInt][Identifier "x"][Assign "="][IntLiteral "42"][Semicolon][Eof]
 // =============================================================================
 
 #include <cstdint>
@@ -116,9 +117,10 @@ enum class TokenType : uint8_t {
 // ─────────────────────────────────────────────────────────────────────────────
 // 关键字字符串 → TokenType 的映射表（关键字清单由标准 [lex.key] 规定）
 // ─────────────────────────────────────────────────────────────────────────────
-// 两步法：先按标识符规则扫出完整单词，再查这张表 —— 命中即关键字，未中即 Identifier。
-// clang 同思路（扫出标识符再查 IdentifierTable 完美哈希）。好处：不必为每个关键字
-// 写状态机，新增关键字只需在这里加一行。
+// 两步法：先按标识符规则扫出完整单词，再查这张表 —— 查表结果直接决定 Token 种类：
+//   "template"  ⇒ 命中 ⇒ Token{KwTemplate,"template"}
+//   "templata"  ⇒ 未中 ⇒ Token{Identifier,"templata"}
+// 好处：不必为每个关键字写状态机，新增关键字只在这里加一行（对照 clang：IdentifierTable）。
 // demo: "template" ⇒ KwTemplate；"templata"（未命中）⇒ Identifier
 // inline const：头文件内定义、多个翻译单元共享且只构建一次。
 inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
@@ -194,9 +196,9 @@ struct Token {
     bool isNot(TokenType t) const { return type != t; }
 
     // 判断是否为类型关键字（int, double, bool, void, auto, const, decltype）
-    // Parser 识别声明（"类型 + 名字"）时用。
-    // demo: Token{KwInt}.isTypeKeyword() ⇒ true；Token{KwClass} ⇒ false
-    //       （class 引入的是类定义而非内置类型名，故不在此列）
+    // Parser 识别声明（"类型 + 名字"）时用：
+    //   Token{KwInt}   ⇒ true      Token{KwConst}    ⇒ true      Token{KwDecltype} ⇒ true
+    //   Token{KwClass} ⇒ false     （class 引入的是类定义而非内置类型名，故不在此列）
     // ★ KwConst 必须在此列：const 是【类型说明符】的开头（[dcl.type]：
     //   type-specifier-seq 可为 `const` + 类型），`const int x = 1;` 是一条正经的声明。
     //   ⚠ 顶层声明走的是"试探性 parseType + 回滚"、不看本函数 —— 同一语义在两条
