@@ -58,6 +58,7 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwPrivate:     return "private";
         case TokenType::KwProtected:   return "protected";
         case TokenType::KwReturn:      return "return";
+        case TokenType::KwStatic:      return "static";
         case TokenType::KwStruct:      return "struct";
         case TokenType::KwTemplate:    return "template";
         case TokenType::KwThis:        return "this";

@@ -146,7 +146,9 @@ private:
     static bool isWordStart(char c);
     static bool isWordChar(char c);
     static size_t readWord(const std::string& s, size_t pos, std::string& out);
-    static std::string stripComment(const std::string& line);  // 剥行尾注释（字符串感知）
+    // 剥注释（字符串/字符字面量感知）。★ inBlockComment 是【跨行状态】，
+    // 由调用方按文件保管 —— 块注释可以跨行（[lex.phases] 阶段 3）。
+    static std::string stripComment(const std::string& line, bool& inBlockComment);
     static std::string trim(const std::string& s);
 };
 

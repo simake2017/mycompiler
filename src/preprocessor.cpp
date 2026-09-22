@@ -60,16 +60,33 @@ std::string Preprocessor::trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
-// 剥行内注释（字符串/字符字面量感知）—— 翻译阶段 3 的准备工作：注释必须在分词前移除。
-// demo: "int a; // 行注释" ⇒ "int a; "
-//       "/* 块 */ int b;"  ⇒ " int b;"（块注释替换为一个空格，防止记号粘连：
-//         int/**/x 若直接删掉注释会变成 intx，必须保持 int 与 x 分开）
-//       字符串字面量里出现的 "//" 不是注释，原样保留。
-std::string Preprocessor::stripComment(const std::string& line) {
+// 剥注释（字符串/字符字面量感知）—— 翻译阶段 3 的准备工作：注释必须在分词前移除。
+// 用例 ⇒ 结果：
+//   "int a; // 行注释"      ⇒ "int a; "     行注释丢弃整段
+//   "/* 块 */ int b;"       ⇒ " int b;"     块注释替换为空格，防止记号粘连
+//   "int/**/x"              ⇒ "int x"       若直接删掉会变成 intx，必须留一个空格
+//   R"("//" 不是注释)"      ⇒ 原样          字符串字面量里的 // 不算注释
+// ★ 跨行块注释（inBlockComment 由调用方按文件保管 —— [lex.phases] 阶段 3 允许跨行）：
+//   行1 "/*"          ⇒ "  "       置 inBlockComment=true
+//   行2 " * 说明文字" ⇒ "  "       仍在注释内，逐字符换空格
+//   行3 " */ int x;"  ⇒ "   int x;" 见 */ 复位，其后恢复正常产出
+//   反例（无跨行状态时）：行2 原样输出 ⇒ 词法器收到 '*' 标识符 '*' '/' 四个记号
+std::string Preprocessor::stripComment(const std::string& line, bool& inBlockComment) {
     std::string out;
     bool inStr = false, inChar = false;
     for (size_t i = 0; i < line.size(); i++) {
         char c = line[i];
+        if (inBlockComment) {
+            // 注释内部：只认结束标记，其余一律换空格（保持列宽，也防记号粘连）
+            if (c == '*' && i + 1 < line.size() && line[i + 1] == '/') {
+                inBlockComment = false;
+                out += "  ";  // */ 两个字符 ⇒ 两个空格
+                i++;
+                continue;
+            }
+            out += ' ';
+            continue;
+        }
         if (inStr) {
             out += c;
             if (c == '\\' && i + 1 < line.size()) { out += line[++i]; continue; }
@@ -86,7 +103,12 @@ std::string Preprocessor::stripComment(const std::string& line) {
         else if (c == '/' && i + 1 < line.size() && line[i + 1] == '*') {
             size_t end = line.find("*/", i + 2);
             out += ' ';  // 块注释 → 空格（防止记号粘连）
-            i = (end == std::string::npos) ? line.size() : end + 1;
+            if (end == std::string::npos) {
+                inBlockComment = true;  // ★ 本行没闭合 ⇒ 记下，后续行继续剥
+                i = line.size();
+            } else {
+                i = end + 1;  // 同行的 */ 直接跳过
+            }
         }
         else out += c;
     }
@@ -171,11 +193,13 @@ std::string Preprocessor::processText(const std::string& src, const std::string&
     std::string line;
     std::string out;
     int lineNo = 0;
+    // 跨行块注释状态（每个文件独立 —— #include 递归时各层不串味）
+    bool inBlockComment = false;
 
     while (std::getline(iss, line)) {
         lineNo++;
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        std::string clean = stripComment(line);
+        std::string clean = stripComment(line, inBlockComment);
         std::string t = trim(clean);
 
         // 调试：每行源文本单独打一个 [src-line] 块标记 —— 测试里的

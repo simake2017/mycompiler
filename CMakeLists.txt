@@ -76,6 +76,7 @@ add_executable(unit_tests
     tests/unit/test_rtti_layout.cpp
     tests/unit/test_typeinfo_suite.cpp
     tests/unit/test_codegen_frame.cpp
+    tests/unit/test_codegen_field_write.cpp
     tests/unit/test_ast_visitor.cpp
     src/preprocessor.cpp
     src/sfinae.cpp

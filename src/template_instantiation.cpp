@@ -32,7 +32,8 @@ namespace minicc {
 // 【编码表】v=void b=bool i=int d=double P=指针 R=左值引用 O=右值引用 K=const
 //           类名 = <长度><名字>（如 7MyClass）；模板参数名原样输出（实例化后不应出现）
 // demo: int* ⇒ Pi │ const int ⇒ Ki │ MyClass ⇒ 7MyClass
-std::string NameMangler::encodeType(TypePtr type) {
+std::string NameMangler::encodeType(TypePtr type,
+                                    const std::vector<std::string>& typeParams) {
     if (!type) return "v"; // void
 
     switch (type->kind) {
@@ -41,16 +42,26 @@ std::string NameMangler::encodeType(TypePtr type) {
         case TypeKind::Int:    return "i";
         case TypeKind::Double: return "d";
         case TypeKind::Pointer:
-            return "P" + encodeType(type->pointeeType);
+            return "P" + encodeType(type->pointeeType, typeParams);
         case TypeKind::LValueReference:
-            return "R" + encodeType(type->referencedType);   // GCC ABI: R = lvalue ref
+            return "R" + encodeType(type->referencedType, typeParams); // GCC ABI: R = lvalue ref
         case TypeKind::RValueReference:
-            return "O" + encodeType(type->referencedType);   // GCC ABI: O = rvalue ref
+            return "O" + encodeType(type->referencedType, typeParams); // GCC ABI: O = rvalue ref
         case TypeKind::Const:
-            return "K" + encodeType(type->innerType);        // GCC ABI: K = const
+            return "K" + encodeType(type->innerType, typeParams);      // GCC ABI: K = const
         case TypeKind::Class:
             return std::format("{}{}", type->name.size(), type->name);
         case TypeKind::TemplateParam:
+            // ★ 仅在函数模板实例的签名里走这段（typeParams 非空）：
+            //   形参编成 Itanium <template-param>，它【引用】模板实参表的第 n 项
+            //   —— 序号 0 ⇒ T_，序号 1 ⇒ T0_，序号 2 ⇒ T1_（编码值比序号少一）。
+            //   类模板路径传的是空表 ⇒ 落到下面原样输出，既有符号不变。
+            for (size_t i = 0; i < typeParams.size(); i++) {
+                if (typeParams[i] == type->templateParamName) {
+                    return i == 0 ? std::string("T_")
+                                  : std::format("T{}_", i - 1);
+                }
+            }
             return type->templateParamName;
         case TypeKind::Auto:
             return "Da"; // 不应该出现（auto 应该在阶段3已被消除）
@@ -83,12 +94,22 @@ std::string NameMangler::mangleTemplateInstance(
         if (arg.isType()) {
             result += encodeType(arg.type);
         }
+        else if (arg.isTemplate()) {
+            // ── 模板模板实参 [temp.arg.template] ──
+            // 实参是【模板名】：Itanium 按 <name> 直接编码（与类类型同形）。
+            // demo: Wrap<Box, int> ⇒ _Z4WrapI3BoxiE
+            // ★ 不能落到下面的 NTTP 分支 —— 那会把它编成 Li0E（值 0 的 expr-primary），
+            //   产出一个"看着像模像样"却与 clang 完全不同的符号。
+            // 对照 clang：ItaniumMangle 的 TemplateTemplateArg 走 mangleName 路径。
+            result += encodeType(Type::makeClass(arg.templateName));
+        }
         else {
             // <expr-primary>：L 开头 E 收尾，中间是「类型编码 + 值」。
             // ★ 负数按 Itanium 规则编成 n<绝对值>（-4 ⇒ "n4"）—— '-' 不是合法的
             //   mangling 字符。
             result += "L";
-            result += "i";                       // 本项目 NTTP 只支持 int
+            // 按实参的【形态】编码：bool ⇒ b、int ⇒ i（缺失时按 int 兜底）
+            result += arg.valueType ? encodeType(arg.valueType) : "i";
             result += (arg.value < 0)
                           ? std::format("n{}", -arg.value)
                           : std::to_string(arg.value);
@@ -97,6 +118,35 @@ std::string NameMangler::mangleTemplateInstance(
     }
 
     result += "E";
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 函数模板实例符号名（[temp]，Itanium ABI §5.1.8 <bare-function-type>）
+// 格式: _Z + 名 + I<模板实参>E + <返回类型> + <各参数类型>
+// demo: template<class T> T twice(T x)      以 T=int 实例化 ⇒ _Z5twiceIiET_T_
+//                                                             └┬┘ └┬┘
+//                                                         返回 T_  参数 T_
+//       template<class T> T pick(T a, int n)              ⇒ _Z4pickIiET_i
+//       template<class T> void f(T a, T b)                ⇒ _Z1fIiEvT_T0_
+// ★ 与类模板实例唯一的差别就是这个末尾段：函数模板的返回类型也是签名的一部分
+//   （无法从名字反推），必须编进去；参数表同理。少了它，`template<class T>
+//   T f(T)` 与 `template<class T> T f(T, int)` 在同一次实例化下会撞成同一符号。
+// ─────────────────────────────────────────────────────────────────────────────
+std::string NameMangler::mangleFunctionTemplateInstance(
+    const std::string& funcName,
+    const std::vector<TemplateArg>& args,
+    const TypePtr& returnType,
+    const std::vector<Parameter>& params,
+    const std::vector<std::string>& typeParams) {
+
+    std::string result = mangleTemplateInstance(funcName, args);
+
+    // <bare-function-type>：返回类型在前，各参数类型依次跟上。
+    result += encodeType(returnType, typeParams);
+    for (auto& param : params) {
+        result += encodeType(param.type, typeParams);
+    }
     return result;
 }
 
@@ -170,6 +220,30 @@ std::string NameMangler::mangleVTable(const std::string& className) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 实例化 = 结构化替换：深拷贝蓝图 AST，逐【类型位置】替换；流程对应函数体内的
 // 0 → 6 编号步骤（含 2a 撞名守卫 / 5.5 类内别名替换）。
+// 实例名清洗：把实参的【人读串】洗成合法的汇编符号字符。
+// ★ 必须尽量【单射】：'*' 与 '&' 各配一个字母（Box<int*>→Box_intP、Box<int&>→Box_intR），
+//   否则两种不同实参洗出同一个符号。',' '<' '>' → '_' 仍非单射，
+//   由调用点的撞名守卫兜底（宁可报错，也绝不产出重复符号）。
+// 类模板实例与成员模板实例共用本函数。
+// 对照 clang：Itanium ABI 的 <substitution> 是另一种思路（去重而非清洗），
+//   本实现只求"符号合法且够用"，人读名与真正的编码（NameMangler）是两件事。
+std::string sanitizeSymbolChars(const std::string& raw) {
+    std::string out;
+    for (char c : raw) {
+        if (c == ' ') continue;                       // 空格剔除
+        switch (c) {
+            case '*': out += 'P'; break;              // Pointer   Box<int*>  → Box_intP
+            case '&': out += 'R'; break;              // Reference Box<int&>  → Box_intR
+            case '-': out += 'N'; break;              // Negative  Buf<-3>    → Buf_N3
+            case '+': out += 'A'; break;              // 目前进不来（实参只认整数字面量）
+            case ',': case '<': case '>':
+                out += '_'; break;
+            default:  out += c;   break;
+        }
+    }
+    return out;
+}
+
 ClassDeclPtr TemplateInstantiator::instantiate(
     TemplateDeclPtr templateDecl,
     const std::vector<TemplateArg>& args,
@@ -242,26 +316,11 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     // ── 2. 生成实例化后的类名 ──
     // 实例名直接进汇编符号（方法名 <类名>_<方法>），必须剔除空格与 '<' '>' ',' 等
     // 非法字符；NTTP 值实参走同一套清洗（Buf<4> ⇒ Buf_4），天然区分不同实例。
+    // ★ 这里只是「人读的实例名」，真正的符号编码在 NameMangler。
+    //   清洗规则见 sanitizeSymbolChars（与成员模板实例共用同一份，避免两处漂移）。
     std::string instanceName = templateDecl->classTemplate->name;
     for (auto& arg : args) {
-        instanceName += "_";
-        for (char c : arg.toString()) {
-            if (c == ' ') continue;                       // 空格剔除
-            // ── 非法符号字符 → 字母（★ 必须【单射】：一字符对一字母）──
-            // ★ '*' 与 '&' 各配一个字母，不能都换成 '_'：否则 Box<int*> 与 Box<int&>
-            //   洗出同名实例 ⇒ as 报 duplicate symbol（clang 视二者为不同类型，合法）。
-            //   ',' '<' '>' → '_' 仍非单射，由 2a 撞名守卫兜底，宁可报错也不重复符号。
-            // ★ 这里只是「人读的实例名」，真正的符号编码在 NameMangler（见上）。
-            switch (c) {
-                case '*': instanceName += 'P'; break;  // Pointer   Box<int*>  → Box_intP
-                case '&': instanceName += 'R'; break;  // Reference Box<int&>  → Box_intR
-                case '-': instanceName += 'N'; break;  // Negative  Buf<-3>    → Buf_N3
-                case '+': instanceName += 'A'; break;  // 目前进不来（实参只认整数字面量）
-                case ',': case '<': case '>':
-                    instanceName += '_'; break;
-                default:  instanceName += c;   break;
-            }
-        }
+        instanceName += "_" + sanitizeSymbolChars(arg.toString());
     }
 
     // ── 2a. ★ 撞名守卫 ──
@@ -306,8 +365,10 @@ ClassDeclPtr TemplateInstantiator::instantiate(
                 if (i > 0) s += ", ";
                 s += (params[i]->kind == TemplateParamKind::Type)
                          ? "typename " + params[i]->name
-                         : (params[i]->nonType ? params[i]->nonType->toString() : "?")
-                               + " " + params[i]->name;
+                     : (params[i]->kind == TemplateParamKind::NonType)
+                         ? (params[i]->nonType ? params[i]->nonType->toString() : "?")
+                               + " " + params[i]->name
+                         : "template <...> class " + params[i]->name;
             } return s; }(),
         kindTag);
     if (templateDecl->isSpecialization()) {
@@ -316,8 +377,8 @@ ClassDeclPtr TemplateInstantiator::instantiate(
             [&] { std::string s;
                   for (size_t i = 0; i < templateDecl->specPattern.size(); i++) {
                       if (i > 0) s += ", ";
-                      const auto& p = templateDecl->specPattern[i];
-                      s += p ? p->toString() : "?";
+                      // 类型位印类型名、值位印值（TemplateArg::toString 已分派）
+                      s += templateDecl->specPattern[i].toString();
                   } return s; }());
     }
     std::cout << std::format("  ║ Instance:  {}\n", instanceName);
@@ -409,7 +470,8 @@ ClassDeclPtr TemplateInstantiator::instantiate(
 // ─────────────────────────────────────────────────────────────────────────────
 FuncDeclPtr TemplateInstantiator::instantiateFunction(
     TemplateDeclPtr templateDecl,
-    const std::vector<TypePtr>& typeArgs) {
+    const std::vector<TypePtr>& typeArgs,
+    const std::string& ownerClassName) {
 
     // 推导引擎 S2~S4 只产出裸 TypePtr（函数模板的 NTTP 尚未实现），此处统一包成
     // TemplateArg::ofType 放进同一张替换表 —— 表本身类型/值两形态通用。
@@ -426,8 +488,24 @@ FuncDeclPtr TemplateInstantiator::instantiateFunction(
     targs.reserve(typeArgs.size());
     for (auto& a : typeArgs) targs.push_back(TemplateArg::ofType(a));
 
-    std::string mangled =
-        NameMangler::mangleTemplateInstance(blueprint->name, targs);
+    // ★ 函数模板实例必须编出完整的 <bare-function-type>（返回类型 + 参数表），
+    //   不能只编模板实参 —— 那是类模板的编法（docs/BUGS.md B2）。
+    //   这里用的是蓝图（尚未替换）的返回类型与参数表：形参在签名里保留为
+    //   T_ / T0_… 形态，与 clang 的编法一致。
+    //   成员模板（[temp.mem]）另走一套：符号是 `类名_方法名` + 实参后缀 —— 与普通
+    //   成员函数同款前缀，使 CodeGen 既有的调用约定（`Cls_method`）能对上，
+    //   而不同实参的实例又靠 `_int` / `_double` 后缀区分开（自由函数模板的
+    //   Itanium 名里已含实参，无此需要）。
+    std::string mangled;
+    if (ownerClassName.empty()) {
+        mangled = NameMangler::mangleFunctionTemplateInstance(
+            blueprint->name, targs,
+            blueprint->returnType, blueprint->parameters,
+            templateDecl->typeParams);
+    } else {
+        mangled = sanitizeSymbolChars(ownerClassName + "_" + blueprint->name);
+        for (auto& a : targs) mangled += "_" + sanitizeSymbolChars(a.toString());
+    }
 
     std::cout << std::format("\n  ╔══ Function Template Instantiation (S5) ═══════╗\n");
     std::cout << std::format("  ║ Blueprint: {} <{}>\n",
@@ -444,8 +522,9 @@ FuncDeclPtr TemplateInstantiator::instantiateFunction(
     }
     std::cout << "}\n";
 
-    // 复用方法克隆（ownerClassName = "" 表示自由函数）
-    FuncDeclPtr instance = cloneMethod(blueprint, subst, "");
+    // 复用方法克隆（ownerClassName = "" 表示自由函数；成员模板传所属类名，
+    // 使实例带隐式 this —— CodeGen 与 Sema 都靠 ownerClassName 判"有没有 this"）
+    FuncDeclPtr instance = cloneMethod(blueprint, subst, ownerClassName);
     instance->mangledName = mangled;
 
     std::cout << std::format("  ║ Symbol: {} → {}\n", blueprint->name, mangled);
@@ -709,6 +788,29 @@ TypePtr TemplateInstantiator::substituteType(
             rebuilt->nestedQualifier = type->nestedQualifier;
             std::cout << std::format("    [subst] ★ 模板 id 实参替换: {} → {}\n",
                 type->toString(), rebuilt->toString());
+            idNode = rebuilt;
+        }
+    }
+
+    // ── Case 5.3: 模板模板形参的使用点 `C<T>`（[temp.param]/4）──
+    // 形参 C 绑的是【一个模板】而不是类型：把 C 换成被传进来的模板名，
+    //   `C<T>` 于是成为 `Box<T>`（实参已在 Case 5.2 换过），交由外部的落地路径兑现。
+    // ★ 与 Case 6（裸形参名 → 类型）的分工：这里换的是【模板 id 的名字段】，
+    //   换完仍是"待实例化的半成品"，不是具体类型 —— 与模板体内的 `Box<T> inner;`
+    //   走同一条兑现路径（所以不需要在这里调 resolveType，也不应该调：
+    //   这一层不认识 Sema，硬调会引入双向依赖）。
+    // 对照 clang：TreeTransform::TransformTemplateSpecializationType 里
+    //   TemplateTemplateParmDecl 的替换发生在 TransformTemplateName。
+    if (idNode->isClass() && !idNode->templateArgs.empty()) {
+        auto it = subst.find(idNode->name);
+        if (it != subst.end() && it->second.isTemplate()) {
+            auto rebuilt = Type::makeClass(it->second.templateName);
+            rebuilt->templateArgs    = idNode->templateArgs;
+            rebuilt->nestedQualifier = idNode->nestedQualifier;
+            std::cout << std::format(
+                "    [subst] ★ 模板模板形参 '{}' → 模板 '{}'：{} → {}\n",
+                idNode->name, it->second.templateName,
+                idNode->toString(), rebuilt->toString());
             idNode = rebuilt;
         }
     }

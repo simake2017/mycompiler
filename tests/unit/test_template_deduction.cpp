@@ -244,13 +244,13 @@ TEST(ParseBlueprint, NonTypeTemplateParameterShape) {
     EXPECT_EQ(tmpl->typeParams[1], "N");
 
     ASSERT_EQ(tmpl->templateParams.size(), 2u);
-    EXPECT_EQ(tmpl->templateParams[0].kind, TemplateParamKind::Type);
-    EXPECT_EQ(tmpl->templateParams[0].name, "T");
+    EXPECT_EQ(tmpl->templateParams[0]->kind, TemplateParamKind::Type);
+    EXPECT_EQ(tmpl->templateParams[0]->name, "T");
 
-    EXPECT_EQ(tmpl->templateParams[1].kind, TemplateParamKind::NonType);
-    EXPECT_EQ(tmpl->templateParams[1].name, "N");
-    ASSERT_NE(tmpl->templateParams[1].nonType, nullptr);
-    EXPECT_TRUE(tmpl->templateParams[1].nonType->isInt());
+    EXPECT_EQ(tmpl->templateParams[1]->kind, TemplateParamKind::NonType);
+    EXPECT_EQ(tmpl->templateParams[1]->name, "N");
+    ASSERT_NE(tmpl->templateParams[1]->nonType, nullptr);
+    EXPECT_TRUE(tmpl->templateParams[1]->nonType->isInt());
 }
 
 // P4. 类模板含非类型参数 (NTTP)：template<class T, int Capacity> class Array
@@ -270,13 +270,13 @@ TEST(ParseBlueprint, ClassTemplateWithNTTP) {
     }
     ASSERT_NE(tmpl, nullptr);
     ASSERT_EQ(tmpl->templateParams.size(), 2u);
-    EXPECT_EQ(tmpl->templateParams[0].kind, TemplateParamKind::Type);
-    EXPECT_EQ(tmpl->templateParams[0].name, "T");
+    EXPECT_EQ(tmpl->templateParams[0]->kind, TemplateParamKind::Type);
+    EXPECT_EQ(tmpl->templateParams[0]->name, "T");
 
-    EXPECT_EQ(tmpl->templateParams[1].kind, TemplateParamKind::NonType);
-    EXPECT_EQ(tmpl->templateParams[1].name, "Capacity");
-    ASSERT_NE(tmpl->templateParams[1].nonType, nullptr);
-    EXPECT_TRUE(tmpl->templateParams[1].nonType->isInt());
+    EXPECT_EQ(tmpl->templateParams[1]->kind, TemplateParamKind::NonType);
+    EXPECT_EQ(tmpl->templateParams[1]->name, "Capacity");
+    ASSERT_NE(tmpl->templateParams[1]->nonType, nullptr);
+    EXPECT_TRUE(tmpl->templateParams[1]->nonType->isInt());
     EXPECT_EQ(tmpl->classTemplate->name, "Array");
 }
 
@@ -993,8 +993,8 @@ TEST(Instantiate, FunctionTemplate) {
     ASSERT_EQ(instance->parameters.size(), 1u);
     EXPECT_TRUE(instance->parameters[0].type->isInt());
 
-    // mangled name
-    EXPECT_EQ(instance->mangledName, "_Z5twiceIiE");
+    // mangled name（★ 含 <bare-function-type>：返回 T_ + 参数 T_，见测试 40）
+    EXPECT_EQ(instance->mangledName, "_Z5twiceIiET_T_");
 
     // 检查已注册
     EXPECT_EQ(inst.getInstantiatedFunctions().size(), 1u);
@@ -1057,13 +1057,44 @@ TEST(Instantiate, DifferentArgsDifferentSymbols) {
 
     auto& funcs = inst.getInstantiatedFunctions();
     ASSERT_EQ(funcs.size(), 2u);
-    EXPECT_EQ(funcs[0]->mangledName, "_Z5twiceIiE");
-    EXPECT_EQ(funcs[1]->mangledName, "_Z5twiceIdE");
+    EXPECT_EQ(funcs[0]->mangledName, "_Z5twiceIiET_T_");
+    EXPECT_EQ(funcs[1]->mangledName, "_Z5twiceIdET_T_");
     EXPECT_NE(funcs[0]->mangledName, funcs[1]->mangledName);
 
     std::printf("── 同模板不同实参:\n");
     std::printf("   twice<int>    → %s\n", funcs[0]->mangledName.c_str());
     std::printf("   twice<double> → %s\n", funcs[1]->mangledName.c_str());
+}
+
+// 40. ★ 函数模板符号必须带 <bare-function-type>（返回类型 + 参数表），否则
+//     同名不同 arity 的重载会撞成同一个符号 —— 调用点挑错实例、实例缓存
+//     假命中，一路静默算错（docs/BUGS.md B2）。
+//     考察理论点：Itanium ABI §5.1.8 —— 函数模板比类模板多编一段
+//     <bare-function-type>，且【返回类型也要编】（它无法从名字反推）；
+//     模板形参在签名里编成 <template-param>（T_ / T0_…），引用模板实参表第 n 项。
+//     clang 对照：此处返回类型/参数各剩一个 T，clang 会把第二个压成替换表引用
+//     （_Z1fIiEiT_S0_ → 见 docs/BUGS.md B7），本实现一律展开，符号仍唯一。
+TEST(Instantiate, MangledNameCarriesSignature) {
+    TemplateDeclPtr pick1, pick2;
+    TemplateInstantiator inst;
+    {
+        StdoutCapture cap;
+        pick1 = parseFuncTmpl("template<typename T> int f(T x);\n");
+        pick2 = parseFuncTmpl("template<typename T> int f(T x, int n);\n");
+        inst.instantiateFunction(pick1, {Type::makeInt()});
+        inst.instantiateFunction(pick2, {Type::makeInt()});
+    }
+
+    auto& funcs = inst.getInstantiatedFunctions();
+    ASSERT_EQ(funcs.size(), 2u);
+    // 模板实参段完全相同（都是 IiE），唯一区分它们的就是签名段
+    EXPECT_EQ(funcs[0]->mangledName, "_Z1fIiEiT_");
+    EXPECT_EQ(funcs[1]->mangledName, "_Z1fIiEiT_i");
+    EXPECT_NE(funcs[0]->mangledName, funcs[1]->mangledName);
+
+    std::printf("── 同名模板不同 arity（T 同为 int）:\n");
+    std::printf("   f(T)      → %s\n", funcs[0]->mangledName.c_str());
+    std::printf("   f(T, int) → %s\n", funcs[1]->mangledName.c_str());
 }
 
 // =============================================================================
@@ -1081,10 +1112,10 @@ TEST(Nttp, ParamKindIsNonType) {
     }
 
     ASSERT_EQ(tmpl->templateParams.size(), 1u);
-    EXPECT_EQ(tmpl->templateParams[0].kind, TemplateParamKind::NonType);
-    EXPECT_EQ(tmpl->templateParams[0].name, "N");
-    ASSERT_NE(tmpl->templateParams[0].nonType, nullptr);
-    EXPECT_TRUE(tmpl->templateParams[0].nonType->isInt());
+    EXPECT_EQ(tmpl->templateParams[0]->kind, TemplateParamKind::NonType);
+    EXPECT_EQ(tmpl->templateParams[0]->name, "N");
+    ASSERT_NE(tmpl->templateParams[0]->nonType, nullptr);
+    EXPECT_TRUE(tmpl->templateParams[0]->nonType->isInt());
 
     // ★ 同时盯住历史陷阱：typeParams 是退化的名字列表，
     //   它把 NTTP 的 N 也当"类型形参名"收着——所以形态判定绝不能用它。
@@ -1106,8 +1137,8 @@ TEST(Nttp, TypeVsNonTypeDistinguished) {
 
     ASSERT_EQ(typeTmpl->templateParams.size(), 1u);
     ASSERT_EQ(nttpTmpl->templateParams.size(), 1u);
-    EXPECT_EQ(typeTmpl->templateParams[0].kind, TemplateParamKind::Type);
-    EXPECT_EQ(nttpTmpl->templateParams[0].kind, TemplateParamKind::NonType);
+    EXPECT_EQ(typeTmpl->templateParams[0]->kind, TemplateParamKind::Type);
+    EXPECT_EQ(nttpTmpl->templateParams[0]->kind, TemplateParamKind::NonType);
     // 两者的 typeParams 长得一样（都只有名字）——差别只在 templateParams
     EXPECT_EQ(typeTmpl->typeParams[0], "T");
     EXPECT_EQ(nttpTmpl->typeParams[0], "N");
@@ -1249,11 +1280,11 @@ TEST(PartialSpec, PatternMatchSucceeds) {
     std::unordered_map<std::string, TypePtr> subst;
     std::string reason;
 
-    std::vector<TypePtr> pattern = {
+    std::vector<TemplateArg> pattern = {
         Type::makePointer(Type::makeTemplateParam("T")),
         Type::makeTemplateParam("T"),
     };
-    std::vector<TypePtr> args = {
+    std::vector<TemplateArg> args = {
         Type::makePointer(Type::makeDouble()),
         Type::makeDouble(),
     };
@@ -1277,11 +1308,11 @@ TEST(PartialSpec, PatternMatchFailsOnNonPointer) {
     std::unordered_map<std::string, TypePtr> subst;
     std::string reason;
 
-    std::vector<TypePtr> pattern = {
+    std::vector<TemplateArg> pattern = {
         Type::makePointer(Type::makeTemplateParam("T")),
         Type::makeTemplateParam("T"),
     };
-    std::vector<TypePtr> args = { Type::makeInt(), Type::makeInt() };
+    std::vector<TemplateArg> args = { Type::makeInt(), Type::makeInt() };
 
     bool ok = true;
     {
@@ -1301,11 +1332,11 @@ TEST(PartialSpec, PatternMatchFailsOnConflictingBindings) {
     std::unordered_map<std::string, TypePtr> subst;
     std::string reason;
 
-    std::vector<TypePtr> pattern = {
+    std::vector<TemplateArg> pattern = {
         Type::makePointer(Type::makeTemplateParam("T")),
         Type::makeTemplateParam("T"),
     };
-    std::vector<TypePtr> args = {
+    std::vector<TemplateArg> args = {
         Type::makePointer(Type::makeInt()),
         Type::makeVoid(),
     };
@@ -1335,4 +1366,112 @@ TEST(PartialSpec, PatternMatchFailsOnArityMismatch) {
     }
     EXPECT_FALSE(ok);
     std::printf("── 偏特化模式/实参个数不符 ⇒ %s\n", reason.c_str());
+}
+
+// 44. 模式第 1 位是【值】（`enable_if<true, T>`）⇒ 值位不绑定、只比值，第 2 位照常推导
+//     [temp.class.spec]：模式位可以是非类型实参；[temp.arg.nontype] 决定值的形态。
+TEST(PartialSpec, NttpPatternPositionMatchesByValue) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    // 模式 <true, T> —— 值位 true 的形态是 bool
+    std::vector<TemplateArg> pattern = {
+        TemplateArg::ofValue(1, Type::makeBool()),
+        TemplateArg::ofType(Type::makeTemplateParam("T")),
+    };
+    // 实参 <1(bool), int>
+    std::vector<TemplateArg> args = {
+        TemplateArg::ofValue(1, Type::makeBool()),
+        TemplateArg::ofType(Type::makeInt()),
+    };
+
+    bool ok = false;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_TRUE(ok) << "reason: " << reason;
+    ASSERT_EQ(subst.count("T"), 1u);
+    EXPECT_TRUE(subst["T"]->isInt());
+    // ★ 值位不绑定：它没有名字，不该往替换表里塞任何东西
+    EXPECT_EQ(subst.size(), 1u) << "值位不该产生绑定";
+    std::printf("── 值位模式: enable_if<true, T> 对 <1, int> ⇒ T := %s\n",
+                subst["T"]->toString().c_str());
+}
+
+// 45. 模式值位与实参值位不等 ⇒ 整条偏特化不匹配（这正是 true/false 分支互斥的原因）
+TEST(PartialSpec, NttpPatternPositionRejectsDifferentValue) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TemplateArg> pattern = {
+        TemplateArg::ofValue(1, Type::makeBool()),
+        TemplateArg::ofType(Type::makeTemplateParam("T")),
+    };
+    // 实参 <0(bool), int> —— 值位是 false
+    std::vector<TemplateArg> args = {
+        TemplateArg::ofValue(0, Type::makeBool()),
+        TemplateArg::ofType(Type::makeInt()),
+    };
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_FALSE(ok) << "true 位不该匹配 false 实参";
+    EXPECT_FALSE(reason.empty());
+    std::printf("── 值位不等: enable_if<true, T> 对 <0, int> ⇒ %s\n", reason.c_str());
+}
+
+// 46. 值的【形态】也参与判断：bool 的 1 ≠ int 的 1（`Flag<true>` 不是 `Buf<1>`）
+//     [temp.arg.nontype]/1：实参形态由形参类型决定，不同形态不是同一个实参。
+TEST(PartialSpec, NttpPatternPositionComparesValueForm) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TemplateArg> pattern = {
+        TemplateArg::ofValue(1, Type::makeInt()),     // 模式写的是 int 的 1
+    };
+    std::vector<TemplateArg> args = {
+        TemplateArg::ofValue(1, Type::makeBool()),    // 实参是 bool 的 true
+    };
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {}, subst, reason);
+    }
+
+    EXPECT_FALSE(ok) << "数值相同但形态不同，不该判等";
+    std::printf("── 值形态不同: int 的 1 对 bool 的 true ⇒ %s\n", reason.c_str());
+}
+
+// 47. 模式位是类型、实参位是值（形态错位）⇒ 不匹配，而不是踩空崩溃
+TEST(PartialSpec, TypePatternRejectsNonTypeArgument) {
+    TemplateDeducer deducer;
+    std::unordered_map<std::string, TypePtr> subst;
+    std::string reason;
+
+    std::vector<TemplateArg> pattern = {
+        TemplateArg::ofType(Type::makeTemplateParam("T")),
+    };
+    std::vector<TemplateArg> args = {
+        TemplateArg::ofValue(3),
+    };
+
+    bool ok = true;
+    {
+        StdoutCapture cap;
+        ok = deducer.matchPattern(pattern, args, {"T"}, subst, reason);
+    }
+
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(reason.empty());
+    std::printf("── 形态错位: 类型位 'T' 对值实参 3 ⇒ %s\n", reason.c_str());
 }

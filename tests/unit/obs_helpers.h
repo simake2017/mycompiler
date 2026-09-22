@@ -155,8 +155,12 @@ inline void dumpExprTree(const ExprPtr& e, const std::string& prefix, bool isLas
     }
     case NodeKind::Unary: {
         auto n = std::static_pointer_cast<UnaryExpr>(e);
+        // 同 main.cpp 的 dump：运算符文本逐个列举，不用二元三元式（会吞掉新增的一元算子）
         dumpExprNode(e, prefix, isLast,
-                     std::string("Unary(") + (n->op == UnaryOp::Neg ? "-" : "!") + ")",
+                     std::string("Unary(")
+                         + (n->op == UnaryOp::Neg  ? "-"
+                          : n->op == UnaryOp::Not  ? "!"
+                          : n->op == UnaryOp::Addr ? "&" : "*") + ")",
                      {{"operand", n->operand}});
         break;
     }

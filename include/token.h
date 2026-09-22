@@ -63,6 +63,7 @@ enum class TokenType : uint8_t {
     KwPrivate,        // private
     KwProtected,      // protected
     KwReturn,         // return
+    KwStatic,         // static —— 类内 static 成员函数（[class.static]/2）
     KwStruct,         // struct
     KwTemplate,       // template
     KwThis,           // this
@@ -146,6 +147,7 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"private",   TokenType::KwPrivate},
     {"protected", TokenType::KwProtected},
     {"return",    TokenType::KwReturn},
+    {"static",    TokenType::KwStatic},
     {"struct",    TokenType::KwStruct},
     {"template",  TokenType::KwTemplate},
     {"this",      TokenType::KwThis},

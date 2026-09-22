@@ -46,8 +46,8 @@ namespace minicc {
 //   classSpecAtLeastAsSpecialized），见 docs/learn/21。
 // 返回：全部位匹配成功 → true，subst 填好可交付实例化；任一位失败 → false
 bool TemplateDeducer::matchPattern(
-    const std::vector<TypePtr>& pattern,
-    const std::vector<TypePtr>& args,
+    const std::vector<TemplateArg>& pattern,
+    const std::vector<TemplateArg>& args,
     const std::vector<std::string>& paramNames,
     std::unordered_map<std::string, TypePtr>& subst,
     std::string& failReason) {
@@ -60,6 +60,38 @@ bool TemplateDeducer::matchPattern(
 
     DeductionResult out;
     for (size_t i = 0; i < pattern.size(); i++) {
+        // ── 值位（NTTP 模式位）[temp.class.spec] ──
+        //   模式位写成值（`enable_if<true, T>` 的 true、`Box<int, 4>` 的 4）时，
+        //   该位【不参与合一、不绑定任何形参】—— 只要求实参位同形态同值。
+        //   整个 enable_if 惯用法就架在这一位上：主模板的 true 分支是
+        //   `enable_if<true, T> { using type = T; }`，false 分支无 type 成员 ⇒
+        //   探测失败。位不比值，两个分支就会同时匹配 ⇒ 偏序裁决出歧义。
+        //   值位若写成形参名（`Box<T, N>` 的 N）在本项目里 Parser 已按类型位建
+        //   节点，故此处不会遇到"值位可绑定"的形态。
+        //   对照 clang：DeduceTemplateArguments 的 TDK_NonDeducedType 路径。
+        if (pattern[i].isValue()) {
+            const TemplateArg& A = args[i];
+            if (!A.isValue() || !pattern[i].equals(A)) {
+                failReason = std::format(
+                    "non-type pattern '{}' does not match argument '{}'",
+                    pattern[i].toString(), A.toString());
+                std::cout << std::format("  [deduction]   ✗ 值位不匹配：{}\n", failReason);
+                return false;
+            }
+            std::cout << std::format(
+                "  [deduction]   P={}  A={}  ⇒ 值位相等 ✓（NTTP 模式位，无绑定）\n",
+                pattern[i].toString(), A.toString());
+            continue;
+        }
+
+        // 类型位配到值实参 ⇒ 形态不符，直接判不匹配（避免下面按裸 TypePtr 取用时踩空）
+        if (!args[i].isType()) {
+            failReason = std::format(
+                "type pattern '{}' does not match non-type argument '{}'",
+                pattern[i].toString(), args[i].toString());
+            std::cout << std::format("  [deduction]   ✗ 形态不匹配：{}\n", failReason);
+            return false;
+        }
         // ── SFINAE 的关键一步：先把模式位"归约"成具体类型 ──
         // void_t<...> / decltype(...) 这类模式位待求值，归约用的替换表正是前面各位
         // 已推出的绑定 —— 这就是从左到右逐位匹配的价值。
@@ -68,8 +100,8 @@ bool TemplateDeducer::matchPattern(
         TypePtr P;
         std::string substReason;
         if (!Sfinae::attempt(
-                std::format("偏特化模式第 {} 位 '{}'", i + 1, pattern[i]->toString()),
-                [&] { P = reducePattern(pattern[i], subst); },
+                std::format("偏特化模式第 {} 位 '{}'", i + 1, pattern[i].toString()),
+                [&] { P = reducePattern(pattern[i].type, subst); },
                 &substReason)) {
             failReason = std::format("substitution failed in pattern position {}: {}",
                                      i + 1, substReason);
@@ -95,14 +127,14 @@ bool TemplateDeducer::matchPattern(
                 return 0;
             };
             int pr = refKind(pc);
-            int ar = refKind(args[i]);
+            int ar = refKind(args[i].type);
             if (pr != 0 && pr != ar) {
                 failReason = std::format(
                     "reference structure mismatch: pattern '{}' requires {} but "
                     "argument '{}' is {}",
                     P->toString(),
                     pr == 1 ? "an lvalue reference" : "an rvalue reference",
-                    args[i] ? args[i]->toString() : "?",
+                    args[i].type ? args[i].type->toString() : "?",
                     ar == 0 ? "not a reference"
                             : (ar == 1 ? "an lvalue reference" : "an rvalue reference"));
                 std::cout << std::format("  [deduction]   ✗ 引用结构不匹配：{}\n", failReason);
@@ -115,7 +147,7 @@ bool TemplateDeducer::matchPattern(
         // ★ structuralMatch 传 true：本次是【结构等价】而非调用推导，必须关掉
         //   [temp.deduct.call]/3 的万能引用规则 —— 否则 `Kind<T&&>` 匹配 `Kind<int&&>`
         //   会把 T 绑成 int&（把"实参是引用"当成"实参是左值"），正确答案是 T := int。
-        if (!deducePair(P, args[i], /*argIsLValue=*/true, paramNames, subst, out,
+        if (!deducePair(P, args[i].type, /*argIsLValue=*/true, paramNames, subst, out,
                         /*structuralMatch=*/true)) {
             failReason = out.failureReason;
             return false;

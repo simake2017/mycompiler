@@ -467,14 +467,28 @@ std::vector<TemplateArg> Parser::parseTemplateArgumentList() {
                 int64_t value = -std::stoll(advance().text);
                 std::cout << std::format(
                     "  [parse:targ] ★ non-type argument (NTTP): negative integer {}\n", value);
-                args.push_back(TemplateArg::ofValue(value));
+                args.push_back(TemplateArg::ofValue(value, Type::makeInt()));
             }
             else if (check(TokenType::IntLiteral)) {
                 const Token& tok = advance();
                 int64_t value = std::stoll(tok.text);
                 std::cout << std::format(
                     "  [parse:targ] ★ non-type argument (NTTP): integer literal {}\n", value);
-                args.push_back(TemplateArg::ofValue(value));
+                args.push_back(TemplateArg::ofValue(value, Type::makeInt()));
+            }
+            // ★ bool 字面量作非类型实参（[temp.arg.nontype]）——
+            //   `enable_if<true, T>` 这类偏特化选择的常客。
+            //   值本身与 int 无异（true=1 / false=0），但【形态】必须留住：
+            //   Itanium 编成 _Z4FlagILb1EE 而不是 _Z4FlagILi1EE。
+            //   对照 clang：ParseTemplateArgument 里 tok::kw_true/kw_false 走
+            //   ActOnBoolLiteral → ActOnNonTypeTemplateArgument。
+            else if (check(TokenType::KwTrue) || check(TokenType::KwFalse)) {
+                bool b = check(TokenType::KwTrue);
+                advance();
+                std::cout << std::format(
+                    "  [parse:targ] ★ non-type argument (NTTP): bool literal {} ({})\n",
+                    b ? "true" : "false", b ? 1 : 0);
+                args.push_back(TemplateArg::ofValue(b ? 1 : 0, Type::makeBool()));
             }
             else {
                 args.push_back(TemplateArg::ofType(parseType()));
@@ -831,6 +845,56 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                         param.name, param.name);
                 }
             }
+            else if (check(TokenType::KwTemplate)) {
+                // ── 模板模板参数 [temp.param]/4 ──
+                //   template <template <class> class C, class T> struct Wrap;
+                // 形态是「内层 template <...> 形参表」+「自己的 class/typename」+「名字」。
+                // 内层表只数个数（templateArity），不做逐位签名匹配 —— 见 ast.h 的说明。
+                // ★ 内层表要【单独吃掉】，不能复用本循环：这里吞的是 C 的形参，
+                //   不是外层模板的形参，混在一起会多注册出假的形参位。
+                // 对照 clang：ParseTemplateParameter 遇 kw_template 递归
+                //   ParseTemplateParameterList（ParseTemplate.cpp）。
+                param.kind = TemplateParamKind::Template;
+                advance();   // 'template'
+                expect(TokenType::Less,
+                       "Expected '<' after 'template' in template template parameter");
+                size_t innerArity = 0;
+                if (!check(TokenType::Greater)) {
+                    do {
+                        if (check(TokenType::KwTypename) || check(TokenType::KwClass)) {
+                            advance();
+                            if (check(TokenType::Identifier)) advance();  // 内层形参名可省
+                        }
+                        else if (check(TokenType::KwTemplate)) {
+                            // 内层又是模板模板参数：递归吃掉它的内层表
+                            // （本项目只做一层，更深的嵌套在此报错而不是静默算错）
+                            error("nested template template parameters are not implemented "
+                                  "(depth > 1)");
+                        }
+                        else {
+                            parseType();                    // 内层 NTTP：如 int N
+                            if (check(TokenType::Identifier)) advance();
+                        }
+                        innerArity++;
+                    } while (match(TokenType::Comma));
+                }
+                expect(TokenType::Greater,
+                       "Expected '>' to close template template parameter list");
+                param.templateArity = innerArity;
+                // 自己的 class / typename 关键字
+                if (!check(TokenType::KwClass) && !check(TokenType::KwTypename)) {
+                    error("Expected 'class' or 'typename' after the template parameter "
+                          "list of a template template parameter");
+                }
+                advance();
+                param.name = expect(TokenType::Identifier,
+                    "Expected name of the template template parameter").text;
+                std::cout << std::format(
+                    "template <...({})> class {}\n  [parse:template]   "
+                    "★ template template parameter registered: '{}' "
+                    "(accepts a template with {} parameter(s), [temp.param]/4)\n",
+                    innerArity, param.name, param.name, innerArity);
+            }
             else {
                 // ★ 非类型模板参数 (NTTP)：如 int N, bool Flag 等 ★
                 param.kind = TemplateParamKind::NonType;
@@ -858,13 +922,21 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
             // 分派与实参表解析同构：整数字面量 → 值实参；否则 → 类型实参。
             if (match(TokenType::Assign)) {
                 if (check(TokenType::IntLiteral)) {
-                    param.defaultArg = TemplateArg::ofValue(std::stoll(advance().text));
+                    param.defaultArg = TemplateArg::ofValue(
+                        std::stoll(advance().text), Type::makeInt());
                 }
                 else if (check(TokenType::Minus)
                          && m_pos + 1 < m_tokens.size()
                          && m_tokens[m_pos + 1].is(TokenType::IntLiteral)) {
                     advance();
-                    param.defaultArg = TemplateArg::ofValue(-std::stoll(advance().text));
+                    param.defaultArg = TemplateArg::ofValue(
+                        -std::stoll(advance().text), Type::makeInt());
+                }
+                else if (check(TokenType::KwTrue) || check(TokenType::KwFalse)) {
+                    // 默认值也可以是 bool（`template <bool B = true>`）
+                    bool b = check(TokenType::KwTrue);
+                    advance();
+                    param.defaultArg = TemplateArg::ofValue(b ? 1 : 0, Type::makeBool());
                 }
                 else {
                     param.defaultArg = TemplateArg::ofType(parseType());
@@ -961,7 +1033,7 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                 [&] { std::string s;
                       for (size_t i = 0; i < decl->specPattern.size(); i++) {
                           if (i > 0) s += ", ";
-                          s += decl->specPattern[i] ? decl->specPattern[i]->toString() : "?";
+                          s += decl->specPattern[i].toString();
                       } return s; }());
         }
     }
@@ -1000,10 +1072,22 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
 
     // 打印蓝图摘要
     std::cout << std::format("  [parse:template]   blueprint summary:\n");
+    // ★ 形参形态只能从 templateParams 读（PITFALLS I4）：
+    //   typeParams 是裸名字表，分不出 `template<int N>` 的 N 是值 ——
+    //   旧实现一律打 "typename N"，把 NTTP 说成类型形参。
     std::cout << std::format("    template <");
-    for (size_t i = 0; i < decl->typeParams.size(); i++) {
+    for (size_t i = 0; i < decl->templateParams.size(); i++) {
         if (i > 0) std::cout << ", ";
-        std::cout << "typename " << decl->typeParams[i];
+        const TemplateParam& p = *decl->templateParams[i];
+        if (p.kind == TemplateParamKind::Type) {
+            std::cout << "typename " << p.name;
+        } else if (p.kind == TemplateParamKind::NonType) {
+            // NTTP：形参写成「类型 + 名字」（`int N` / `bool B`），不是 typename
+            std::cout << (p.nonType ? p.nonType->toString() : "?") << " " << p.name;
+        } else {
+            // 模板模板形参：`template <...> class C`
+            std::cout << "template <...> class " << p.name;
+        }
     }
     if (decl->isClassTemplate()) {
         std::cout << std::format("> class {} {{ ... }}\n", decl->templateName());
@@ -1115,9 +1199,9 @@ DtorDeclPtr Parser::parseDestructorDecl(const std::string& ownerClass, bool isVi
 }
 
 // ── parseClassDecl 主入口（成员文法见上方"类声明"小节）──
-// 多继承（[class.mi]）：逗号分隔的基类列表，每个基类必须带 public 说明符；
+// 多继承（[class.mi]）：逗号分隔的基类列表，说明符可省略（默认级别按 struct/class 定）；
 // 声明顺序即子对象摆放顺序（主基类优化：第一个多态基类的虚表与派生类合并）。
-ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
+ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
     auto decl = std::make_shared<ClassDecl>();
     decl->location = current().location;
 
@@ -1129,7 +1213,7 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
         expect(TokenType::KwClass, "Expected 'class' or 'struct'");
         decl->currentAccess = AccessModifier::Private;
     }
-    (void)isStruct;
+    // isStruct 还决定【默认继承访问级别】（见下方继承列表，[class.derived]/2）
 
     const Token& nameToken = expect(TokenType::Identifier, "Expected class name");
     decl->name = nameToken.text;
@@ -1139,28 +1223,36 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
     // 尖括号里的那串模式回填给调用方（parseTemplateDecl 存进 specPattern）。
     // 只允许类型实参作模式：NTTP 模式的偏特化（Box<int, N>）本项目未实现。
     if (outSpecPattern && check(TokenType::Less)) {
-        auto raw = parseTemplateArgumentList();
-        outSpecPattern->reserve(raw.size());
-        for (auto& a : raw) {
-            if (!a.isType()) {
-                error(std::format(
-                    "non-type argument '{}' is not supported in a class template "
-                    "specialization pattern (only type patterns are implemented)",
-                    a.toString()));
-            }
-            outSpecPattern->push_back(a.type);
-        }
+        // 模式位可以是类型（`T*`、`int`）也可以是值（`true`、`N`）——
+        // [temp.class.spec] 不区分形态，两者都能出现在尖括号里，故原样收下
+        // TemplateArg。此前只收类型位，于是 `enable_if<true, T>` 这种
+        // "用 NTTP 选中特化"的惯用法直接不可写。
+        *outSpecPattern = parseTemplateArgumentList();
         std::cout << std::format("  [parse:class] ★ specialization pattern for '{}'\n",
             decl->name);
     }
 
-    // 可选的继承列表：`:` 后逗号分隔，每个基类前必须显式写 public。
-    // 真实语法允许省略说明符（struct 默认 public），本项目为教学明确性强制要求。
+    // 可选的继承列表：`:` 后逗号分隔。
+    // ★ 默认继承访问级别（[class.derived]/2）：**struct 默认 public，class 默认 private**
+    //   —— 省略说明符 ≠ 一律 public。此前一律强制写 public，把 `struct D : Base`
+    //   这种完全合法的写法拒之门外（错误拒绝合法程序，见 docs/BUGS.md B9）。
+    // private/protected 继承的**语义**本项目未实现（基类子对象的访问控制），
+    // 故显式写出时仍报错，只是文案改为说清「是语义未实现」而非「语法不允许」。
     if (match(TokenType::Colon)) {
         do {
-            if (!match(TokenType::KwPublic)) {
-                error("仅支持 public 继承（每个基类前需写 'public'）");
+            if (match(TokenType::KwPublic)) {
+                // 显式 public：本项目唯一受支持的形态，放行
+            } else if (check(TokenType::KwPrivate) || check(TokenType::KwProtected)) {
+                error(std::format(
+                    "'{}' inheritance is not implemented (only public inheritance is); "
+                    "omit the specifier on a struct to get public by default",
+                    current().text));
+            } else if (!isStruct) {
+                // 省略说明符 + class ⇒ 默认 private 继承，同上未实现
+                error("a class default-inherits privately ([class.derived]/2), which is "
+                      "not implemented; write 'public' explicitly or use 'struct'");
             }
+            // 落到这里 = 省略说明符 + struct ⇒ 默认 public，继续解析基类名
             // 基类名支持命名空间限定：: public std::false_type
             // （std 垫片 is_range 的基类正是 std::true_type / std::false_type，
             //  与 parseType 的限定名处理同构）
@@ -1173,6 +1265,22 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
             }
             decl->baseClassNames.push_back(baseName);
         } while (match(TokenType::Comma));
+    }
+
+    // ── 前置声明（[dcl.type.elab]、[basic.def]/2）：`struct A;` / `class A;` ──
+    // 只声明"这个名字存在"、不给定义 —— 模板递归/互引用（A 里写 B*、B 里写 A*）
+    // 必需的前置土壤；没有它就只能靠先定义其一。
+    // 用例 ⇒ 结果：
+    //   struct A;             ⇒ 返回空壳 ClassDecl（body 为空），名字交给 Sema 入表
+    //   struct A { int x; };  ⇒ 后随 '{'，不走本分支，正常定义
+    // 对照 clang：ParseDecl 建出 RecordDecl 后 isCompleteDefinition() 仍为 false，
+    //   后续 Sema 按"不完整类型"限制使用（本项目不做该检查，教学简化）。
+    if (match(TokenType::Semicolon)) {
+        decl->isForwardDecl = true;   // ★ 让 Sema 跳过成员生成与布局计算
+        std::cout << std::format(
+            "  [parse:class] ★ forward declaration of '{}' (no body) [dcl.type.elab]\n",
+            decl->name);
+        return decl;
     }
 
     expect(TokenType::LBrace, "Expected '{' after class name");
@@ -1238,11 +1346,81 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
             continue;
         }
 
+        // ── static 成员（[class.static]）──
+        // 本项目只实现 static 成员【函数】：它没有隐式 this 参数，调用时不必传对象。
+        // ★ static 数据成员（`static int count;`）未实现 —— 它需要类外定义与独立
+        //   存储（不是每实例一份）。落到字段分支时明确报错，绝不静默当成普通字段
+        //   （那会每个对象各存一份，语义与 C++ 完全相反，且不报错）。
+        // ★ 位置在成员模板【之前】：`template <...> static T f(T)` 的 template 在外层，
+        //   但 isStatic/isVirtual 的声明必须先于任何使用它们的成员分支。
+        bool isStatic = false;
+        if (match(TokenType::KwStatic)) {
+            isStatic = true;
+        }
+
         // 虚函数标记
         bool isVirtual = false;
         if (check(TokenType::KwVirtual)) {
             isVirtual = true;
             advance();
+        }
+
+        // ── 成员模板（[temp.mem]）──
+        //   struct S { template <class T> T id(T x) { return x; } };
+        // 形态：'template' '<' 形参表 '>' 后跟一个普通成员函数声明。
+        // ★ 产物与自由函数模板**同构**（funcTemplate 非空的 TemplateDecl），
+        //   只是挂在类的 memberTemplates 上、实例化出的函数带 ownerClassName。
+        //   这一点是刻意的：调用点的推导逻辑（TemplateDeducer）完全复用，
+        //   不需要为"成员"再造一套合一算法 —— [temp.deduct] 对两者是同一套。
+        // 对照 clang：ParseCXXMemberSpecification 里 kw_template 走
+        //   ParseTemplateDeclarationOrSpecialization，产物是 MemberTemplateDecl。
+        if (check(TokenType::KwTemplate)) {
+            advance();   // 'template'
+            expect(TokenType::Less, "Expected '<' after 'template'");
+
+            auto memTmpl = std::make_shared<TemplateDecl>();
+            // 形参作用域建帧：使下面 parseMethodDecl 里的裸 T 认得出是模板形参
+            TemplateParamFrame memFrame(this, memTmpl.get());
+
+            if (!check(TokenType::Greater)) {
+                do {
+                    auto tp = std::make_shared<TemplateParam>();
+                    tp->location = current().location;
+                    if (check(TokenType::KwTypename) || check(TokenType::KwClass)) {
+                        advance();
+                        tp->kind = TemplateParamKind::Type;
+                        tp->name = expect(TokenType::Identifier,
+                            "Expected parameter name in member template").text;
+                    }
+                    else if (check(TokenType::KwTemplate)) {
+                        error("template template parameters in member templates "
+                              "are not implemented");
+                    }
+                    else {
+                        tp->kind = TemplateParamKind::NonType;
+                        tp->nonType = parseType();
+                        tp->name = expect(TokenType::Identifier,
+                            "Expected parameter name in member template").text;
+                    }
+                    memTmpl->templateParams.push_back(tp);
+                    memTmpl->typeParams.push_back(tp->name);
+                } while (match(TokenType::Comma));
+            }
+            expect(TokenType::Greater,
+                   "Expected '>' to close member template parameter list");
+
+            auto method = parseMethodDecl(decl->name, access);
+            method->isVirtual = isVirtual;
+            method->isStatic  = isStatic;
+            memTmpl->funcTemplate = method;   // templateName() 由此取到函数名
+            memTmpl->isMemberTemplate = true;
+            decl->memberTemplates.push_back(memTmpl);
+
+            std::cout << std::format(
+                "  [parse:member] ★ '{}' 是成员模板（{} 个模板形参，[temp.mem]）"
+                "—— 调用点按实参推导实例化\n",
+                method->name, memTmpl->templateParams.size());
+            continue;
         }
 
         // 1. 析构函数：[virtual] ~ClassName()
@@ -1289,8 +1467,18 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TypePtr>* outSpecPattern) {
         if (isMethod) {
             auto method = parseMethodDecl(decl->name, access);
             method->isVirtual = isVirtual;
+            method->isStatic  = isStatic;
+            if (isStatic) {
+                std::cout << std::format(
+                    "  [parse:member] ★ '{}' 是 static 成员函数（无隐式 this，"
+                    "调用不传对象 [class.static]/2）\n", method->name);
+            }
             decl->methods.push_back(method);
         } else {
+            if (isStatic) {
+                error("static data members are not implemented "
+                      "(only static member functions are)");
+            }
             // 字段声明
             TypePtr fieldType = parseType();
             const Token& fieldName = expect(TokenType::Identifier, "Expected field name");
@@ -1373,6 +1561,28 @@ FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerCl
     decl->parameters = parseParameterList();
     expect(TokenType::RParen, "Expected ')' after parameters");
 
+    // ── 后置 cv 限定符（[dcl.fct]/7）：`int get() const` ──
+    // 语法位置：参数列表之后、virt-specifier(override/final) 之前
+    // —— [class.mem] 里这一段叫 parameters-and-qualifiers，顺序是
+    //    `( params ) cv-qualifier-seq ref-qualifier? noexcept? virt-specifier?`。
+    // ★ 语义地位：cv-qualifier-seq 属于【函数类型】本身，它把隐式 this 参数
+    //   的类型从 `T*` 变成 `const T*` —— 这就是"const 对象调不了非 const 成员"
+    //   的底层原因（不是语法糖，是类型系统里的实打实差别）。
+    // 对照 clang：ParseFunctionDeclarator 的 ConsumeAndStoreFunctionPrologue
+    //   → 把 const 记进 FunctionProtoType 的 qualifier 位。
+    // demo: int get() const { return v; } ⇒ isConstMethod=true
+    if (check(TokenType::KwConst)) {
+        if (ownerClass.empty()) {
+            // 非成员函数没有隐式 this，后置 const 无从作用（clang 同款文案）
+            error("non-member function cannot have 'const' qualifier");
+        }
+        advance();
+        decl->isConstMethod = true;
+        std::cout << std::format(
+            "  [parse:fct] ★ '{}' 是 const 成员函数（后置 const，"
+            "this 类型 T* → const T*，[dcl.fct]/7）\n", decl->name);
+    }
+
     // override 关键字（在 { 或 ; 之前）
     if (match(TokenType::KwOverride)) {
         decl->isOverride = true;
@@ -1391,21 +1601,36 @@ FuncDeclPtr Parser::parseFunctionDecl(bool isVirtual, const std::string& ownerCl
 // ─────────────────────────────────────────────────────────────────────────────
 // 参数列表（声明侧）
 // ─────────────────────────────────────────────────────────────────────────────
-// 文法：parameter-list := [ parameter (',' parameter)* ] ；parameter := type IDENT
+// 文法：parameter-list := [ parameter (',' parameter)* ] ；parameter := type [IDENT]
 // 对应 clang：ParseParameterDeclarationList（ParseDecl.cpp）
 //   简化点：无默认实参、无省略号 varargs、无形参修饰符（const 形参由类型携带）。
 // 调用约定：调用处游标停在 '(' 之后；紧跟 ')' 即空列表。
 // demo: [int][a][,][double][b] ⇒ [(int,"a"), (double,"b")] │ [)] ⇒ []
+//       [Token][)]            ⇒ [("$unnamed0", Token)]   ← 无名形参，见下
 std::vector<Parameter> Parser::parseParameterList() {
     std::vector<Parameter> params;
 
     if (check(TokenType::RParen)) return params; // 空参数列表
 
+    int unnamedSeq = 0;   // 无名形参的合成名序号（每个参数列表独立编号）
     do {
         Parameter param;
         param.type = parseType();
-        const Token& nameToken = expect(TokenType::Identifier, "Expected parameter name");
-        param.name = nameToken.text;
+        // ★ 无名形参：类型之后直接跟 ',' 或 ')'（[dcl.fct]/3 允许省略形参名）。
+        //   合成一个用户写不出来的名字——'$' 不能作标识符首字符，
+        //   保证不会与任何真实形参撞车（与模板形参的无名处理同构）。
+        //   用例 ⇒ 结果：
+        //     void f(Token)          ⇒ $unnamed0
+        //     void f(int a, Token)   ⇒ a 保留原名，第二个 $unnamed0
+        //     void f(int, int)       ⇒ $unnamed0 + $unnamed1
+        if (check(TokenType::Comma) || check(TokenType::RParen)) {
+            param.name = "$unnamed" + std::to_string(unnamedSeq++);
+            std::cout << std::format(
+                "  [parse:param] (unnamed) ⇒ 内部合成名 '{}' ([dcl.fct]/3)\n", param.name);
+        } else {
+            const Token& nameToken = expect(TokenType::Identifier, "Expected parameter name");
+            param.name = nameToken.text;
+        }
         params.push_back(param);
     } while (match(TokenType::Comma));
 
@@ -1848,16 +2073,22 @@ ExprPtr Parser::parseMultiplicativeExpr() {
 //           Token 流 [!][flag] → UnaryExpr(Not, Var(flag))
 ExprPtr Parser::parseUnaryExpr() {
     if (check(TokenType::Minus) || check(TokenType::Bang)
-        || check(TokenType::Ampersand)) {
+        || check(TokenType::Ampersand) || check(TokenType::Star)) {
         auto loc = current().location;
         // 一元位置上的 '&' 是【取地址】而非引用/位与：
         //   引用只出现在类型里（V& r），位与是二元运算符（a & b），
         //   走到 parseUnaryExpr 说明 '&' 前面没有左操作数，故必然是取地址。
         //   对照 clang：ParseCastExpression 的 tok::ampersand 分支。
         // demo：&a → UnaryExpr{ op=Addr, operand=VarExpr{a} }
-        UnaryOp op = (current().type == TokenType::Minus)   ? UnaryOp::Neg
-                   : (current().type == TokenType::Bang)    ? UnaryOp::Not
-                                                            : UnaryOp::Addr;
+        // ★ '*' 用【完全同构】的判据（[expr.unary.op]/1）：
+        //   乘法有左操作数（a * b），指针声明只出现在类型里（int* p），
+        //   能走到这里说明 '*' 前没有左操作数 ⇒ 必然是解引用。
+        //   对照 clang：ParseCastExpression 的 tok::star 分支。
+        // demo：*p → UnaryExpr{ op=Deref, operand=VarExpr{p} }
+        UnaryOp op = (current().type == TokenType::Minus)     ? UnaryOp::Neg
+                   : (current().type == TokenType::Bang)      ? UnaryOp::Not
+                   : (current().type == TokenType::Ampersand) ? UnaryOp::Addr
+                                                              : UnaryOp::Deref;
         advance();
         ExprPtr operand = parseUnaryExpr();
         auto expr = std::make_shared<UnaryExpr>(op, operand);

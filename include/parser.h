@@ -151,7 +151,7 @@ private:
     TemplateDeclPtr    parseTemplateDecl();
     // outSpecPattern 非空时，若类名后紧跟模板 id（Box<T*, T>），
     // 把尖括号里的模式写回该向量 —— 供 parseTemplateDecl 判定偏特化/全特化。
-    ClassDeclPtr       parseClassDecl(std::vector<TypePtr>* outSpecPattern = nullptr);
+    ClassDeclPtr       parseClassDecl(std::vector<TemplateArg>* outSpecPattern = nullptr);
     EnumDeclPtr        parseEnumDecl();
     NamespaceDeclPtr   parseNamespaceDecl();
     TypeAliasDeclPtr   parseTypeAliasDecl();

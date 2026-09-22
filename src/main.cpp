@@ -225,8 +225,13 @@ public:
         dumpExpr(e.right, cp, true);
     }
     void visit(UnaryExpr& e) override {
+        // ★ 运算符文本必须【逐个列举】：早先写成 `op == Neg ? "-" : "!"` 的二元三元式，
+        //   新增 Deref/Addr 后会把它们全印成 "!"，--dump-ast 直接误导（静默错味）。
         printNode(m_prefix, m_isLast,
-                  std::format("UnaryExpr: {}", e.op == UnaryOp::Neg ? "-" : "!"));
+                  std::format("UnaryExpr: {}",
+                      e.op == UnaryOp::Neg   ? "-"
+                    : e.op == UnaryOp::Not   ? "!"
+                    : e.op == UnaryOp::Addr  ? "&" : "*"));
         dumpExpr(e.operand, childPrefix(), true);
     }
     void visit(CallExpr& e) override {
@@ -771,8 +776,32 @@ int main(int argc, char* argv[]) {
                     // ── 按形参形态分派第二组实参（[temp.arg]）──
                     // 第二实参是类型还是值，一律由 templateParams[1].kind 决定。
                     // ★ 若固定传类型实参，template<class T, int N> 会拿类型去填 NTTP 槽。
+                    const TemplateParam& p1 = *tmpl->templateParams[0];
                     const TemplateParam& p2 = *tmpl->templateParams[1];
-                    if (p2.kind == TemplateParamKind::NonType) {
+                    if (p1.kind == TemplateParamKind::Template
+                        || p2.kind == TemplateParamKind::Template) {
+                        // 模板模板形参（[temp.param]/4）没有"用固定类型演示"的合理形态：
+                        // 这一位要的是【模板名】，喂 int/double 会造出一个字段类型停在
+                        // 裸 C 上的假实例。这种模板只能由使用点驱动实例化。
+                        std::cout << std::format(
+                            "  (template template parameter present: instantiation is "
+                            "use-site driven — see Phase 3)\n");
+                    }
+                    else if (p1.kind == TemplateParamKind::NonType) {
+                        // 首形参是 NTTP（`template<bool B, class T>` 这种"值 + 类型"混排）。
+                        // ★ 此前没有这条分支，`enable_if<B, T>` 会落进下面的"两类型形参"
+                        //   分支、被喂 <int, double> —— 类型实参塞进 NTTP 槽，实例化直接抛
+                        //   "must be a value, but 'int' is a type"。判据必须【逐位看形参
+                        //   自己的 kind】，不能只看第二位的形态。
+                        std::cout << std::format(
+                            "\n  ─── Instantiation: {}<true, int> (NTTP + type) ───\n",
+                            tmpl->classTemplate->name);
+                        auto instance = instantiator.instantiate(
+                            tmpl, {TemplateArg::ofValue(1, Type::makeBool()),
+                                   ta(Type::makeInt())});
+                        std::cout << std::format("  → Instantiated: {}\n", instance->name);
+                    }
+                    else if (p2.kind == TemplateParamKind::NonType) {
                         std::cout << std::format(
                             "\n  ─── Instantiation: {}<int, 8> (NTTP) ───\n",
                             tmpl->classTemplate->name);

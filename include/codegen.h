@@ -106,6 +106,12 @@ private:
     // 与 emitDelete 共享；块尾析构是它的"无 free"版（栈对象不经过 malloc）。
     void emitClassDtorCall(const std::string& className, int rbpOffset);
 
+    // return 点就近析构：把【所有活跃作用域层】登记的对象从内到外、层内逆序各发一遍
+    // 析构，并顺带保护 rax 里的返回值（析构是 callq，会踩 rax）。
+    // 返回值 = 是否真的发了析构；false 时【一个字节都不发】，
+    // 从而保证非 RAII 函数的汇编逐字节不变。见 docs/BUGS.md B4。
+    bool emitDtorsOnReturn();
+
     // 帧空间预估：扫描函数体内所有局部变量声明并累加占用字节（类类型按布局
     // totalSize 对齐到 8，其余按 8 字节槽）—— 序言的 subq $N 用它，保证类对象
     // （可能 >8B）不越出预留空间。

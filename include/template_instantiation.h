@@ -148,6 +148,25 @@ public:
         const std::string& templateName,
         const std::vector<TemplateArg>& args);
 
+    // 函数模板实例的符号名（★ 比类模板实例多末尾一段 <bare-function-type>）
+    // 格式: _Z + 名 + I<模板实参>E + <返回类型> + <各参数类型>
+    // demo: template<class T> T twice(T x) 以 T=int 实例化 ⇒ _Z5twiceIiET_T_
+    //                                                        └┬┘ └┬┘
+    //                                                    返回 T_  参数 T_
+    //       template<class T> T pick(T a, int n)  ⇒ _Z4pickIiET_i
+    // 少了这段，同名模板的多个重载会撞成同一个符号（docs/BUGS.md B2）。
+    // 模板形参在签名里编成 Itanium 的 <template-param>（T_ / T0_…）—— 它引用
+    // 模板实参表里的第 n 项，故不同实例仍靠前缀 I…E 区分，签名只如实反映形状。
+    // ★ 与 clang 的逐字符差异：clang 会在参数表里用替换表压缩重复类型
+    //   （第二个 T 编成 S0_），本实现一律展开 ⇒ _Z4pickIiET_i vs clang 的
+    //   _Z4pickIiET_S0_i。唯一性不受影响，差异记于 docs/BUGS.md B7。
+    static std::string mangleFunctionTemplateInstance(
+        const std::string& funcName,
+        const std::vector<TemplateArg>& args,
+        const TypePtr& returnType,
+        const std::vector<Parameter>& params,
+        const std::vector<std::string>& typeParams);
+
     // 对函数生成符号名
     // 例: foo(int, double) → _Z3foo id
     static std::string mangleFunction(
@@ -165,7 +184,11 @@ public:
 
 private:
     // 将类型编码为 mangling 字符串
-    static std::string encodeType(TypePtr type);
+    // ★ typeParams 非空时，TypeKind::TemplateParam 编成 Itanium 的 <template-param>
+    //   （T_ / T0_ / T1_…）；为空表时保持原行为（原样输出形参名）—— 故类模板
+    //   路径（恒传 1 参）的符号逐字节不变。
+    static std::string encodeType(TypePtr type,
+        const std::vector<std::string>& typeParams = {});
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,9 +231,19 @@ public:
     // 注：形参仍是裸 TypePtr 列表 —— 函数模板的非类型形参（NTTP）尚未实现（推导引擎
     //   只产出类型），需要时在函数体内包成 TemplateArg::ofType；类模板走上面的
     //   instantiate()，形参已可类型/值混排。
+    // 实例名清洗：把实参的【人读串】洗成合法的汇编符号字符。
+    // ★ 由 Instantiator（造类/函数实例名）与 Sema（拼成员模板实例的缓存键）
+    //   【共用同一份】—— 这条规则一旦两处各写一份，改一处必漏另一处，
+    //   缓存的键就会与实际符号名对不上（命中失败或误命中，且都不报错）。
+    // 定义在 src/template_instantiation.cpp，紧挨 instantiate()。
+    // 自由函数，故意放在类外：它是纯粹的字符串工具，不属于实例化器的状态。
+
+    // ownerClassName 非空 ⇒ 按【成员模板】实例化（[temp.mem]）：实例带隐式 this，
+    // 符号用 `类名_方法名_实参后缀` 而非 Itanium 模板实例名。
     FuncDeclPtr instantiateFunction(
         TemplateDeclPtr templateDecl,
-        const std::vector<TypePtr>& typeArgs);
+        const std::vector<TypePtr>& typeArgs,
+        const std::string& ownerClassName = "");
 
     // 获取所有已实例化的类
     const std::vector<ClassDeclPtr>& getInstantiatedClasses() const {
@@ -268,5 +301,8 @@ private:
                             const std::string& newClassName);
     FieldInfo cloneField(const FieldInfo& field, const TypeSubstitution& subst);
 };
+
+// 实例名清洗（见类内注释；定义在 src/template_instantiation.cpp）
+std::string sanitizeSymbolChars(const std::string& raw);
 
 } // namespace minicc

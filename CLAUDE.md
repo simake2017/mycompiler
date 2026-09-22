@@ -150,10 +150,23 @@ clang 同此分法：`RecursiveASTVisitor` 只服务遍历，类型计算走 `dy
 顺带把散落的 69 处 `// wangyang` 个人阅读笔记提炼进 `docs/NOTES-阅读笔记.md`
 （源码只留正式注释）；并提取了 Pass 2/Pass 3 重复的命名空间递归走查为 `forEachFunctionDecl`。
 文档 docs/REFACTOR-ast-visitor.md（重构全过程）+ docs/learn/29-ast-dispatch-two-idioms.md（判据与 clang 对照）。
-**未做（按优先级）**：⑧一元 `*` 解引用未实现（`return *p;` 不解析）→ ④[stmt.ambig] 完整裁决 → ⑥后置 const；
-另有函数形参里的 decltype 依赖表达式、函数默认实参、`operator|`/`operator||` 那半边；
-`std::enable_if_t`（需**类型级条件选择**，别名模板的底层类型表达不了 `cond ? X : Y`）、
-别名模板偏特化、别名模板作模板模板实参 —— 三者见 docs/learn/27 §5 边界表。
+✅ **语言基础补齐 + 模板三项收尾已完成**（一/二/三梯队，本轮）：
+① `struct X : Base` 默认 **public** 继承（[class.derived]/2；此前按 private 拒收，是**拒收合法程序**的 bug，B9）；
+② 一元 `*p` 解引用（[expr.unary.op]/1，结果按 pointee 宽度分派读/写）+ 后置 `const` 成员函数（[dcl.fct]/7）
+   + 类内 `static` 成员函数（[class.static]/2，无 this ⇒ 参数寄存器从 rdi 起）；
+③ **NTTP 值位参与偏特化模式**（`enable_if<true,T>` 的地基 —— `specPattern` 由 `vector<TypePtr>` 改型为
+   `vector<TemplateArg>`，拆掉"实参含值位就跳过特化"的旧守卫；`std::enable_if_t` 由此端到端可用）；
+④ **模板模板参数**（[temp.param]/4，`Wrap<Box,int>`，二级替换：C→Box 再落地解析）；
+⑤ **成员模板**（[temp.mem]，`Acc::add(T)`，推导复用同一套合一算法，符号改用 `类名_方法名_实参后缀`）。
+测试 tests/lang/test_basics_01 + tests/tmpl/test_tmpl_52/53/54/56；文档 docs/learn/31..34。
+顺带修 PITFALLS **I4**（蓝图摘要把 NTTP 打成 `typename N`）与 **F2 残留**（Phase 4 演示只看第二位形参，
+`template<bool B, class T>` 被喂 `<int,double>` 触发形态自检）。全量 159 → **224** 单测 / 94 集成测试。
+**未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
+⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
+属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
+函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；
+别名模板偏特化、别名模板作模板模板实参 —— 见 docs/learn/27 §5 边界表；
+模板模板参数的逐位签名匹配 [temp.arg.template]/2 —— 见 docs/learn/33 §5。
 ⏭ 后续计划见 **docs/ROADMAP.md**（主线 C 控制流 → D 常量折叠 → E 数组/高级类型 → F 深水区选做，
 每条含理论点/clang 参照/任务分解/验收）。新会话接手：先读本文件与 ROADMAP，选定主线再开工。
 

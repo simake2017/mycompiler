@@ -153,14 +153,30 @@ struct BaseSubobject {
 // demo: template<int N> class Buf ⇒ Buf<4> ⇒ 替换表 { "N" → TemplateArg{Integral, 4} }
 // =============================================================================
 enum class TemplateArgKind : uint8_t {
-    Type,     // 类型实参：Box<int>         →  payload 在 type 字段
-    Integral, // 非类型实参：Buf<4>（NTTP） →  payload 在 value 字段
+    Type,     // 类型实参：Box<int>            →  payload 在 type 字段
+    Integral, // 非类型实参：Buf<4>（NTTP）    →  payload 在 value 字段
+    Template, // 模板模板实参：Wrap<Box, int>  →  payload 在 templateName 字段
 };
 
 struct TemplateArg {
     TemplateArgKind kind = TemplateArgKind::Type;
     TypePtr         type  = nullptr; // kind == Type     时有效
     int64_t         value = 0;       // kind == Integral 时有效
+
+    // ── 模板模板实参（[temp.arg.template]）────────────────────────────────
+    // `Wrap<Box, int>` 里 Box 位的是【一个模板】，不是类型也不是值。
+    // 只存名字：本项目不做模板模板实参的逐位签名匹配（[temp.arg.template]/2
+    // 的"形参表至少一样特化"规则），形态自检只要求"这位得是个模板名"。
+    // 对照 clang：TemplateArgument 的 Template 形态带 TemplateDecl*。
+    std::string     templateName;
+
+    // ── 非类型实参的【形态】（[temp.arg.nontype]）──────────────────────────
+    // 值统一用 int64_t 存（bool 存 0/1），但 Itanium 编码必须区分形态：
+    //   Buf<1>    （int 形参）  ⇒ _Z3BufILi1EE
+    //   Flag<true>（bool 形参） ⇒ _Z4FlagILb1EE   ← 是 'b' 不是 'i'
+    // 故在此记住"这个值是按哪种类型写的"；为空时 mangler 按 int 兜底。
+    // 对照 clang：TemplateArgument 的值形态带 QualType（来自 IntegerLiteral 的 AST 类型）。
+    TypePtr         valueType = nullptr;
 
     TemplateArg() = default;
 
@@ -174,12 +190,26 @@ struct TemplateArg {
     static TemplateArg ofType(TypePtr t) {
         TemplateArg a; a.kind = TemplateArgKind::Type; a.type = std::move(t); return a;
     }
-    static TemplateArg ofValue(int64_t v) {
-        TemplateArg a; a.kind = TemplateArgKind::Integral; a.value = v; return a;
+    // vt = 该值的【形态】（int / bool …），决定 mangling 编码是 Li…E 还是 Lb…E。
+    static TemplateArg ofValue(int64_t v, TypePtr vt = nullptr) {
+        TemplateArg a; a.kind = TemplateArgKind::Integral; a.value = v;
+        a.valueType = std::move(vt); return a;
+    }
+    // 模板模板实参：只带模板名。demo: Wrap<Box, int> ⇒ 实参 0 = ofTemplate("Box")
+    static TemplateArg ofTemplate(std::string n) {
+        TemplateArg a; a.kind = TemplateArgKind::Template;
+        a.templateName = std::move(n); return a;
     }
 
-    bool isType()  const { return kind == TemplateArgKind::Type; }
-    bool isValue() const { return kind == TemplateArgKind::Integral; }
+    bool isType()     const { return kind == TemplateArgKind::Type; }
+    bool isValue()    const { return kind == TemplateArgKind::Integral; }
+    bool isTemplate() const { return kind == TemplateArgKind::Template; }
+
+    // 逐位相等（全特化匹配 [temp.expl.spec] 用）：类型位比类型，值位比值。
+    // 值的【形态】参与判断：`enable_if<true, T>` 的 true 与 `Buf<1>` 的 1
+    // 数值相同但不是同一种实参，不该判等。
+    // 定义放 src/type.cpp —— 与下面的 toString 同理，此处 Type 尚不完整。
+    bool equals(const TemplateArg& o) const;
 
     // 人读形态：类型实参取类型名，值实参取十进制数字
     // demo：ofType(makeInt()) → "int"；ofValue(4) → "4"

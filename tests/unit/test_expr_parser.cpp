@@ -584,8 +584,12 @@ TEST(ExprParserErrors, ThrowRuntimeErrorOnSyntaxError) {
     // "(1 + 2"：缺少右括号
     expectParseError("(1 + 2", "错误：缺少右括号");
 
-    // "*3"：'*' 不能出现在一元/主表达式位置
-    expectParseError("*3", "错误：'*' 不能出现在主表达式位置");
+    // "1 *"：二元乘法右操作数缺失。
+    // ★ 这里刻意用 "1 *" 而不是 "*3" —— 后者自一元解引用实现后已【语法合法】
+    //   （无左操作数 ⇒ 判为解引用 [expr.unary.op]/1），只在语义阶段报
+    //   "Indirection requires pointer operand"。判据就是"位置上有没有左操作数"，
+    //   语义侧的用例见 tests/unit/test_expressions.cpp 的 Semantics.DerefRequiresPointer。
+    expectParseError("1 *", "错误：乘法右操作数缺失");
 
     // "f(1,)"：尾逗号后缺少实参
     expectParseError("f(1,)", "错误：尾逗号后缺少实参");

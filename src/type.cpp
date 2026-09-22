@@ -20,8 +20,24 @@ namespace minicc {
 // 在字符串层面的体现（把 4 当成类型打印只会得到无意义的 "?"）。
 // demo: ofType(makeInt()).toString() ⇒ "int"；ofValue(4).toString() ⇒ "4"
 std::string TemplateArg::toString() const {
-    if (kind == TemplateArgKind::Type) return type ? type->toString() : "?";
+    if (kind == TemplateArgKind::Type)     return type ? type->toString() : "?";
+    if (kind == TemplateArgKind::Template) return templateName;   // 模板名本身就是可读形态
     return std::to_string(value);
+}
+
+// 逐位相等（声明与说明见 include/type.h）——
+// demo：ofType(int) == ofType(int) ⇒ true │ ofValue(1, int) == ofValue(1, bool) ⇒ false
+//       （形态不同：前者是 Buf<1> 的 1，后者是 Flag<true> 的 true）
+bool TemplateArg::equals(const TemplateArg& o) const {
+    if (kind != o.kind) return false;
+    if (kind == TemplateArgKind::Type) {
+        if (!type || !o.type) return type == o.type;
+        return type->equals(o.type);
+    }
+    if (kind == TemplateArgKind::Template) return templateName == o.templateName;
+    if (value != o.value) return false;
+    if (!valueType || !o.valueType) return valueType == o.valueType;
+    return valueType->equals(o.valueType);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

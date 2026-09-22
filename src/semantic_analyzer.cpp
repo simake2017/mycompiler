@@ -205,10 +205,16 @@ void SymbolTable::dumpCurrentScope() const {
 bool SemanticAnalyzer::classSpecAtLeastAsSpecialized(const TemplateDeclPtr& a,
                                                      const TemplateDeclPtr& b) {
     // ① a 的模式 → 合成实参（形参名替换为唯一名）
-    std::vector<TypePtr> synthArgs;
+    //   值位（NTTP）原样搬过去：偏序只需把"两边都是变量"的位置去相关，
+    //   值位是常量，不与 b 的形参名同名，天然无关，无需重命名。
+    std::vector<TemplateArg> synthArgs;
     const std::string prefix = "$ord_" + a->templateName() + "_";
     for (const auto& t : a->specPattern) {
-        synthArgs.push_back(renameTemplateParams(t, prefix));
+        if (t.isType() && t.type) {
+            synthArgs.push_back(TemplateArg::ofType(renameTemplateParams(t.type, prefix)));
+        } else {
+            synthArgs.push_back(t);
+        }
     }
 
     // ② b 的形参名列表 —— 只有它们才是可绑定的"变量"
@@ -276,16 +282,16 @@ TypePtr SemanticAnalyzer::renameTemplateParams(const TypePtr& t,
     return t;
 }
 
-std::string SemanticAnalyzer::patternToString(const std::vector<TypePtr>& pattern) {
+std::string SemanticAnalyzer::patternToString(const std::vector<TemplateArg>& pattern) {
     std::string s;
     for (size_t i = 0; i < pattern.size(); i++) {
         if (i > 0) s += ", ";
-        s += pattern[i] ? pattern[i]->toString() : "?";
+        s += pattern[i].toString();   // 类型位印类型名，值位印值（含形态）
     }
     return s;
 }
 
-std::string SemanticAnalyzer::typeListToString(const std::vector<TypePtr>& types) {
+std::string SemanticAnalyzer::typeListToString(const std::vector<TemplateArg>& types) {
     return patternToString(types);
 }
 
@@ -916,15 +922,58 @@ TypePtr SemanticAnalyzer::resolveType(TypePtr type) {
                 // 实参先递归解析（实参本身可能是模板 id：Box<Box<int>>）
                 TypePtr tid = Type::makeClass(type->name);
                 tid->templateArgs.reserve(type->templateArgs.size());
-                for (auto& arg : type->templateArgs) {
+
+                // 形参表（逐位判"这一位期望什么"）—— 模板模板位要特殊对待：
+                // Parser 把实参位的 `Box` 建成了 Class("Box") 类型节点，若直接送
+                // resolveType，会撞上"裸类模板名不能当类型"的报错。故先看形参位。
+                const std::vector<TemplateParamPtr>* fps = nullptr;
+                if (auto ptIt = m_classTemplates.find(type->name);
+                    ptIt != m_classTemplates.end()) {
+                    fps = &ptIt->second->templateParams;
+                }
+
+                for (size_t i = 0; i < type->templateArgs.size(); i++) {
+                    auto& arg = type->templateArgs[i];
                     // ★ 按 kind 分派（[temp.arg]）：类型实参 → 递归 resolveType
                     //   （内层模板 id 也要实例化，如 Box<Box<int>>）；
                     //   非类型实参（NTTP）→ 是常量值，没有类型可解析，原样带过。
-                    if (arg.isType())
+                    if (arg.isType()) {
+                        // ── ★ 该位期望一个【模板】时，实参是模板名而不是类型 ──
+                        // `Wrap<Box, int>` 的 Box 不是"要被实例化的类型"，它本身就是
+                        // 实参（[temp.arg.template]）。取出名字标成 Template 形态，
+                        // 交给替换期去做 `C<T>` → `Box<T>` 的改名。
+                        const TemplateParam* fp =
+                            (fps && i < fps->size()) ? fps->at(i).get() : nullptr;
+                        if (fp && fp->kind == TemplateParamKind::Template) {
+                            // 这一位要的是【模板名】：`Wrap<int, ...>` 这种拿类型来填的
+                            // 必须在此响亮报错，否则会造出一个模板名叫 "int" 的假实例，
+                            // 一路算到汇编期才炸。对照 clang：err_template_template_parm_mismatch
+                            // / "template template argument must be a class template"。
+                            const std::string& tn = arg.type ? arg.type->name : std::string();
+                            if (!arg.type || !arg.type->isClass() || tn.empty()
+                                || (!m_classTemplates.count(tn)
+                                    && !m_aliasTemplates.count(tn))) {
+                                error(std::format(
+                                    "template argument {} for '{}' ('{}') must be a class "
+                                    "template, but '{}' is not a template",
+                                    i + 1, type->name, fp->name,
+                                    arg.type ? arg.type->toString() : "?"),
+                                    SourceLocation{});
+                            }
+                            std::cout << std::format(
+                                "  [sema:targ]   ⤷ 第 {} 位期望模板 ⇒ 实参 '{}' 按"
+                                "【模板名】处理（[temp.arg.template]）\n",
+                                i + 1, arg.type ? arg.type->name : "?");
+                            tid->templateArgs.push_back(
+                                TemplateArg::ofTemplate(arg.type ? arg.type->name : ""));
+                            continue;
+                        }
                         tid->templateArgs.push_back(
                             TemplateArg::ofType(resolveType(arg.type)));
-                    else
+                    }
+                    else {
                         tid->templateArgs.push_back(arg);
+                    }
                 }
                 // 模板 id 尚未实例化 ⇒ 当场实例化，拿到具体的类类型
                 return getOrInstantiateClass(tid, SourceLocation{});
@@ -1385,6 +1434,35 @@ void SemanticAnalyzer::processTypeAliasDecl(TypeAliasDeclPtr decl) {
 // │       （因为"边扫边放"会让 A.x 与 _vptr 重叠）。
 // └────────────────────────────────────────────────────────────────────────────
 void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
+    // ── 前置声明（`struct A;`）：只登记名字，不生成任何成员/布局/符号 ──
+    // 用例：struct A;  struct B { A* pa; };  struct A { int x; };
+    //   ① 前置声明让 `A*` 能被 resolveType 解析（名字进 m_classTypes）；
+    //   ② 真定义到来时走下面的正常路径，覆盖同名登记；
+    //   ③ 空壳【不生成默认构造/析构】—— 否则 CodeGen 会发两份 A_dtor，
+    //      汇编期报 "symbol `A_dtor' is already defined"。
+    // 简化点：不做"不完整类型"使用检查（clang 会对 `A a;` 这类值使用报错）。
+    if (decl->isForwardDecl) {
+        std::cout << std::format(
+            "  [register] class '{}' (forward declaration ⇒ 只登记名字，不产符号)\n",
+            decl->name);
+        // 三处登记（与正常路径末尾同构）：类型表 + AST 声明 + ★符号表。
+        // ★ 符号表这条不能省 —— resolveType 查的是 m_symbolTable.lookup()，
+        //   少了它 `struct B { A* pa; };` 会误报 unknown type name 'A'。
+        TypePtr fwdType = Type::makeClass(decl->name);
+        decl->classType = fwdType;
+        m_classTypes[decl->name] = fwdType;
+        m_classDecls[decl->name] = decl;
+
+        Symbol fwdSym;
+        fwdSym.name = decl->name;
+        fwdSym.type = fwdType;
+        fwdSym.kind = SymbolKind::Type;
+        fwdSym.isLocal = false;
+        fwdSym.definedAt = decl->location;
+        m_symbolTable.define(decl->name, fwdSym);
+        return;
+    }
+
     // 处理本类期间置"当前类"，供 resolveType 的类作用域回退用（类体内 `type x;` 要先在
     // 类作用域的 typeAliases 里找）。方法体的分析由 registerFunction 另行覆盖/还原这个值。
     std::string savedClassScope = m_currentClassName;
@@ -1684,6 +1762,18 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 }
             }
         }
+    }
+
+    // ── 注册成员模板（[temp.mem]）──
+    // 不进 methods：它不是可调用实体，只是一张"配方"（要用实参推导才产出函数）。
+    // 单独存一张表，调用点在方法表查不到时来这里查。
+    // ★ 蓝图里的形参名（T）必须保留原样直到实例化 —— 与自由函数模板同理。
+    for (auto& mt : decl->memberTemplates) {
+        mt->funcTemplate->ownerClassName = decl->name;
+        m_classMemberTemplates[decl->name].push_back(mt);
+        std::cout << std::format(
+            "    ↳ member template '{}::{}' registered ({} template parameter(s))\n",
+            decl->name, mt->templateName(), mt->templateParams.size());
     }
 
     // ── 注册方法，检查虚函数 ──
@@ -2370,7 +2460,11 @@ void SemanticAnalyzer::processTemplateDecl(TemplateDeclPtr decl) {
             // 为什么只查 ExplicitSpec：偏特化 `template<class T>` 里的裸 T 是【合法】形参，
             //   Parser 已建成 TemplateParam 节点（见 parseTemplateDecl 压入的
             //   m_templateParamScope），一并拦下会误伤。"T 到底存不存在"只有 Sema 判得了。
-            for (const auto& pat : decl->specPattern) {
+            for (const auto& arg : decl->specPattern) {
+                // 值位（`template <> struct Flag<true>`）：值本就是具体量，
+                //   不存在"名字未声明"的问题，跳过。
+                if (!arg.isType()) continue;
+                const TypePtr& pat = arg.type;
                 if (!pat) continue;
                 // 模式里挂着模板参数节点 = 形参表空却用了形参名，必是笔误
                 if (pat->isTemplateParam()) {
@@ -2502,6 +2596,63 @@ void SemanticAnalyzer::visit(BlockStmt& block) {
 // │ 类型检查的三种放行  equals 全等 → 通过；typeCompatible（剥引用 + int→double）→ 打
 // │       [conv] 日志；双指针 → 打 [poly] 日志；其余 → Type mismatch 报错。
 // └────────────────────────────────────────────────────────────────────────────
+// ── auto 占位符：去壳判据 ─────────────────────────────────────────────────
+// 壳 ⇒ 下钻方向（每一层都只是"包着 auto"，不改变 auto 的身份）：
+//   Const(Auto)        ⇒ innerType
+//   Pointer(Auto)      ⇒ pointeeType
+//   LValueRef(Auto)    ⇒ referencedType
+//   RValueRef(Auto)    ⇒ referencedType
+//   Pointer(Const(Auto)) ⇒ 两层依次下钻（const auto* p = &a;）
+bool SemanticAnalyzer::containsAuto(const TypePtr& t) const {
+    if (!t) return false;
+    if (t->isAuto()) return true;
+    if (t->isConst())     return containsAuto(t->innerType);
+    if (t->isPointer())   return containsAuto(t->pointeeType);
+    if (t->isReference()) return containsAuto(t->referencedType);
+    return false;
+}
+
+// ── auto 占位符：反推 ────────────────────────────────────────────────────
+// [dcl.spec.auto]/7：声明类型含占位符 ⇒ 类型由初始化式推导，规则等价于把 auto
+// 当模板形参跑一次函数模板实参推导（[temp.deduct.call]）——即合一：pattern 是 P，
+// 初始化式类型是 A，Auto 是待绑定的变量。
+// 【为什么要递归而不是"剥到光杆 auto 再套回"】auto 外面有几层壳，结果就要套回几层；
+//   且每遇一层 Pointer，A 也要同步剥掉一层指针才对齐（否则 auto** 会算成三层）。
+// 用例（pattern + init ⇒ 结果）：
+//   Auto                   + int                 ⇒ int
+//   Const(Auto)            + int                 ⇒ Const(int)             const auto  v1 = a;
+//   Pointer(Auto)          + Pointer(int)        ⇒ Pointer(int)           auto*       v3 = &a;
+//   LValueRef(Auto)        + int                 ⇒ LValueRef(int)         auto&       v4 = a;
+//   LValueRef(Const(Auto)) + int                 ⇒ LValueRef(Const(int))  const auto& v5 = a;
+//   RValueRef(Auto)        + int                 ⇒ RValueRef(int)         auto&&      v6 = 7;
+//   Pointer(Pointer(Auto)) + Pointer(Pointer(int)) ⇒ 同构                  auto**      pp = &p;
+// 简化点：未做引用折叠（auto&& 绑左值按 [dcl.ref]/6 应折叠成 T&）——minicc 的
+//   inferType 对标识符一律返回裸类型（表达式的类型从不含引用，[expr.type]/1），
+//   该分支暂不可达；真要做时在此加 collapseRef 即可。
+TypePtr SemanticAnalyzer::deduceAutoType(TypePtr pattern, TypePtr init,
+                                         const std::string& varName, SourceLocation loc) {
+    if (!pattern) return nullptr;
+    if (pattern->isAuto()) return init;              // ★ 绑定点：auto := A
+    if (pattern->isConst())
+        return Type::makeConst(deduceAutoType(pattern->innerType, init, varName, loc));
+    if (pattern->isPointer()) {
+        // `auto*` 要求初始化式确实是指针，且 A 要剥掉一层才能与内层模式对齐
+        if (!init || !init->isPointer())
+            error(std::format(
+                "cannot deduce 'auto*' for '{}': initializer is '{}', not a pointer",
+                varName, init ? init->toString() : "?"), loc);
+        return Type::makePointer(
+            deduceAutoType(pattern->pointeeType, init->pointeeType, varName, loc));
+    }
+    if (pattern->isLValueReference())
+        return Type::makeLValueReference(
+            deduceAutoType(pattern->referencedType, init, varName, loc));
+    if (pattern->isRValueReference())
+        return Type::makeRValueReference(
+            deduceAutoType(pattern->referencedType, init, varName, loc));
+    return pattern;  // 不含 auto 的外壳（containsAuto 为真时不可达）
+}
+
 void SemanticAnalyzer::visit(VarDeclStmt& decl) {
     // ── CTAD：`MyPtr m(7);` → `MyPtr<int> m(7);`（[dcl.type.class.deduct]）──
     // ★ 必须在 resolveType【之前】：resolveType 见到裸类模板名会直接报 "requires
@@ -2528,19 +2679,25 @@ void SemanticAnalyzer::visit(VarDeclStmt& decl) {
         std::cout << std::format("{}    ⟹ inferred: {}\n",
             inferIndent(), initType ? initType->toString() : "?");
 
-        // ─── auto 类型推导 ───
-        if (type->isAuto()) {
+        // ─── auto 类型推导（[dcl.spec.auto]/7）───
+        // ★ 判据是 containsAuto 而非 isAuto：const auto 的树是 Const(Auto)，
+        //   光杆判据看不见占位符 ⇒ 落到 else 分支被当成"声明 const auto、实得 int"误报。
+        if (containsAuto(type)) {
             if (!initType || initType->isAuto() || initType->isVoid()) {
                 error(std::format("Cannot deduce auto type for '{}'", decl.name),
                       decl.location);
             }
 
-            // ★★★ 核心：永久替换 auto 为真实类型 ★★★
-            decl.declaredType = initType;
-            type = initType;
+            // ★★★ 核心：去壳反推 → 套回外壳 → 永久替换 ★★★
+            // 日志打 pattern 原文：裸 auto 仍输出 "auto"（与旧日志一字不差），
+            //   `const auto` / `auto*` / `auto&` 则原样可见。
+            TypePtr declaredAuto = type;
+            TypePtr deduced = deduceAutoType(type, initType, decl.name, decl.location);
+            decl.declaredType = deduced;
+            type = deduced;
 
-            std::cout << std::format("  [auto] ★ {} : auto ⟹ {}   ← auto 被永久替换!\n",
-                decl.name, type->toString());
+            std::cout << std::format("  [auto] ★ {} : {} ⟹ {}   ← auto 被永久替换!\n",
+                decl.name, declaredAuto->toString(), type->toString());
         }
         else {
             // ── 类型检查（含 [conv.lval] 引用剥除 / 数值提升）──
@@ -2562,7 +2719,8 @@ void SemanticAnalyzer::visit(VarDeclStmt& decl) {
                 }
             }
         }
-    } else if (type->isAuto()) {
+    } else if (containsAuto(type)) {
+        // 含占位符但无初始化式（`const auto x;` 同样要拦）
         error(std::format("auto variable '{}' must have an initializer", decl.name),
               decl.location);
     } else if (!decl.ctorArgs.empty()) {
@@ -2980,6 +3138,29 @@ TypePtr SemanticAnalyzer::inferUnary(UnaryExpr& expr) {
         return Type::makeBool();
     }
 
+    // ── 解引用 *p（[expr.unary.op]/1）──
+    // 结果类型 = 指针的 pointee（被指类型），且结果是【左值】—— 故 `*p = v` 合法。
+    // 操作数必须是指针：C++ 里没有指针不做隐式转换（C 也没有），非指针即错误。
+    // demo: int a; int* p = &a;  *p → int（左值）
+    // 对照 clang：Sema::CheckIndirectionOperand（SemaExpr.cpp）
+    if (expr.op == UnaryOp::Deref) {
+        if (!operandType) {
+            error("Cannot dereference a null-typed operand", expr.location);
+        }
+        if (!operandType->isPointer()) {
+            // 文案对齐 clang：indirection requires pointer operand ('X' invalid)
+            error(std::format(
+                "Indirection requires pointer operand ('{}' invalid)",
+                operandType->toString()), expr.location);
+        }
+        TypePtr result = operandType->pointeeType;
+        std::cout << std::format(
+            "{}[infer] *{} → {}    (解引用 [expr.unary.op]/1)\n",
+            inferIndent(), operandType->toString(),
+            result ? result->toString() : "?");
+        return result;
+    }
+
     // ── 取地址 &x（[expr.unary.op]/3）──
     // 结果类型 = Pointer(操作数类型)，操作数必须是左值。
     // demo: int a;  &a → int*  —— 也就是 Box<decltype(&a)> 里的实参类型。
@@ -3131,6 +3312,27 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
                             return method->returnType;
                         }
                     }
+                    // ── 成员模板（[temp.mem]）：普通方法表里没有，查成员的模板表 ──
+                    // ★ 位置刻意放在"方法表查完之后"：普通成员函数优先（重载决议里
+                    //   非模板候选本来就优先于模板候选，[over.match.best]）。
+                    if (auto mtIt = m_classMemberTemplates.find(clsName);
+                        mtIt != m_classMemberTemplates.end()) {
+                        for (auto& mt : mtIt->second) {
+                            if (mt->templateName() != funcName) continue;
+                            FuncDeclPtr inst = getOrInstantiateMemberFunction(
+                                mt, argTypes, argIsLValue, clsName, expr.location);
+                            if (!inst) continue;   // 推导失败 ⇒ 试下一个同名成员模板
+                            // 回填符号：CodeGen 的成员调用硬拼 `类名_方法名`，
+                            // 而成员模板的多个实例各有符号，必须由这里指定。
+                            mem->resolvedCalleeSymbol = inst->mangledName;
+                            std::cout << std::format(
+                                "{}[call] {}.{}({} args) → {}    "
+                                "[member template instantiated]\n",
+                                inferIndent(), objType->name, funcName, argTypes.size(),
+                                inst->returnType ? inst->returnType->toString() : "?");
+                            return inst->returnType;
+                        }
+                    }
                     // 搜基类
                     for (auto& bn : classIt->second->baseClassNames)
                         searchQueue.insert(searchQueue.begin(), bn);
@@ -3245,6 +3447,20 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
     // ── ④ 退回既有路径：精确匹配一个都没有 ──
     if (it != m_functionMap.end()) {
         if (it->second->parameters.size() == argTypes.size()) {
+            // ★ 限定名调用（`C::f()`）必须把 callee 名改写成【发射符号】。
+            //   定义端成员函数用 mangledName（C_f），调用端若留着源码名 "C::f"，
+            //   asmSymbol 会把 "::" 净化成 "__" 得到 C__f ⇒ 链接期 undefined reference。
+            //   与模板实例（calleeVar->name = instance->mangledName）是同一手法：
+            //   Sema 定死符号名，CodeGen 照着发 —— 名字的"真身"在语义阶段兑现。
+            //   判据用 mangledName != funcName：命名空间自由函数两边同为 "N::get"
+            //   （registerFunction 对 ownerClassName 为空者不修饰），天然不触发。
+            if (calleeVar && !it->second->mangledName.empty()
+                && it->second->mangledName != funcName) {
+                std::cout << std::format(
+                    "{}[call] 限定名 '{}' → 发射符号 '{}'（成员函数 mangled）\n",
+                    inferIndent(), funcName, it->second->mangledName);
+                calleeVar->name = it->second->mangledName;
+            }
             std::cout << std::format(
                 "{}[call] {}({} args) → {}    [symbol resolved, non-template preferred]\n",
                 inferIndent(), funcName, argTypes.size(),
@@ -3500,14 +3716,25 @@ void SemanticAnalyzer::checkTemplateArguments(
                 "template argument {} for '{}' ('{}') must be {}, but '{}' is a type",
                 i + 1, tname, p.name, want, a.toString()), loc);
         }
-        // ③ NTTP 的值类型必须受支持（本项目只支持 int）
-        //    对照 clang：[temp.param]/6 允许整型/枚举/指针/左值引用/字面量类类型等
+        // ③ NTTP 的值类型必须受支持（本项目支持 int / bool）
+        //    对照 clang：[temp.param]/6 允许整型（含 bool）/枚举/指针/左值引用/字面量类类型等
         if (p.kind == TemplateParamKind::NonType
-            && p.nonType && !p.nonType->isInt()) {
+            && p.nonType && !p.nonType->isInt() && !p.nonType->isBool()) {
             error(std::format(
                 "non-type template parameter '{}' of '{}' has unsupported type '{}' "
-                "(only 'int' is supported)",
+                "(only 'int' and 'bool' are supported)",
                 p.name, tname, p.nonType->toString()), loc);
+        }
+        // ③-b 值实参的【形态】须与形参类型相容（[temp.arg.nontype]/1：实参应是
+        //     形参类型的【转换后常量表达式】）。`Flag<1>`（bool 形参收 int 字面量）
+        //     与 `Buf<true>`（int 形参收 bool）都不合法。
+        //     本项目做"形态精确匹配"，不做隐式转换 —— 与实参推导的严格性一致。
+        if (p.kind == TemplateParamKind::NonType && a.isValue()
+            && a.valueType && p.nonType && !a.valueType->equals(p.nonType)) {
+            error(std::format(
+                "non-type template argument for '{}' ('{}') has type '{}', "
+                "but the parameter type is '{}'",
+                tname, p.name, a.valueType->toString(), p.nonType->toString()), loc);
         }
 
         std::cout << std::format(
@@ -3555,7 +3782,7 @@ std::tuple<TemplateDeclPtr, TemplateInstantiator::TypeSubstitution, bool>
 // │       Box<int*>   → [spec:select]   P=T   A=int   ⇒ T := int
 // │                     [spec:select]   │  唯一候选 → 直接选中 'Box<T*>'
 // │       is_int<int> → [spec:select]   ├─ ① explicit specialization matched
-// │                                       (exact type equality) → USING IT
+// │                                       (exact argument equality) → USING IT
 // │ 输出  (选中的声明, 替换表, 是否走特化)；主模板路径的替换表为空
 // │ 偏特化的失败原因会原样打进日志（"reference structure mismatch" 这类）
 // └────────────────────────────────────────────────────────────────────────────
@@ -3566,14 +3793,10 @@ SemanticAnalyzer::selectClassTemplate(
 
     const std::string& name = primary->templateName();
 
-    // 只有类型实参才能参与特化模式匹配（Parser 已限制 specPattern 只含类型）。
-    // 实参表里若出现 NTTP 值，直接跳过特化路径走主模板。
-    std::vector<TypePtr> argTypes;
-    bool allTypeArgs = true;
-    for (const auto& a : args) { // wangyang 看的是进去的参数 比如 box<Dog,Void> 这种，进入的参数是不是 type
-        if (!a.isType()) { allTypeArgs = false; break; }
-        argTypes.push_back(a.type);
-    }
+    // ★ 实参表原样参与匹配（含 NTTP 值位）。
+    //   此前这里有个"含值实参就跳过特化路径"的守卫，前提是"specPattern 只含类型"
+    //   —— 而 [temp.class.spec] 并不禁止模式位写成值，`enable_if<true, T>` 这种
+    //   "用 NTTP 选中特化"的惯用法正需要它。守卫拆掉后，值位由 matchPattern 逐位比。
 
     std::cout << std::format("  [spec:select] ★ selecting class template '{}' for <{}>\n",
         name, [&] { std::string s;
@@ -3581,20 +3804,20 @@ SemanticAnalyzer::selectClassTemplate(
                        if (i > 0) s += ", "; s += args[i].toString();
                    } return s; }());
 
-    if (allTypeArgs) {
-        // ── ① 全特化：逐位类型相等 ──
+    {
+        // ── ① 全特化：逐位实参相等 ──
         // 对照 clang：Sema::CheckTemplateArgumentList 对已知特化的精确匹配路径
         if (auto it = m_explicitSpecs.find(name); it != m_explicitSpecs.end()) {
             for (const auto& spec : it->second) {
-                if (spec->specPattern.size() != argTypes.size()) continue;
+                if (spec->specPattern.size() != args.size()) continue;
                 bool same = true;
-                for (size_t i = 0; i < argTypes.size(); i++) {
-                    if (!spec->specPattern[i]->equals(argTypes[i])) { same = false; break; }
+                for (size_t i = 0; i < args.size(); i++) {
+                    if (!spec->specPattern[i].equals(args[i])) { same = false; break; }
                 }
                 if (same) {
                     std::cout << std::format(
                         "  [spec:select]   ├─ ① explicit specialization matched "
-                        "(exact type equality) → USING IT\n");
+                        "(exact argument equality) → USING IT\n");
                     return {spec, {}, true};
                 }
             }
@@ -3627,7 +3850,7 @@ SemanticAnalyzer::selectClassTemplate(
                 deducer.setDecltypeEvaluator(this);
                 deducer.setMemberTypeResolver(this);   // void_t<typename T::type> 探测要用
                 deducer.setAliasTemplateResolver(this);
-                if (deducer.matchPattern(spec->specPattern, argTypes,
+                if (deducer.matchPattern(spec->specPattern, args,
                                          paramNames, subst, reason)) {
                     std::cout << std::format(
                         "  [spec:select]   ├─ ② 候选：'{}<{}>' 匹配成功\n",
@@ -3685,7 +3908,7 @@ SemanticAnalyzer::selectClassTemplate(
                             "ambiguous partial specializations of '{}' for <{}>: "
                             "{} are equally specialized, none is more specialized "
                             "than the others",
-                            name, typeListToString(argTypes), cands), loc);
+                            name, typeListToString(args), cands), loc);
                     }
                 }
                 std::cout << std::format(
@@ -3694,9 +3917,6 @@ SemanticAnalyzer::selectClassTemplate(
                 return {matched[winner].spec, matched[winner].taggedSubst, true};
             }
         }
-    }
-    else {
-        std::cout << "  [spec:select]   ├─ 实参含非类型值，跳过特化匹配\n";
     }
 
     // ── ③ 主模板 ──
@@ -3866,8 +4086,14 @@ FuncDeclPtr SemanticAnalyzer::getOrInstantiateFunction(
     targs.reserve(args.size());
     for (auto& a : args) targs.push_back(TemplateArg::ofType(a));
 
-    std::string mangled =
-        NameMangler::mangleTemplateInstance(tmpl->funcTemplate->name, targs);
+    // ★ 缓存键必须与实例化端（TemplateInstantiator）编出【同一串】—— 它用的是
+    //   完整签名（返回类型 + 参数表）。此前这里只编到模板实参，于是
+    //   `f(1)` 与 `f(1,2)`（两个不同重载、T 同为 int）编出同一个键，
+    //   后者撞上前者的缓存项被当成"已实例化" ⇒ 静默调用错误的实例（docs/BUGS.md B2）。
+    std::string mangled = NameMangler::mangleFunctionTemplateInstance(
+        tmpl->funcTemplate->name, targs,
+        tmpl->funcTemplate->returnType, tmpl->funcTemplate->parameters,
+        tmpl->typeParams);
 
     auto it = m_templateInstanceCache.find(mangled);
     if (it != m_templateInstanceCache.end()) {
@@ -3896,6 +4122,75 @@ FuncDeclPtr SemanticAnalyzer::getOrInstantiateFunction(
     m_functionMap[mangled] = instance;
     m_functions.push_back(instance);
     analyzeFunctionBody(instance);
+    return instance;
+}
+
+// ─── 成员模板实例化（[temp.mem]）────────────────────────────────────────────
+// 与自由函数模板【逐字同构】：推导 → 实例化（带缓存）→ 落地解析 → 注册进 CodeGen
+//   的函数列表。标准里 [temp.mem]/1 明说成员模板的推导规则与 [temp.deduct] 一致 ——
+//   形参表就是形参表，不为"成员"另立一套合一算法。
+// 只多两件事：
+//   ① ownerClassName（隐式 this）：CodeGen 靠它决定参数寄存器要不要偏一位；
+//   ② 符号是 `类名_方法名_实参`（不是 Itanium 模板实例名）—— 同一个方法名的多个
+//      实例（S_id_int / S_id_double）必须各有符号，CodeGen 的成员调用才能各调各的。
+FuncDeclPtr SemanticAnalyzer::getOrInstantiateMemberFunction(
+    const TemplateDeclPtr& tmpl,
+    const std::vector<TypePtr>& argTypes,
+    const std::vector<bool>& argIsLValue,
+    const std::string& ownerClassName,
+    SourceLocation loc) {
+
+    std::cout << std::format(
+        "{}[call] {}::{} — 成员模板候选，开始推导（[temp.mem]）\n",
+        inferIndent(), ownerClassName, tmpl->templateName());
+
+    TemplateDeducer deducer;
+    deducer.setDecltypeEvaluator(this);
+    deducer.setMemberTypeResolver(this);
+    deducer.setAliasTemplateResolver(this);
+    auto r = deducer.deduce(tmpl, argTypes, argIsLValue);
+    if (!r.success) {
+        // SFINAE 性质：这位成员模板推不出来【不一定是错误】—— 调用方可能还有别的
+        // 重载可选。故只报推导失败原因，由调用方决定是继续找还是报 no matching。
+        std::cout << std::format("{}[call] {}::{} 推导失败：{}\n",
+            inferIndent(), ownerClassName, tmpl->templateName(), r.failureReason);
+        return nullptr;
+    }
+
+    // 缓存键 = 实例的符号名。与 Instantiator 用同一个 sanitizeSymbolChars ——
+    // 两处各写一份的话，键与符号名会悄悄对不上（命中失败或误命中，都不报错）。
+    std::string mangled = sanitizeSymbolChars(
+        ownerClassName + "_" + tmpl->funcTemplate->name);
+    for (auto& a : r.deducedArgs) {
+        mangled += "_" + sanitizeSymbolChars(a ? a->toString() : "?");
+    }
+
+    auto it = m_templateInstanceCache.find(mangled);
+    if (it != m_templateInstanceCache.end()) {
+        std::cout << std::format("  [instantiate] cache hit: {} (skip re-instantiation)\n",
+            mangled);
+        return it->second;
+    }
+
+    FuncDeclPtr instance =
+        m_instantiator.instantiateFunction(tmpl, r.deducedArgs, ownerClassName);
+    m_templateInstanceCache[mangled] = instance;
+
+    // 落地解析（同自由函数模板）：替换只做【替换】，残留的半成品模板 id 要靠
+    // resolveType 兑现成具体实例类型，否则函数体里 p.value 查不到类。
+    if (instance->returnType) instance->returnType = resolveType(instance->returnType);
+    for (auto& param : instance->parameters) {
+        param.type = resolveType(param.type);
+    }
+
+    std::cout << std::format("{}[call] {}::{} → {} (member template instantiated) → {}\n",
+        inferIndent(), ownerClassName, tmpl->templateName(), mangled,
+        instance->returnType ? instance->returnType->toString() : "void");
+
+    m_functionMap[mangled] = instance;
+    m_functions.push_back(instance);
+    analyzeFunctionBody(instance);
+    (void)loc;
     return instance;
 }
 
@@ -3998,6 +4293,27 @@ TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
                     method->returnType ? method->returnType->toString() : "?",
                     method->isVirtual ? ", virtual" : "");
                 return method->returnType;
+            }
+        }
+    }
+
+    // ── 成员模板（[temp.mem]）：名字存在，但"是哪一个函数"要等实参 ──
+    // ★ 这里【不能】报 No member：inferCall 对成员调用会先补推导一次 callee 表达式
+    //   （见 inferCall 里 `inferType(mem)` 那段），走到这里时手上【没有实参】，
+    //   推不出 T 也就选不出实例。报错会把整条成员模板调用路径掐死在推导之前。
+    //   故只回答"名字确实存在"，返回 void 占位；真正的选择由调用点带实参完成。
+    //   限定 isMethodCall：`auto x = s.id;` 这种"取成员模板本身"的写法仍然报错
+    //   （clang 里那是未决名字，同样不合法）。
+    if (expr.isMethodCall) {
+        if (auto mtIt = m_classMemberTemplates.find(actualType->name);
+            mtIt != m_classMemberTemplates.end()) {
+            for (auto& mt : mtIt->second) {
+                if (mt->templateName() == expr.memberName) {
+                    std::cout << std::format(
+                        "{}[member] {}.{} —— 成员模板（待实参推导，[temp.mem]）\n",
+                        inferIndent(), actualType->name, expr.memberName);
+                    return Type::makeVoid();
+                }
             }
         }
     }

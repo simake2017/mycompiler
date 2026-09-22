@@ -81,8 +81,8 @@ public:
     //       pattern=[T*, T]、args=[int, int]      → 失败（指针结构失配）
     // 返回：全部位匹配成功 → true；任一位失败 → false 并填 failReason。
     // 注：不做 [temp.class.order] 偏序裁决（多偏特化同时匹配时取先成功者）。
-    bool matchPattern(const std::vector<TypePtr>& pattern,
-                      const std::vector<TypePtr>& args,
+    bool matchPattern(const std::vector<TemplateArg>& pattern,
+                      const std::vector<TemplateArg>& args,
                       const std::vector<std::string>& paramNames,
                       std::unordered_map<std::string, TypePtr>& subst,
                       std::string& failReason);

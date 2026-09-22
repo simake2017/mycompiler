@@ -178,6 +178,9 @@ enum class UnaryOp : uint8_t {
     Neg,    // -x
     Not,    // !x
     Addr,   // &x —— 取地址 [expr.unary.op]/3
+    Deref,  // *x —— 解引用 [expr.unary.op]/1
+            //   ★ 一元 '*' 与二元的 '*' 同形，靠【位置】区分：有左操作数才是乘法。
+            //     与 '&'（取地址 vs 位与/引用）完全同构的判据，见 parseUnaryExpr。
 };
 
 // demo：return -x;  → ReturnStmt[ UnaryExpr{ op=Neg, operand=VarExpr{x} } ]
@@ -227,6 +230,15 @@ struct MemberExpr : Expression {
     // clang 对照：DeclRefExpr(NestedNameSpecifier + ValueDecl)，
     //   Sema::BuildDeclarationNameExpr 走 CXXScopeSpec 的那条路径。
     bool        isTypeAccess = false;
+
+    // ── 成员【模板】调用选定的符号（[temp.mem]）────────────────────────────
+    // 普通成员调用的符号是 CodeGen 按 `类名_方法名` 硬拼的；成员模板不同：
+    //   同一个 `id` 会因实参不同实例化出 `S_id_int` / `S_id_double` 多个符号，
+    //   硬拼必然全部调同一个（且那个符号可能根本没被发射）。
+    // 故由 Sema 在推导+实例化后把选定的符号名回填到这里，CodeGen 非空即采用。
+    // 空串 = 普通成员调用，走原有硬拼路径（既有符号逐字节不变）。
+    // 对照 clang：CXXMemberCallExpr 持 CXXMethodDecl*，符号由该 Decl 决定。
+    std::string resolvedCalleeSymbol;
 
     MemberExpr(ExprPtr obj, std::string member, bool arrow)
         : Expression(NodeKind::Member), object(std::move(obj)),
@@ -483,6 +495,15 @@ struct FunctionDecl : Declaration {
     std::shared_ptr<BlockStmt> body;      // nullptr = 纯声明（无实现）
     bool                 isVirtual  = false;
     bool                 isOverride = false;
+    // 后置 const（[dcl.fct]/7）：`int get() const` —— cv-qualifier-seq 是【函数类型】
+    // 的一部分，改变隐式 this 的类型（T* → const T*），这是"const 对象不能调
+    // 非 const 成员"的底层机制。本项目记录该标志用于日志与后续检查，
+    // ★ 未实现：`f()` 与 `f() const` 的重载区分（clang 视其为两个不同重载）。
+    bool                 isConstMethod = false;
+    // 类内 static 成员函数（[class.static]/2）：**没有隐式 this 参数**，
+    // 调用不传对象（C::f() 与 obj.f() 等价，都不装 rdi）。
+    // ★ 未实现：static 数据成员（需类外定义 + 独立存储，不是每实例一份）。
+    bool                 isStatic = false;
     std::string          mangledName;     // 符号修饰后的名字（阶段4填充）
     std::string          ownerClassName;  // 所属类名（如果是成员函数）
 
@@ -617,6 +638,15 @@ struct ClassDecl : Declaration {
     TypePtr                  classType;      // 对应的 Type 对象
     AccessModifier           currentAccess = AccessModifier::Private;
 
+    // ── 前置声明标记（[dcl.type.elab]）──────────────────────────────────
+    // `struct A;` 只声明"名字存在"、不给定义 ⇒ 本字段为 true。
+    // 【为什么必须显式标记】空壳与"真的空类"（`struct A {};`）在字段/方法上都为空，
+    //   靠内容区分不了；而两者语义不同：前者不该生成任何符号。
+    // 【不标会怎样】Sema 给空壳也生成默认构造/析构 ⇒ CodeGen 发射两份 A_dtor
+    //   （空壳发 A_A + A_dtor，真定义发 A_A_0 + A_dtor）⇒ 汇编期
+    //   "symbol `A_dtor' is already defined"。
+    bool isForwardDecl = false;
+
     // ── 静态常量成员（名 → 值）──────────────────────────────────────────
     // 【用途】std 垫片 false_type/true_type 的 ::value 由 SemanticAnalyzer::
     //   registerBuiltins 直接注入（Parser 不解析类内 `static const int value = 1;`）。
@@ -637,6 +667,12 @@ struct ClassDecl : Declaration {
     //   clang 对照：TypedefNameDecl / Sema::InstantiateTypedefNameDecl。
     std::unordered_map<std::string, TypePtr> typeAliases;
     std::vector<std::string> typeAliasOrder;   // 保持声明顺序，便于日志可观测
+
+    // ── 成员模板（[temp.mem]）──────────────────────────────────────────────
+    //   struct S { template <class T> T id(T x) { return x; } };
+    // 每个元素是一个函数模板蓝图（funcTemplate 非空），与自由函数模板**同构** ——
+    // 调用点用同一套合一算法推导，只是实例化出来的函数带 ownerClassName。
+    std::vector<std::shared_ptr<TemplateDecl>> memberTemplates;
 
     ClassDecl() : Declaration(NodeKind::Class) {}
 
@@ -665,14 +701,21 @@ using ClassDeclPtr = std::shared_ptr<ClassDecl>;
 // ─── 模板形参（类型形参 vs 非类型形参 NTTP）──────────────────────────────
 // 对应 [temp.param]；clang: TemplateTypeParmDecl / NonTypeTemplateParmDecl
 enum class TemplateParamKind {
-    Type,    // typename T, class T
-    NonType, // int N, bool Flag 等非类型模板参数 (NTTP)
+    Type,     // typename T, class T
+    NonType,  // int N, bool Flag 等非类型模板参数 (NTTP)
+    Template, // template <class> class C —— 模板模板参数 [temp.param]/4
 };
 
 struct TemplateParam {
     TemplateParamKind kind = TemplateParamKind::Type;
     std::string       name;
     TypePtr           nonType = nullptr; // 非类型形参对应的类型（如 int）
+
+    // ── kind == Template 时有效：被接受模板的【形参个数】───────────────
+    // `template <template <class> class C>` ⇒ C.templateArity = 1。
+    // 只记元数：本项目不做 [temp.arg.template]/2 的"逐位形参表至少一样特化"
+    // 匹配，形态自检只要求"这一位得是个模板名"。
+    size_t            templateArity = 0;
 
     // ── 默认模板实参（[temp.param]/12）──
     // demo: template<typename T, typename U = void> 里 U 的 `= void` ⇒ hasDefault = true
@@ -756,8 +799,12 @@ struct TemplateDecl : Declaration {
     // specPattern : 特化形参模式 = 模板名后尖括号里的那串实参；主模板无尖括号 ⇒ 空
     //   Box<T*, T>     ⇒ [T*, T]      （含模板参数 ⇒ 偏特化；pattern[0]=Pointer(T)）
     //   Box<int*, int> ⇒ [int*, int]  （全具体 ⇒ 全特化）
+    //   enable_if<true, T> ⇒ [true, T] ★ 非类型模式位
+    // [temp.class.spec] 不区分模式位的形态 —— 类型与值都能出现在尖括号里，
+    // 故元素是 TemplateArg（tagged）而非裸 TypePtr。此前只收类型，导致
+    // `enable_if<true, T>` 这类"用 NTTP 选中特化"的惯用法根本写不出来。
     TemplateSpecKind           specKind = TemplateSpecKind::Primary;
-    std::vector<TypePtr>       specPattern;
+    std::vector<TemplateArg>   specPattern;
 
     TemplateDecl() : Declaration(NodeKind::Template) {}
 
@@ -780,6 +827,11 @@ struct TemplateDecl : Declaration {
     //   实体、没有符号、不被实例化 —— 它只是 CTAD 可问到的一条"映射规则"（故也有
     //   templateParams）。
     bool isDeductionGuide()   const { return guide != nullptr; }
+    // ── 成员模板（[temp.mem]）──
+    // 与自由函数模板同构（funcTemplate 非空），区别只在"出生地"：它定义在类体内、
+    // 实例化出的函数带 ownerClassName（有隐式 this）。调用点由 Sema 在对象的类里
+    // 查到它，再走与自由函数模板完全相同的推导 + 实例化路径。
+    bool isMemberTemplate = false;
     // 模板的主名（类名 / 函数名 / 别名名 / 被指引的类模板名）
     const std::string& templateName() const {
         if (isClassTemplate()) return classTemplate->name;

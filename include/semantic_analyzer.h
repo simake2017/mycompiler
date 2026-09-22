@@ -346,6 +346,21 @@ private:
                                 SourceLocation loc);
     FuncDeclPtr getOrInstantiateFunction(TemplateDeclPtr tmpl,
                                          const std::vector<TypePtr>& args);
+
+    // ── 成员模板（[temp.mem]）──────────────────────────────────────────────
+    // 与 getOrInstantiateFunction 同构，区别有二：
+    //   ① 推导用的实参表是【调用点的实参】（含隐式 this 之后的那些），
+    //      而形参表来自成员模板自身的 funcTemplate；
+    //   ② 实例化的函数带 ownerClassName（隐式 this），符号是 `类名_方法名_实参`。
+    // 推导仍是同一套合一算法 —— 标准里 [temp.deduct] 对自由/成员模板并无二致。
+    FuncDeclPtr getOrInstantiateMemberFunction(const TemplateDeclPtr& tmpl,
+                                               const std::vector<TypePtr>& argTypes,
+                                               const std::vector<bool>& argIsLValue,
+                                               const std::string& ownerClassName,
+                                               SourceLocation loc);
+
+    // 类名 → 该类体内声明的成员模板列表（processClassDecl 填充）
+    std::unordered_map<std::string, std::vector<TemplateDeclPtr>> m_classMemberTemplates;
     // S6 偏序：a 是否至少与 b 同样特化（deduction-based，[temp.func.order] 简化）
     bool isAtLeastAsSpecialized(TemplateDeclPtr a, TemplateDeclPtr b);
     std::unordered_map<std::string, ClassDeclPtr>  m_classDecls;    // 类名 → 声明
@@ -508,8 +523,8 @@ private:
     TypePtr renameTemplateParams(const TypePtr& t, const std::string& prefix);
 
     // 日志辅助：把模式/类型列表渲染成 "T*, T" 这样的可读串
-    std::string patternToString(const std::vector<TypePtr>& pattern);
-    std::string typeListToString(const std::vector<TypePtr>& types);
+    std::string patternToString(const std::vector<TemplateArg>& pattern);
+    std::string typeListToString(const std::vector<TemplateArg>& types);
 
     // ── 表达式类型推导 ──
     // 总入口：按节点动态类型分派到 inferXxx，结果写回 expr->resolvedType
@@ -532,6 +547,16 @@ private:
     TypePtr inferCall(CallExpr& expr);
     // 成员访问 obj.x / p->x：字段查布局表(得偏移)，方法查类声明
     TypePtr inferMember(MemberExpr& expr);
+
+    // ── auto 占位符（[dcl.spec.auto]/7）──
+    // auto 可能被 cv/指针/引用包住（Const(Auto) / Pointer(Auto) / ...），
+    // 只认光杆 Auto 的写法会让 const auto、auto*、auto& 全部误报 —— 见 docs/BUGS.md B1。
+    // 判据：递归下钻到壳底，看是不是 Auto。
+    bool containsAuto(const TypePtr& t) const;
+    // 用初始化式反推 auto，并把 pattern 的外壳原样套回。
+    // 等价于把 auto 当模板形参跑一次实参推导（[temp.deduct.call]）。
+    TypePtr deduceAutoType(TypePtr pattern, TypePtr init,
+                           const std::string& varName, SourceLocation loc);
     // new C：类名存在性检查 → 返回 C*
     TypePtr inferNew(NewExpr& expr);
     // this：仅限成员函数内，类型为属主类指针 [class.this]

@@ -361,3 +361,42 @@ TEST(ExprSemanticInference, TypeResolutionAndPromotion) {
     EXPECT_EQ(varC->name, "c");
     EXPECT_TRUE(varC->declaredType->isInt());
 }
+
+// =============================================================================
+// 一元解引用 *p（[expr.unary.op]/1）—— 并钉住 Parser / Sema 的【分工边界】
+// =============================================================================
+// ★ `*3` 与 `1 *` 是一对镜像，判据只有一条：**位置上有没有左操作数**。
+//     `*3`  —— '*' 前无左操作数 ⇒ 解引用，**语法合法**，错在语义（3 不是指针）
+//     `1 *` —— 有左操作数 ⇒ 乘法，缺右操作数 ⇒ **语法错误**
+//   实现前 minicc 把 `*3` 当语法错误拒掉（见 test_expr_parser.cpp 的
+//   ExprParserErrors 用例，已同步改为断言 `1 *`）；这与 clang 不符 —— clang 对
+//   `return *3;` 报的是**语义**错误 indirection requires pointer operand。
+// 对照 clang：Sema::CheckIndirectionOperand（SemaExpr.cpp）
+TEST(Semantics, DerefRequiresPointer) {
+    // ① 合法路径：int* 解引用 ⇒ 结果是被指类型 int（且是左值，故可作赋值目标）
+    {
+        auto [unit, trace] = analyzeSource(
+            "int main() { int a = 5; int* p = &a; return *p; }\n");
+        (void)unit;
+        dumpWithExplanation("解引用 *p（p : int*）⇒ int",
+                            "int a = 5; int* p = &a; return *p;", trace, []{});
+        EXPECT_NE(trace.find("[infer] *int* → int"), std::string::npos)
+            << "解引用应推导出被指类型 int；实际 trace:\n" << trace;
+    }
+
+    // ② 非法路径：*3 —— 语法过得去，语义必须响亮报错（不许静默算错）
+    {
+        bool        threw = false;
+        std::string msg;
+        try {
+            analyzeSource("int main() { return *3; }\n");
+        } catch (const std::runtime_error& e) {
+            threw = true;
+            msg   = e.what();
+        }
+        EXPECT_TRUE(threw) << "对非指针解引用必须报语义错误（此前是静默通过/语法误报）";
+        EXPECT_NE(msg.find("Indirection requires pointer operand"), std::string::npos)
+            << "报错文案应与 clang 对齐；实际: " << msg;
+        std::printf("★ 非指针解引用 ⇒ %s\n", msg.c_str());
+    }
+}

@@ -531,16 +531,26 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     // 如果是成员函数，第一个参数是 this 指针
     // Itanium C++ ABI：this 视为隐式第 0 参数，独占 rdi；
     // 登记为 "this" 槽位后，emitThis/裸字段访问都从这里加载
-    if (!func->ownerClassName.empty()) {
+    // ★ static 成员函数【没有 this】（[class.static]/2）：它 ownerClassName 仍非空
+    //   （符号名要带类前缀），但参数寄存器从 rdi 起算，不占隐式第 0 个。
+    //   漏掉这个判据的症状：调用端按自由函数装参（rdi=arg0…），被调端却把 rdi 当
+    //   this 丢进栈槽 ⇒ 形参表整体错位一个寄存器，静默算错
+    //   （`C::add(3,4)` 返回 4 而非 7：a 取到 rsi=4，b 取到 rdx=垃圾）。
+    // ★ 这个判据只算一次，下方形参 spill 复用同一个变量。
+    //   教训：同一条语义散成两处 `ownerClassName.empty()` 时，加 static 只改一处
+    //   必然错位 —— this 不再占 rdi，形参却仍右移一格，全体静默算错。
+    const bool hasThis = !func->ownerClassName.empty() && !func->isStatic;
+
+    if (hasThis) {
         m_localVars["this"] = paramOffset;
         emit(std::format("movq %{}, {}(%rbp)         # 保存 this 指针到栈槽", paramRegs[0], paramOffset));
         paramOffset -= 8;
     }
 
-    // 形参 spill：非成员函数形参 i 用第 i 个寄存器；
-    // 成员函数整体右移一位（regIdx = i+1），因为 rdi 已被 this 占用
+    // 形参 spill：无 this 的（自由函数 / static 成员）形参 i 用第 i 个寄存器；
+    // 有 this 的整体右移一位（regIdx = i+1），因为 rdi 已被隐式第 0 参数占用
     for (size_t i = 0; i < func->parameters.size() && i < 6; i++) {
-        size_t regIdx = func->ownerClassName.empty() ? i : i + 1;
+        size_t regIdx = hasThis ? i + 1 : i;
         if (regIdx < 6) {
             m_localVars[func->parameters[i].name] = paramOffset;
             emit(std::format("movq %{}, {}(%rbp)         # 形参 {} 从寄存器 spill 到栈",
@@ -689,7 +699,9 @@ void CodeGen::emitFunction(FuncDeclPtr func) {
     // 生成函数体
     // ★ 函数级析构层：直接声明在函数体顶层（不在任何 {} 块内）的类对象
     //   也要有人管——压一层"函数层"，正常落尾（fallthrough）路径在尾声
-    //   前逆序析构该层。（中途 return 跳过析构：教学简化，见文档 12）
+    //   前逆序析构该层。
+    // ★ 中途 return 走 visit(ReturnStmt) → emitDtorsOnReturn() 就近析构，
+    //   不再依赖"函数末尾"这个位置（BUGS.md B4 修复前那段是死代码）。
     m_blockDtorStack.push_back({});
     if (func->body) {
         for (auto& stmt : func->body->statements) {
@@ -755,8 +767,9 @@ void CodeGen::emitStmt(const StmtPtr& stmt) {
 //   （int x; 之类标量不进此表，不析构）
 // 嵌套块天然正确：内层弹层只析构自己那层，外层列表原封不动（与符号表
 //   enterScope/exitScope 同构）。
-// 简化：中途 return（直接 leave/ret）跳过析构——真实编译器会在每个退栈点补析构
-//   调用，教学版接受此差距（见文档 12）。
+// 提前出口：块内 return 的析构由 visit(ReturnStmt) → emitDtorsOnReturn() 补齐
+//   （同一套 LIFO 规则，只是提前到 return 处；BUGS.md B4）。
+//   return 之后本块末尾那段析构仍会发射，但已不可达 —— 无害的冗余。
 void CodeGen::visit(BlockStmt& block) {
     m_blockDtorStack.push_back({});   // enter scope：本块专属析构层
 
@@ -805,6 +818,48 @@ void CodeGen::emitClassDtorCall(const std::string& className, int rbpOffset) {
     }
     emit(std::format("callq {}            # 静态调用析构函数（非虚析构路径）",
         asmSymbol(className + "_dtor")));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// return 点就近析构（RAII，[class.dtor]/2、[basic.stc]）
+// ─────────────────────────────────────────────────────────────────────────────
+// 【为什么需要】块尾析构是挂在"块结束"这个【位置】上的，而 return 是提前出口 ——
+//   函数末尾那条"统一析构"发在 leave; ret 之后，永远执行不到（BUGS.md B4：
+//   带 return 的函数里局部对象从不析构，静默泄漏）。
+// 做法：return 处就地补一遍析构，层序与块尾规则完全一致 ——
+//   从最内层到最外层，每层按【逆声明序】；返回值先 pushq 保起来再逐层 callq。
+// demo: int f() { Dog d; return 0; }
+//   movq $0, %rax                           # 返回值
+//   pushq %rax                              # ← 保护（析构 callq 会踩 rax）
+//   leaq -16(%rbp), %rdi / callq Dog_dtor   # ~Dog()
+//   popq %rax                               # 恢复返回值
+//   leave / ret
+// 简化点：return 之后的块尾/函数尾析构代码仍会照常发射（已不可达，无害）；
+//   对照 clang：ReturnStmt → EmitBranchThroughCleanup → 统一 cleanup block，
+//   布局更省代码但要跨作用域收集，教学版用"就近发射"更好讲。
+bool CodeGen::emitDtorsOnReturn() {
+    // 先探一遍有没有对象要析构 —— 没有就【一个字节都不发】（零漂移的关键）
+    bool any = false;
+    for (const auto& layer : m_blockDtorStack) {
+        for (const auto& name : layer) {
+            if (m_classLocals.count(name)) { any = true; break; }
+        }
+        if (any) break;
+    }
+    if (!any) return false;
+
+    emit("pushq %rax                  # 保护返回值（析构调用会踩掉 rax）");
+    for (auto layer = m_blockDtorStack.rbegin(); layer != m_blockDtorStack.rend(); ++layer) {
+        for (auto it = layer->rbegin(); it != layer->rend(); ++it) {
+            auto ci = m_classLocals.find(*it);
+            if (ci == m_classLocals.end()) continue;
+            emitComment(std::format("~{}() before return (RAII, scope exit)",
+                ci->second.className));
+            emitClassDtorCall(ci->second.className, ci->second.offset);
+        }
+    }
+    emit("popq %rax                   # 恢复返回值");
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1084,6 +1139,33 @@ void CodeGen::visit(AssignStmt& stmt) {
     // ③ 成员访问 o.f（按 ClassLayout 查到偏移量后直接写内存）。
     // 三者互斥 —— 按节点种类一次 switch，跳表分派替代 RTTI 试探链。
     switch (stmt.target->kind) {
+        case NodeKind::Unary: {
+            // ── *p = v（[expr.ass]/3：解引用产生【左值】，可作赋值目标）──
+            // 与 B3 的裸字段写完全同构的两步：先算出目标地址，再按宽度存进去。
+            // rax 此刻已是右值（本函数开头统一求值）⇒ 压栈保序，
+            // 求值指针拿到地址后弹出右值，写入 (地址)。
+            auto un = std::static_pointer_cast<UnaryExpr>(stmt.target);
+            if (un->op != UnaryOp::Deref) {
+                throw std::runtime_error(std::format(
+                    "[CodeGen Error] unsupported unary assignment target (line {})",
+                    stmt.target->location.line));
+            }
+            emitComment("*p = ...  (解引用左值，[expr.ass]/3)");
+            emit("pushq %rax                  # 暂存右值（待写入的值）到栈上");
+            emitExpr(un->operand);
+            emit("movq %rax, %rcx                # 目标地址存入 rcx");
+            emit("popq %rax                    # 弹出右值回 rax");
+            // 宽度按被指类型选（与写字段、读解引用同一条判据，避免踩坏邻居）
+            TypePtr pt = un->operand->resolvedType;
+            TypePtr pointee = (pt && pt->isPointer()) ? pt->pointeeType : nullptr;
+            if (pointee && pointee->isBool()) {
+                emit("movb %al, (%rcx)             # 按 1 字节写入");
+            } else if (pointee && pointee->isInt()) {
+                emit("movl %eax, (%rcx)            # 按 4 字节写入");
+            } else {
+                emit("movq %rax, (%rcx)            # 按 8 字节写入");
+            }
+        } break;
         case NodeKind::Index: {
             auto idx = std::static_pointer_cast<IndexExpr>(stmt.target);
             // ─── 下标赋值（写形态）→ 糖化为 v.set(i, value) ───
@@ -1126,8 +1208,22 @@ void CodeGen::visit(AssignStmt& stmt) {
                     emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
                     emit("movq %rax, %rcx                # this 地址存入 rcx");
                     emit("popq %rax                    # 弹出右值回 rax");
-                    emit(std::format("movl %eax, {}(%rcx)    # .{} = ...（偏移 {}，4 字节写入）",
-                        field->offset, var->name, field->offset));
+                    // ── 按字段宽度选存储指令，与读路径、初始化列表路径对称 ──
+                    //   1B ⇒ movb │ ≤4B ⇒ movl │ 8B ⇒ movq
+                    // ★ 硬编码 movl 会让 8B 字段（指针/long）丢掉高 32 位（BUGS.md B3）。
+                    // 对照 clang：CodeGenFunction::EmitStoreOfScalar（按 TI.Width 选指令）。
+                    // 用例：struct MyPtr { int* ptr; void set(int* x) { ptr = x; } };
+                    //       ptr 宽 8 ⇒ 此处分派到 movq（旧版写死 movl，指针高 32 位丢失）
+                    if (field->size == 1) {
+                        emit(std::format("movb %al, {}(%rcx)    # .{} = ...（偏移 {}，1 字节写入）",
+                            field->offset, var->name, field->offset));
+                    } else if (field->size <= 4) {
+                        emit(std::format("movl %eax, {}(%rcx)    # .{} = ...（偏移 {}，4 字节写入）",
+                            field->offset, var->name, field->offset));
+                    } else {
+                        emit(std::format("movq %rax, {}(%rcx)    # .{} = ...（偏移 {}，8 字节写入）",
+                            field->offset, var->name, field->offset));
+                    }
                     fieldHandled = true;
                 }
             }
@@ -1197,9 +1293,13 @@ void CodeGen::visit(AssignStmt& stmt) {
 // 返回值算进 rax 后就地 leave / ret 撤帧（System V 规定整数返回值在 rax）。
 // ★ 任意位置 return 都能正确退栈：所有局部都锚定在 %rbp 上，leave 一步还原
 //   （leave = movq %rbp,%rsp; popq %rbp，ret 弹返回地址跳回调用方）。
-// demo: return a + 1;（a 在 -8(%rbp)）⇒ movq -8(%rbp),%rax /
+// ★ 撤帧【之前】先就近析构本作用域链上的栈对象（RAII）——有对象才发，
+//   没有则一个字节都不多发（见 emitDtorsOnReturn）。
+// demo: return a + 1;（a 在 -8(%rbp)，无局部对象）⇒ movq -8(%rbp),%rax /
 //       pushq %rax / movq $1,%rax / movq %rax,%rcx / popq %rax /
-//       addq %rcx,%rax / leave / ret
+//       addq %rcx,%rax / leave / ret   ← 无析构，与旧版逐字节相同
+// demo: int f() { Dog d; return 0; } ⇒ movq $0,%rax / pushq %rax /
+//       leaq -16(%rbp),%rdi / callq Dog_dtor / popq %rax / leave / ret
 void CodeGen::visit(ReturnStmt& stmt) {
     if (stmt.value) {
         emitComment("return expr");
@@ -1208,6 +1308,7 @@ void CodeGen::visit(ReturnStmt& stmt) {
     } else {
         emit("movq $0, %rax               # void 返回，结果置 0");
     }
+    emitDtorsOnReturn();   // ★ return 是提前出口，析构必须在这里补（BUGS.md B4）
     emit("leave                         # 恢复栈帧（movq %rbp,%rsp; popq %rbp）");
     emit("ret                           # 返回调用者（从栈上弹出返回地址）");
 }
@@ -1559,6 +1660,32 @@ void CodeGen::visit(UnaryExpr& expr) {
             "for now (line {})", expr.location.line));
     }
 
+    // ── *p 解引用（[expr.unary.op]/1）：先求值拿到【地址】，再间接加载 ──
+    // 与 &x 相反的一步：& 是"算出地址"，* 是"把地址当值读回来"。
+    // ★ 宽度按本项目的既有约定统一 movq（8 字节）—— 与 visit(VarExpr) 加载局部变量
+    //   同一条约定：本项目局部变量一律按 8 字节槽处理（教学简化，见 B3 之外的类型宽度讨论）。
+    //   对照 clang：EmitLoadOfLValue 会按 lvalue 的 AST 类型选 movb/movl/movq。
+    // demo: int a = 5; int* p = &a; *p
+    //       ⇒ movq -16(%rbp), %rax   # rax = p（地址）
+    //          movq (%rax), %rax      # rax = *(rax)
+    if (expr.op == UnaryOp::Deref) {
+        emitExpr(expr.operand);   // rax = 指针的值（即目标地址）
+        // 宽度按【被指类型】选，与 B3 字段写的判据同源。
+        // ★ 这里不能无脑 movq：`*p` 的目标可以是任意左值 —— 局部变量（8B 槽）、
+        //   结构体字段（可能只有 4B）、全局 —— 读 8 字节会越界读到邻居。
+        //   对照 clang：EmitLoadOfLValue 按 lvalue 的 AST 类型选 movb/movl/movq。
+        TypePtr pt = expr.operand->resolvedType;
+        TypePtr pointee = (pt && pt->isPointer()) ? pt->pointeeType : nullptr;
+        if (pointee && pointee->isBool()) {
+            emit("movzbq (%rax), %rax        # 解引用：按 1 字节读 + 零扩展");
+        } else if (pointee && pointee->isInt()) {
+            emit("movl (%rax), %eax          # 解引用：按 4 字节读（movl 自动清高 32 位）");
+        } else {
+            emit("movq (%rax), %rax          # 解引用：按 8 字节读");
+        }
+        return;
+    }
+
     emitExpr(expr.operand);
 
     switch (expr.op) {
@@ -1574,6 +1701,10 @@ void CodeGen::visit(UnaryExpr& expr) {
             // 上面已提前 return（取地址不走"先求值"路径），此处不可达
             throw std::runtime_error(
                 "[CodeGen Error] UnaryOp::Addr should be handled before emitExpr");
+        case UnaryOp::Deref:
+            // 同上：解引用也已提前 return（它要的是地址而非值），此处不可达
+            throw std::runtime_error(
+                "[CodeGen Error] UnaryOp::Deref should be handled before emitExpr");
     }
 }
 
@@ -1658,7 +1789,11 @@ void CodeGen::visit(CallExpr& expr) {
             // 与 emitFunction 发射的标签、vtable 表项保持一致；
             // 标准 GCC ABI 下应为 _ZN3Dog5speakEv 形式
             std::string funcName;
-            if (objType && objType->isClass()) {
+            if (!mem->resolvedCalleeSymbol.empty()) {
+                // 成员模板实例：符号由 Sema 推导+实例化后回填
+                // （`S_id_int` 这种——同一方法名的多个实例必须各有符号）
+                funcName = mem->resolvedCalleeSymbol;
+            } else if (objType && objType->isClass()) {
                 funcName = objType->name + "_" + mem->memberName;
             } else {
                 funcName = mem->memberName;

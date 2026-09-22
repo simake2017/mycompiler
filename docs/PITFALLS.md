@@ -31,7 +31,7 @@
 | [I3](#i3-实例名清洗不是单射) | 实例化 | `Box<int*>` 与 `Box<int&>` 撞汇编符号 |
 | [I4](#i4-蓝图摘要读错了形参表) | 实例化 | 读 `typeParams` 渲染 ⇒ NTTP 被打成 `typename N` |
 | [F1](#f1-istypekeyword-缺-kwconst) | 前端 | `isTypeKeyword()` 缺 `KwConst` ⇒ 语句层 `const` 声明不可解析 |
-| [F2](#f2-演示代码固定传-double-去填-nttp-槽) | 前端 | 按类型传实参 ⇒ NTTP 槽被塞进一个类型 |
+| [F2](#f2-演示代码固定传-double-去填-nttp-槽) | 前端 | 按类型传实参 ⇒ NTTP 槽被塞进一个类型（**且只看一位**） |
 | [S1](#s1-resolvetype-查不到就静默放行) | sema | 符号表查不到就放行 ⇒ `Undeclared q;` 静默通过 |
 | [S2](#s2-类内别名的登记时机) | sema | 别名登记太晚 ⇒ 类体内 `Int a;` 报错 |
 | [S3](#s3-继承布局边扫边放) | sema | 边扫边放 offset ⇒ 非多态基类与 `_vptr` 重叠 |
@@ -44,6 +44,7 @@
 | [S10](#s10-候选池混进了模板实例) | sema | 模板实例抢走精确匹配 ⇒ 链接失败 |
 | [S11](#s11-pass-23-漏掉命名空间) | sema | 扁平分派漏命名空间（**且有一个镜像 bug**） |
 | [S12](#s12-实参个数校验读错形参表) | sema | 读 `typeParams` 数形参 ⇒ NTTP 被当成类型 |
+| [S13](#s13-放宽数据结构时忘了拆守卫) | sema | 放宽 `specPattern` 却留着旧守卫 ⇒ 值位偏特化被整条掐死 |
 
 ---
 
@@ -530,7 +531,16 @@ template <class T> using Vec = MyPtr<T>;       // 别名展开后仍是 MyPtr<T>
 一律用 `templateParams`：`kind == Type` → `typename X`，否则打
 `nonType->toString() + " " + name`。
 
-**回归用例**：`tests/tmpl/test_tmpl_21..26` 的蓝图行。
+**修法落地**
+
+修 `src/parser.cpp` 的 blueprint summary 循环（`decl->typeParams.size()` →
+`decl->templateParams.size()`，按 `kind` 分支渲染）。同一份判断在
+`template_instantiation.cpp` 的 `║ Blueprint:` 行里已经是对的——**又是同一个
+"两处写同一条语义判断、只改了一处"的形状**（对比 `emitFunction` 里
+`hasThis` 被复制成两份、加 static 特例时只改了一份那次）。
+
+**回归用例**：`tests/tmpl/test_tmpl_21..26` 的蓝图行 —— 现在打的是
+`template <int N> class Buf { ... }`（此前误打成 `typename N`）。
 
 ---
 
@@ -588,7 +598,24 @@ int main() {
 **教训**：凡是「按位次填实参」的地方，都必须先问该位的 `kind` ——
 这正是 [T2](#t2-模板实参不能一律存成-typeptr) 那个设计的直接后果。
 
-**回归用例**：`tests/tmpl/test_tmpl_22_nttp_mixed.cpp`（`Pair<int,8>`）。
+**残留缺口（本轮补齐）**
+
+上面的修法**只看了第二位** `templateParams[1].kind`。于是
+`template <bool B, class T>`（**首位**是 NTTP）落进"两类型形参"分支，
+被喂 `<int, double>` ⇒ 实例化抛
+`template argument 1 for 'enable_if' ('B') must be a value, but 'int' is a type`。
+
+修法：在两形参分支里**先判 `templateParams[0].kind`**，首位是 NTTP 时走
+`<true, int>`（值 + 类型混排）。
+
+★ 这是"只取一位就下结论"的通病：形参表是**逐位**结构，
+判据必须逐位看，写死"看第 N 位"等于把其他位当成常量。
+同一族还有 [S12](#s12-实参个数校验读错形参表)（读错表）与
+[S13](#s13-放宽数据结构时忘了拆守卫)（旧前提没跟着放宽）。
+
+**回归用例**：`tests/tmpl/test_tmpl_22_nttp_mixed.cpp`（`Pair<int,8>`）、
+`tests/tmpl/test_tmpl_52_nttp_spec_pattern.cpp`（Phase 4 演示
+`enable_if<true,int>`）。
 
 ---
 
@@ -840,3 +867,43 @@ Pass 2/3 扁平遍历 `unit.declarations`，漏掉了命名空间内的类与函
 
 **同族**：[I4](#i4-蓝图摘要读错了形参表) 是同一个两张表问题的另一个出口。
 ★ 只要 `TemplateDecl` 还并存两张形参表，"读错表"就还会再犯。
+（I4 已于本轮一并修掉，两个出口现在都读 `templateParams`。）
+
+---
+
+### S13. 放宽数据结构时忘了拆守卫
+
+**症状**
+
+`enable_if<true, T>` 的值位偏特化写对了，日志里却完全看不到特化匹配，
+只有一行"实参含非类型值，跳过特化匹配"，然后一路走主模板。
+
+**根因**
+
+`selectClassTemplate` 开头有一段**基于旧假设**的守卫：
+
+```cpp
+std::vector<TypePtr> argTypes;
+bool allTypeArgs = true;
+for (const auto& a : args) {
+    if (!a.isType()) { allTypeArgs = false; break; }   // 值实参 ⇒ 放弃特化
+    argTypes.push_back(a.type);
+}
+```
+
+它的前提是"`specPattern` 只含类型"。本轮把 `specPattern` 改成了
+`vector<TemplateArg>`（值位可入表），**这个前提就没了**——但守卫还在，
+于是新能力被旧守卫整条掐死。
+
+★ 这是 [T2](#t2-模板实参不能一律存成-typeptr)（实参一律存 `TypePtr`）的
+**下游回声**：同一个简化假设会同时写进「数据结构的类型」和
+「使用它的守卫」两处。放宽假设时只改类型、不拆守卫，
+结果是**编译通过、日志正常、功能全错**——比编译报错难查得多。
+
+**修法**
+
+拆掉守卫，实参表原样进匹配；值位由 `matchPattern` 的新分支逐位比
+（同形态 + 同值，不产生绑定）。
+
+**回归用例**：`tests/tmpl/test_tmpl_52_nttp_spec_pattern.cpp`（值位选中/不选中/
+全特化带值位），`PartialSpec.NttpPatternPosition*`（4 例）。

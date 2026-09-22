@@ -66,8 +66,14 @@ public:
     static size_t readWord(const std::string& s, size_t pos, std::string& out) {
         return Preprocessor::readWord(s, pos, out);
     }
+    // 单行调用：跨行状态即刻丢弃（只为覆盖单行语义；跨行场景走下面的重载）
     static std::string stripComment(const std::string& line) {
-        return Preprocessor::stripComment(line);
+        bool inBlock = false;
+        return Preprocessor::stripComment(line, inBlock);
+    }
+    // 跨行调用：状态由调用方保管，模拟 processText 的逐行循环
+    static std::string stripComment(const std::string& line, bool& inBlock) {
+        return Preprocessor::stripComment(line, inBlock);
     }
     static std::string trim(const std::string& s) {
         return Preprocessor::trim(s);
@@ -439,6 +445,28 @@ TEST(LexUtils, StripComment) {
     // 块注释整体替换为一个空格，原文 "*/" 后的空格保留 → 共两个空格
     showAndExpectEq("块注释→空格", in2, out2, "  int b;");
     showAndExpectEq("串内 // 保留", in3, out3, "x = \"// in str\"; ");
+}
+
+// 18b. stripComment 跨行块注释 —— [lex.phases] 阶段 3：块注释可以跨行。
+//      ★ 这是 B5：修复前逐行调用且无跨行状态，第 2 行起被当代码分词
+//        （'*' 标识符 '*' '/' 四个记号），中文注释还会报 Unexpected character。
+TEST(LexUtils, StripCommentAcrossLines) {
+    bool inBlock = false;
+    auto l1 = PreprocessorTestPeer::stripComment("/*", inBlock);
+    EXPECT_TRUE(inBlock) << "本行没闭合 ⇒ 必须记住「还在注释里」";
+    auto l2 = PreprocessorTestPeer::stripComment(" * ascii", inBlock);
+    EXPECT_TRUE(inBlock) << "中间行仍在注释内（状态未被后续行清掉）";
+    auto l3 = PreprocessorTestPeer::stripComment(" */ int x;", inBlock);
+    EXPECT_FALSE(inBlock) << "见 */ 必须复位";
+
+    showAndExpectEq("行1 独占/*", "/*", l1, " ");
+    showAndExpectEq("行2 注释体", " * ascii", l2, "        ");
+    showAndExpectEq("行3 收尾+代码", " */ int x;", l3, "    int x;");
+
+    // 反例保护：同行闭合的块注释不得残留状态，否则后续行会被整段误吞
+    bool s = false;
+    (void)PreprocessorTestPeer::stripComment("/* a */ int b;", s);
+    EXPECT_FALSE(s) << "同行闭合 ⇒ 状态必须复位";
 }
 
 // 19. trim：去首尾空白
