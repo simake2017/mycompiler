@@ -331,6 +331,10 @@ void MiniLinker::injectRuntime(uint64_t mainAddr) {
     //   ret                      c3
     // .fail:
     //   xor  %eax, %eax          31 c0             分配失败返回 NULL
+    // demo: `new int` ⇒ callq malloc ⇒ 返回 bump 区的【旧】指针（即新块首地址）；
+    //       堆满 64KB ⇒ ja .fail ⇒ 返回 0（NULL）。free 是空操作（bump 分配器不回收）。
+    //       真实日志："[link] 注入运行时: _start @ 0x4000b0 | malloc @ 0x4000c0 (bump)
+    //                 | free @ 0x4000e0 (nop)"
     //   ret                      c3
     put({0x48, 0xa1}); putImm64(heapPtrAddr_);
     put({0x48, 0x01, 0xf8});
@@ -434,6 +438,11 @@ bool MiniLinker::resolveSymbols(LinkResult& res) {
 //   R_X86_64_PC32 : *P = S + A - P       （leaq sym(%rip) / 同段引用）
 //   R_X86_64_PLT32: 同 PC32（不链外部库时 PLT 降级为直接调用）
 //   其中 S = 符号最终地址，A = addend，P = 被修正处的地址
+// demo: 未回填时 .o 里对应位置是 0，全靠 .rela 记账；回填后变成最终虚地址 ——
+//       可观测处：vtable 槽指向 .text 里的函数体、`.quad .Lstr` 指向 .rodata 里的字符串。
+//       真实日志："链接成功：9 个符号决议, 3 条重定位回填, 入口 0x4000b0"
+//       （tests/ctor/test_ctor_01_basic.cpp —— 9 个符号决议 = 定义 + 引用配对，
+//        3 条回填 = 该程序里所有跨节引用；数字随程序而变，不是常量）
 bool MiniLinker::applyRelocations(LinkResult& res) {
     auto mergedBase = [&](int kind) -> uint64_t {
         switch (kind) {

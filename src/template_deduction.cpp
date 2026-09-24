@@ -42,7 +42,7 @@ namespace minicc {
 //   实参 [int, int]  ⇒ 引用位收到非引用实参 ✗ │ 实参 [int&, int] ⇒ T := int ✓
 // 【职责边界】本函数只回答"这一条偏特化匹配不匹配"（逐条试，不含比较）；
 //   "多条都匹配时谁胜"由调用方 selectClassTemplate 用 dominance 循环裁决
-//   [temp.class.order]（semantic_analyzer.cpp:2994 一带，比较器见同文件 :223
+//   [temp.class.order]（semantic_analyzer.cpp 的 selectClassTemplate，比较器
 //   classSpecAtLeastAsSpecialized），见 docs/learn/21。
 // 返回：全部位匹配成功 → true，subst 填好可交付实例化；任一位失败 → false
 bool TemplateDeducer::matchPattern(

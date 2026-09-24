@@ -78,6 +78,8 @@ add_executable(unit_tests
     tests/unit/test_codegen_frame.cpp
     tests/unit/test_codegen_field_write.cpp
     tests/unit/test_ast_visitor.cpp
+    tests/unit/test_symbol_consistency.cpp
+    tests/unit/test_layout_lookup.cpp
     src/preprocessor.cpp
     src/sfinae.cpp
     src/lexer.cpp

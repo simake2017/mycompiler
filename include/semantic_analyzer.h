@@ -548,6 +548,20 @@ private:
     // 成员访问 obj.x / p->x：字段查布局表(得偏移)，方法查类声明
     TypePtr inferMember(MemberExpr& expr);
 
+    // ── 类成员查找的两条通路（[class.member.lookup]）──
+    // ★ 抽出来的理由与 BUGS.md B10 同源：同一条"成员叫什么/是不是它"的判据一旦写成
+    //   两份，就会各自演化出不一致（那里是符号名后缀，这里是"查不查基类"）。
+    //   两条通路共用下面两个原语，谓词只有一处。
+    /** 在【单个类】的方法表里按名字找方法；arity < 0 表示不看参数个数。 */
+    FuncDeclPtr findMethodInClass(const std::string& className,
+                                  const std::string& methodName, int arity) const;
+    /** 沿基类链 BFS 找方法（含本类自身）；返回 nullptr 表示整条链都没有。
+     *  遍历顺序与 inferCall 一致：本类 → 直接基类 → 更远的祖辈。
+     *  declaringClass（可空）回填"在哪个类里命中的"，用于日志里的 via 'X'。 */
+    FuncDeclPtr findMethodInHierarchy(const std::string& className,
+                                      const std::string& methodName,
+                                      std::string* declaringClass = nullptr) const;
+
     // ── auto 占位符（[dcl.spec.auto]/7）──
     // auto 可能被 cv/指针/引用包住（Const(Auto) / Pointer(Auto) / ...），
     // 只认光杆 Auto 的写法会让 const auto、auto*、auto& 全部误报 —— 见 docs/BUGS.md B1。

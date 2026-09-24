@@ -387,8 +387,10 @@ void Preprocessor::handleUndef(const std::string& rest, int line) {
 //   ② canonical 路径 ∈ m_pragmaOnce ⇒ 返回空串（#pragma once 去重，同一物理文件只展开一次）
 //   ③ canonical 路径 ∈ include 栈上 ⇒ 报 "circular #include detected"（防无限递归）
 //   ④ 压栈 → 递归 processText（被包含文件里还可再 #include）→ 弹栈
-// demo: main.cpp:3 的 #include "util.h" ⇒ 日志 "[pp] #include "util.h" → tests/pp/util.h"，
-//       util.h 展开后的全文插入到输出中原来 #include 所在的位置。
+// demo: tests/pp/test_pp_01_include.cpp 的 #include "math_helper.h"
+//       ⇒ 日志 "[pp] #include math_helper.h → tests/pp/math_helper.h"（引号形式先搜【当前文件所在目录】）
+//       同一文件第二次 ⇒ "[pp] #include math_helper.h → skipped (pragma once)"
+//       math_helper.h 展开后的全文插入到输出中原来 #include 所在的位置。
 std::string Preprocessor::handleInclude(const std::string& rest,
                                         const std::string& fileName, int line) {
     if (rest.empty()) ppError("expected filename after #include", fileName, line);

@@ -16,6 +16,14 @@
 //   D. 栈对象 + RAII：v 是栈上类对象，离开 main 块前自动析构
 //
 // 预期：编译通过，运行退出码 0（10 + 20 + 31 == 61 → 返回 0）
+//
+// ✅ 回归点（此处历史上曾恒失败）——【带参成员方法】的符号拼装两侧不一致：
+//     定义点（Sema）：方法名追加“参数个数”后缀 ⇒ IntVec_at_1 / IntVec_set_2
+//     调用点（CodeGen）：硬拼“类名_方法名”       ⇒ IntVec_at / IntVec_set
+//   ⇒ 报 "undefined reference to 'IntVec_at'"
+//   修法：Sema 把 at()/set() 的符号回填进 IndexExpr（atSymbol / setSymbol），
+//   CodeGen 优先用回填值 —— 与 MemberExpr 的 resolvedCalleeSymbol 同一套路；
+//   普通带参成员调用 `c.f(1)` 走的是同一处修复。
 // =============================================================================
 
 // 定容 4 槽的整数容器（不依赖 malloc —— 模板版/扩容版见 test_stl_03/04）

@@ -1187,7 +1187,14 @@ void CodeGen::visit(AssignStmt& stmt) {
             emit("movq %rax, %rdi             # this = 容器对象地址（第 0 参数）");
             emit("popq %rsi                   # arg1: 弹出下标 i 到 rsi");
             emit("popq %rdx                   # arg2: 弹出右值 value 到 rdx");
-            emit(std::format("callq {}_set              # 调用 v.set(i, value) 完成写入", className));
+            // ★ 符号取 Sema 回填值 —— 不能硬拼 `类名_set`：Sema 给带参成员方法名
+            //   加了"参数个数"后缀（IntVec_set_2），硬拼得到的是 IntVec_set ⇒
+            //   链接期 undefined reference。
+            //   宽度仍按"硬拼时的旧名字"算 ⇒ 未回填路径的列对齐逐字节不变。
+            std::string setSymbol = idx->setSymbol.empty()
+                                  ? className + "_set" : idx->setSymbol;
+            emit(std::format("callq {:<{}}# 调用 v.set(i, value) 完成写入",
+                             setSymbol, 18 + className.size()));
         } break;
         case NodeKind::Var: {
             auto var = std::static_pointer_cast<VarExpr>(stmt.target);
@@ -1991,7 +1998,7 @@ void CodeGen::visit(MemberExpr& expr) {
 //   set()（在 visit(AssignStmt) 里）。inferIndex 已校验 at() 存在且形参匹配。
 // demo: v[i]（v 是栈上容器对象，i 在 -16(%rbp)）⇒
 //       leaq -24(%rbp),%rax / pushq %rax / movq -16(%rbp),%rax / pushq %rax /
-//       popq %rsi / popq %rdi / callq Vector_at
+//       popq %rsi / popq %rdi / callq Vector_at_1
 void CodeGen::visit(IndexExpr& expr) {
     emitComment("subscript v[i] → desugar to v.at(i)");
 
@@ -2012,7 +2019,11 @@ void CodeGen::visit(IndexExpr& expr) {
 
     emit("popq %rsi                   # arg1: 弹出下标到 rsi");
     emit("popq %rdi                   # this: 弹出容器地址到 rdi");
-    emit(std::format("callq {}_at                # 调用 v.at(i) 读取元素", className));
+    // ★ 同上：符号取 Sema 回填值（IntVec_at_1），空则退回硬拼（旧行为）。
+    std::string atSymbol = expr.atSymbol.empty()
+                         ? className + "_at" : expr.atSymbol;
+    emit(std::format("callq {:<{}}# 调用 v.at(i) 读取元素",
+                     atSymbol, 19 + className.size()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

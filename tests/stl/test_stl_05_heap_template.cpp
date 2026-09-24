@@ -9,6 +9,14 @@
 //   —— 这正是 unique_ptr 存在的原因（见 test_stl_01）。
 //
 // 预期：编译通过，运行退出码 0
+//
+// ✅ 回归点（此处历史上曾恒失败）——【带参成员方法】的符号拼装两侧不一致：
+//     定义点（Sema）：方法名追加“参数个数”后缀 ⇒ Box_int_set_*
+//     调用点（CodeGen）：硬拼“类名_方法名”       ⇒ Box_int_set
+//   ⇒ 报 "undefined reference to 'Box_int_set'"
+//   修法：Sema 把 at()/set() 的符号回填进 IndexExpr（atSymbol / setSymbol），
+//   CodeGen 优先用回填值 —— 与 MemberExpr 的 resolvedCalleeSymbol 同一套路；
+//   普通带参成员调用 `c.f(1)` 走的是同一处修复。
 // =============================================================================
 
 template<typename T>

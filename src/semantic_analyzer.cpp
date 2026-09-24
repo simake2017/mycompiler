@@ -1527,9 +1527,16 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 // ═══ 主基类（primary base）═══
                 // 合并字段到主字段列表 + 合并 vtable 到主表
                 // 字段名不加限定前缀（保持单继承兼容）
-                for (auto& baseField : baseType->classLayout.fields) {
-                    FieldInfo fi = baseField;
+                for (size_t k = 0; k < baseType->classLayout.fields.size(); ++k) {
+                    FieldInfo fi = baseType->classLayout.fields[k];
+                    if (fi.declaredName.empty()) fi.declaredName = fi.bareName();
                     if (fi.sourceClass.empty()) fi.sourceClass = baseName;
+                    // ★ viaBase / baseFieldIndex 必须【覆盖】成本层的值：基类记录里那对值
+                    //   指的是【它那一层】的子对象，照抄会让偏移算到错的子对象上
+                    //   （BUGS.md B15：X : P, B 里从 P 带出的 "B.x"，其 viaBase 在 P 层是
+                    //   "B"，到 X 层若不改成 "P" 就会被当成 X 的直接 B 子对象 ⇒ +8 变 +16）。
+                    fi.viaBase = baseName;
+                    fi.baseFieldIndex = static_cast<int>(k);
                     decl->fields.push_back(fi);
                 }
                 for (auto& baseEntry : baseType->classLayout.vtableEntries) {
@@ -1552,14 +1559,13 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             } else if (baseType->classLayout.hasVTable) {
                 // ═══ 次基类（secondary base）═══
                 // 字段带 "BaseName." 限定前缀；vtable 条目存入独立次表 entries
-                for (auto& baseField : baseType->classLayout.fields) {
-                    FieldInfo fi = baseField;
-                    // 提取裸名（已有前缀则去掉）
-                    std::string rawName = fi.name;
-                    auto dot = rawName.find('.');
-                    if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
-                    fi.name = baseName + "." + rawName;
+                for (size_t k = 0; k < baseType->classLayout.fields.size(); ++k) {
+                    FieldInfo fi = baseType->classLayout.fields[k];
+                    fi.declaredName = fi.bareName();          // 权威裸名先落袋
+                    fi.name = baseName + "." + fi.declaredName;
                     fi.sourceClass = baseName;
+                    fi.viaBase = baseName;
+                    fi.baseFieldIndex = static_cast<int>(k);
                     decl->fields.push_back(fi);
                 }
 
@@ -1587,13 +1593,13 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             } else {
                 // ═══ 非多态基类 ═══
                 // 字段带限定前缀，无 vtable 贡献
-                for (auto& baseField : baseType->classLayout.fields) {
-                    FieldInfo fi = baseField;
-                    std::string rawName = fi.name;
-                    auto dot = rawName.find('.');
-                    if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
-                    fi.name = baseName + "." + rawName;
+                for (size_t k = 0; k < baseType->classLayout.fields.size(); ++k) {
+                    FieldInfo fi = baseType->classLayout.fields[k];
+                    fi.declaredName = fi.bareName();          // 权威裸名先落袋
+                    fi.name = baseName + "." + fi.declaredName;
                     fi.sourceClass = baseName;
+                    fi.viaBase = baseName;
+                    fi.baseFieldIndex = static_cast<int>(k);
                     decl->fields.push_back(fi);
                 }
 
@@ -1617,8 +1623,13 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
         // 用例  struct A{int x;};  struct P{virtual void f();};  struct D : A, P {};
         //       ⇒ primary = P（不是首基类 A）⇒ [relocate] P@0、A@8（误用 bi==0 当 primary
         //         则 A@0 与 _vptr 重叠）
-        // 简化声明：全部基类都非多态时，第一个基类视作 primary（占 0），与 computeClassLayout
-        //   的字段放置规则保持一致。
+        // 简化声明：全部基类都非多态、且【本类自身也非多态】时，第一个基类视作 primary
+        //   （占 0），与 computeClassLayout 的字段放置规则保持一致。
+        // ★ 补上的第三种情形（BUGS.md B11）：本类【自身】多态、而所有基类都非多态 ⇒
+        //   Itanium 下【没有主基类】—— primary base 只在动态基类里选，一个都没有时
+        //   vptr 自己占 offset 0，全部基类子对象从 8 起摆。旧实现把首基类当 primary 摆到
+        //   0，而本类自己的 _vptr 也要占 0 ⇒ 两者重叠（B.x 压 _vptr，写字段即写坏虚表
+        //   指针，随后虚调用跳飞到 0x3）。
         if (!classType->classLayout.bases.empty()) {
             size_t primaryIdx = 0;
             bool anyPoly = false;
@@ -1629,36 +1640,57 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                     break;
                 }
             }
-            for (size_t i = 0; i < classType->classLayout.bases.size(); ++i)
-                classType->classLayout.bases[i].isPrimary = (i == primaryIdx);
+            // 本类自身是否多态：无多态基类时 vtable 只可能来自本类，而"覆写基类虚函数"
+            // 也要求基类先有多态 ⇒ 此刻只需看有没有带 virtual 关键字的方法。
+            // ⚠ 判据必须与下方方法注册循环同源（那里才最终置 hasVTable）—— 位置却被夹在
+            //   前面，因为子对象偏移随后就要被 thunkAdjust 用掉。
+            bool selfPoly = false;
+            if (!anyPoly) {
+                for (auto& m : decl->methods) {
+                    if (m->isVirtual) { selfPoly = true; break; }
+                }
+            }
+            bool noPrimary = (!anyPoly && selfPoly);
 
-            // place 恒从 primary 子对象尾部起算 —— 无论 primary 是多态基类（真 primary）
-            // 还是全非多态时的首个基类（视作 primary）。
-            // ★ 不能用 if (anyPoly) 守卫：全非多态时 place 会停在 0，第二个基类被
-            //   alignTo(0,8)=0 放到 offset 0，与首个基类字段重叠（x@0 与 y@0 互踩）。
-            uint32_t place = 0;
-            {
+            for (size_t i = 0; i < classType->classLayout.bases.size(); ++i)
+                classType->classLayout.bases[i].isPrimary = (!noPrimary && i == primaryIdx);
+
+            // place = 已占用区间的右端：有 primary 时是 primary 子对象尾部；无 primary
+            //   （本类自身多态）时是 vptr 之后的 8。
+            // ★ 不能用"全非多态 ⇒ place=0"的写法：那会让第二个基类被 alignTo(0,8)=0 放到
+            //   offset 0，与首个基类字段重叠（x@0 与 y@0 互踩）。
+            uint32_t place = noPrimary ? 8u : 0u;
+            if (!noPrimary) {
                 auto pIt = m_classTypes.find(
                     classType->classLayout.bases[primaryIdx].baseClassName);
                 if (pIt != m_classTypes.end())
                     place = pIt->second->classLayout.totalSize; // primary 尾部
             }
-            (void)anyPoly; // anyPoly 仅保留语义说明作用，不再参与 place 计算
             for (size_t i = 0; i < classType->classLayout.bases.size(); ++i) {
                 auto& sub = classType->classLayout.bases[i];
-                if (sub.isPrimary) { sub.offset = 0; continue; }
+                if (sub.isPrimary) {
+                    sub.offset = 0;
+                    continue;   // primary 恒 0，无需打印（保持既有日志逐字节不变）
+                }
                 sub.offset = alignTo(place, 8); // 这里非常关键, 这里会对结束位置再做一次偏移，彻底锁死对应的位置
                 auto bIt = m_classTypes.find(sub.baseClassName);
                 place = sub.offset + (bIt != m_classTypes.end()
                     ? bIt->second->classLayout.totalSize : 0);
-                std::cout << std::format("    ↳ [relocate] '{}' → offset {} (primary='{}' 占 0)\n",
-                    sub.baseClassName, sub.offset,
-                    classType->classLayout.bases[primaryIdx].baseClassName);
+                std::string why = noPrimary
+                    ? std::string("本类自身多态 ⇒ 无主基类，_vptr 占 0")
+                    : std::format("primary='{}' 占 0",
+                          classType->classLayout.bases[primaryIdx].baseClassName);
+                std::cout << std::format("    ↳ [relocate] '{}' → offset {} ({})\n",
+                    sub.baseClassName, sub.offset, why);
             }
         }
 
         // 追加自身字段到最后
         for (auto& f : ownFields) {
+            // 自身字段：viaBase 留空（"住在本类里"）、下标 -1；权威裸名就是解析期那个名字
+            if (f.declaredName.empty()) f.declaredName = f.name;
+            f.viaBase.clear();
+            f.baseFieldIndex = -1;
             decl->fields.push_back(f);
         }
     }
@@ -1693,10 +1725,14 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
         //   类型永远是 complete 的注册版（ASTContext::getASTRecordLayout 按需递归构建+缓存）。
         field.type = resolveType(field.type);
 
+        if (field.declaredName.empty()) field.declaredName = field.bareName();
         FieldInfo fi;
         fi.name = field.name;
         fi.type = field.type;
         fi.access = field.access;
+        fi.declaredName = field.declaredName;
+        fi.viaBase = field.viaBase;
+        fi.baseFieldIndex = field.baseFieldIndex;
         classType->classLayout.fields.push_back(fi);
 
         std::cout << std::format("    field: {} : {}\n",
@@ -1956,13 +1992,10 @@ void SemanticAnalyzer::computeClassLayout(ClassDeclPtr decl) {
     //   ② 逐字段放置（见下）。
     // ★ primary 的判据必须是"第一个多态基类"，不能用 bi==0 —— 两者打架时（非多态基类
     //   声明在前）会选出不同的 primary，A.offset 与 P.offset 同为 0，A.x 压在 _vptr 上。
-    std::string currentPrimaryBase;
-    for (auto& base : classType->classLayout.bases) {
-        if (base.isPrimary) {
-            currentPrimaryBase = base.baseClassName; // 找到主基类
-            break;
-        }
-    }
+    // ★ 旧实现还要在这里先挑出"主基类是谁"，再据此把字段分派到两条分支（主基类走
+    //   "直接复用偏移"、次基类走"子对象偏移 + 内部偏移"）。现在两条分支合并成
+    //   `sub->offset + src->offset`（见下）—— 主基类 offset 恒为 0，式子自动退化，
+    //   不必再知道"谁是主基类"。挑主基类的那段随之删除。
 
     // ── 逐字段放置 ──
     // 字段顺序：[主基类字段...][次基类1字段...][次基类2字段...][自身字段...]
@@ -1985,56 +2018,11 @@ void SemanticAnalyzer::computeClassLayout(ClassDeclPtr decl) {
     }
 
     for (auto& field : decl->fields) {
-        std::string srcClass = field.sourceClass;
-        if (srcClass.empty()) srcClass = decl->name;
-
-        if (srcClass == currentPrimaryBase) {
-            // 主基类字段：直接用基类布局中的偏移（主基类 offset=0，共享 _vptr）
-            // 查找该字段在基类布局中的原始偏移
-            auto baseIt = m_classTypes.find(srcClass);
-            if (baseIt != m_classTypes.end()) {
-                std::string rawName = field.name;
-                auto dot = rawName.find('.');
-                if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
-                for (auto& bf : baseIt->second->classLayout.fields) {
-                    std::string bfRaw = bf.name;
-                    auto bfdot = bfRaw.find('.');
-                    if (bfdot != std::string::npos) bfRaw = bfRaw.substr(bfdot + 1);
-                    if (bfRaw == rawName) {
-                        field.offset = bf.offset; // 字段的对齐，已经在自身计算的时候对齐过了
-                        field.size = bf.size;
-                        break;
-                    }
-                }
-            }
-        } else if (srcClass != decl->name) {
-            // 次基类字段：base.offset + 基类内部偏移
-            for (auto& base : classType->classLayout.bases) {
-                if (base.baseClassName == srcClass) {
-                    auto baseIt = m_classTypes.find(srcClass);
-                    if (baseIt != m_classTypes.end()) {
-                        std::string rawName = field.name;
-                        auto dot = rawName.find('.');
-                        if (dot != std::string::npos) rawName = rawName.substr(dot + 1);
-                        for (auto& bf : baseIt->second->classLayout.fields) {
-                            std::string bfRaw = bf.name;
-                            auto bfdot = bfRaw.find('.');
-                            if (bfdot != std::string::npos) bfRaw = bfRaw.substr(bfdot + 1);
-                            if (bfRaw == rawName) {
-                                field.offset = base.offset + bf.offset; // 这里会添加这个类的基础偏移位置
-                                field.size = bf.size;
-                                break;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        } else {
-            // 自身字段：从基类子对象尾部继续
-            // ── size 与 align 分离（对照 clang LayoutField 的 TI.Width / TI.Align）──
-            // ★ 类类型字段的 align ≠ size：Five{bool×5} size=5 但 align=1，拿 size 当
-            //   align 会推出 alignTo(4,5)=9 这种非 2 幂的错位布局。
+        // ── 自身字段（viaBase 为空）：从基类子对象尾部继续 ──
+        // ── size 与 align 分离（对照 clang LayoutField 的 TI.Width / TI.Align）──
+        // ★ 类类型字段的 align ≠ size：Five{bool×5} size=5 但 align=1，拿 size 当
+        //   align 会推出 alignTo(4,5)=9 这种非 2 幂的错位布局。
+        if (field.viaBase.empty()) {
             uint32_t fieldAlign = alignOf(field.type);   // 对齐要求（成员 align 递归 max）
             uint32_t fieldSize = field.type->sizeInBytes(); // 实际占用字节, 这里的字节数就是实际 resolveType 解析出来的字节数
             // 对齐的精髓就是 起始地址要能够 整除 filedAlign
@@ -2043,7 +2031,38 @@ void SemanticAnalyzer::computeClassLayout(ClassDeclPtr decl) {
             field.size = fieldSize;
             currentFieldOffset += fieldSize; // 加上这个字段的长度，等于当前位置
             maxAlign = std::max(maxAlign, fieldAlign);
+            continue;
         }
+
+        // ── 继承字段：① 找到装着它的那个【直接基类子对象】 ② 按 baseFieldIndex 取出
+        //    该基类布局里那条记录的原始偏移 ⇒ offset = 子对象偏移 + 内部偏移（Itanium）
+        // ★ 主基类子对象 offset 恒为 0（Itanium primary base optimization，D* → A* 是
+        //   no-op 转换）⇒ 本式对它退化成"直接复用基类偏移"，与旧实现同值。
+        // ★ 旧实现靠 name 字符串反查基类字段（剥第一个点再比裸名 + 找第一个命中），
+        //   在"两条记录的显示名相同"时会认错人（BUGS.md B13/B15）—— 换成下标后，
+        //   名字怎样都无所谓，与 clang 的 getFieldIndex() 一致。
+        const BaseSubobject* sub = nullptr;
+        for (auto& base : classType->classLayout.bases) {
+            if (base.baseClassName == field.viaBase) { sub = &base; break; }
+        }
+        auto baseIt = m_classTypes.find(field.viaBase);
+        const FieldInfo* src = nullptr;
+        if (baseIt != m_classTypes.end()) {
+            auto& bfields = baseIt->second->classLayout.fields;
+            if (field.baseFieldIndex >= 0 &&
+                static_cast<size_t>(field.baseFieldIndex) < bfields.size()) {
+                src = &bfields[field.baseFieldIndex];
+            }
+        }
+        if (sub && src) {
+            field.offset = sub->offset + src->offset;
+            field.size   = src->size;
+            continue;
+        }
+        // 兜底：viaBase/下标缺失（不该发生）⇒ 保留扁平化时拷贝来的偏移
+        std::cout << std::format(
+            "    ⚠ [layout] 字段 '{}' 的 viaBase='{}' 无法定位（下标 {}），沿用扁平化偏移 {}\n",
+            field.name, field.viaBase, field.baseFieldIndex, field.offset);
     }
 
     offset = currentFieldOffset;
@@ -3301,16 +3320,19 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
                 if (!searched.insert(clsName).second) continue;
                 auto classIt = m_classDecls.find(clsName);
                 if (classIt != m_classDecls.end()) {
-                    for (auto& method : classIt->second->methods) {
-                        if (method->name == funcName &&
-                            method->parameters.size() == argTypes.size()) {
-                            std::cout << std::format(
-                                "{}[call] {}.{}({} args) → {}    [class-scoped member call{}]\n",
-                                inferIndent(), objType->name, funcName, argTypes.size(),
-                                method->returnType ? method->returnType->toString() : "?",
-                                clsName != objType->name ? std::format(" via '{}'", clsName) : "");
-                            return method->returnType;
-                        }
+                    if (auto method = findMethodInClass(clsName, funcName,
+                                                        static_cast<int>(argTypes.size()))) {
+                        // ★ 回填符号：CodeGen 硬拼 `类名_方法名` 拼不出带参方法的
+                        //   真符号 —— Sema 给带参成员方法名加了"参数个数"后缀
+                        //   （IntVec_at_1 / IntVec_set_2），硬拼得到的是 IntVec_at。
+                        //   虚调用不受影响：CodeGen 在前面的 vtable 分支就 return 了。
+                        mem->resolvedCalleeSymbol = method->mangledName;
+                        std::cout << std::format(
+                            "{}[call] {}.{}({} args) → {}    [class-scoped member call{}]\n",
+                            inferIndent(), objType->name, funcName, argTypes.size(),
+                            method->returnType ? method->returnType->toString() : "?",
+                            clsName != objType->name ? std::format(" via '{}'", clsName) : "");
+                        return method->returnType;
                     }
                     // ── 成员模板（[temp.mem]）：普通方法表里没有，查成员的模板表 ──
                     // ★ 位置刻意放在"方法表查完之后"：普通成员函数优先（重载决议里
@@ -4237,6 +4259,49 @@ bool SemanticAnalyzer::isAtLeastAsSpecialized(TemplateDeclPtr a, TemplateDeclPtr
 // │       不剥掉就会误报 "Cannot access member on non-class type 'Vec&&'"
 // │ 找不到  error("No member 'x' in class 'C'")
 // └────────────────────────────────────────────────────────────────────────────
+// ── 类成员查找的两个原语（[class.member.lookup]）────────────────────────────
+// ★ 为什么抽出来：成员访问（inferMember）与成员调用（inferCall）是两条通路，但"一个类
+//   有没有叫这个名字的方法"必须是【同一个判据】—— 写成两份就会各自演化（BUGS.md B10
+//   的根因正是同一规则两处实现不一致；B12 则是其中一处漏了基类链）。此处收口：
+//   谓词只有 findMethodInClass 一处，层次遍历只有 findMethodInHierarchy 一处。
+// 对照 clang：两条通路最终都落到 LookupResult（DeclContext::lookup 沿 base 链）+ 重载决议。
+FuncDeclPtr SemanticAnalyzer::findMethodInClass(const std::string& className,
+                                                const std::string& methodName,
+                                                int arity) const {
+    auto it = m_classDecls.find(className);
+    if (it == m_classDecls.end()) return nullptr;
+    for (auto& method : it->second->methods) {
+        if (method->name != methodName) continue;
+        // arity < 0 ⇒ 不看参数个数（`d.g` 这种没有实参可数，无法据此筛选）
+        if (arity >= 0 && method->parameters.size() != static_cast<size_t>(arity)) continue;
+        return method;
+    }
+    return nullptr;
+}
+
+FuncDeclPtr SemanticAnalyzer::findMethodInHierarchy(const std::string& className,
+                                                    const std::string& methodName,
+                                                    std::string* declaringClass) const {
+    // 遍历顺序刻意与 inferCall 的成员方法搜索保持逐字一致（基类名 insert 到队首、
+    // 从队尾取）—— 否则"两个基类都有同名方法"时两条通路会选中不同的那一个。
+    std::vector<std::string> searchQueue = {className};
+    std::set<std::string> searched;
+    while (!searchQueue.empty()) {
+        std::string clsName = searchQueue.back();
+        searchQueue.pop_back();
+        if (!searched.insert(clsName).second) continue;
+        if (auto method = findMethodInClass(clsName, methodName, -1)) {
+            if (declaringClass) *declaringClass = clsName;
+            return method;
+        }
+        auto it = m_classDecls.find(clsName);
+        if (it == m_classDecls.end()) continue;
+        for (auto& bn : it->second->baseClassNames)
+            searchQueue.insert(searchQueue.begin(), bn);
+    }
+    return nullptr;
+}
+
 TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
     m_inferDepth++;
     TypePtr objType = inferType(expr.object);
@@ -4270,7 +4335,23 @@ TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
     }
 
     // 查找字段
-    auto fieldInfo = actualType->classLayout.findField(expr.memberName);
+    // ★ 歧义必须先于"取第一条"（[class.member.lookup]/8）：两个不同基类子对象各有一个
+    //   同名成员时，真 C++ 是 ill-formed，而"先到先得"会静默绑到其中一个 —— 最坏的一类
+    //   错误（能编译、能跑、结果错）。BUGS.md B13 的现场就是布局打印出两条同名
+    //   "A.name"、第二条偏移还算成 0。
+    auto fieldMatches = actualType->classLayout.findFields(expr.memberName);
+    if (fieldMatches.size() > 1) {
+        std::string where;   // 每条命中都点出"经哪个子对象、显示名是什么"
+        for (auto* f : fieldMatches) {
+            if (!where.empty()) where += "、";
+            where += std::format("经 '{}' 的 '{}'",
+                f->viaBase.empty() ? std::string("(本类)") : f->viaBase, f->name);
+        }
+        error(std::format(
+            "Member '{}' is ambiguous in class '{}': found in {} base-class subobjects ({})",
+            expr.memberName, actualType->name, fieldMatches.size(), where), expr.location);
+    }
+    auto fieldInfo = fieldMatches.empty() ? nullptr : fieldMatches.front();
     if (fieldInfo) {
         std::cout << std::format(
             "{}[member] {}.{} → {}    (offset={}, size={})\n",
@@ -4281,20 +4362,22 @@ TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
         return fieldInfo->type;
     }
 
-    // 查找方法
-    auto classIt = m_classDecls.find(actualType->name);
-    if (classIt != m_classDecls.end()) {
-        for (auto& method : classIt->second->methods) {
-            if (method->name == expr.memberName) {
-                std::cout << std::format(
-                    "{}[member] {}.{}() → {}    (method{})\n",
-                    inferIndent(),
-                    actualType->name, expr.memberName,
-                    method->returnType ? method->returnType->toString() : "?",
-                    method->isVirtual ? ", virtual" : "");
-                return method->returnType;
-            }
-        }
+    // 查找方法 —— 走【类作用域 + 基类链】（[class.member.lookup]）
+    // ★ 修复 BUGS.md B12：这里此前只扫本类的方法表，不沿 baseClassNames 走。字段能查到
+    //   是因为字段已被扁平化进 classLayout.fields，而方法没有扁平化 ⇒ `D d; d.g()`
+    //   （g 在基类 A）报 "No member 'g' in class 'D'"。更具讽刺的是 inferCall 另有一条
+    //   搜基类的路径，但它在更早的 inferType(callee) 就被这里的 error() 挡死了 ——
+    //   同一条查找规则写在两处、只有一处带基类链，正是 B10 那类"双份判据"的翻版。
+    std::string declCls;
+    if (auto method = findMethodInHierarchy(actualType->name, expr.memberName, &declCls)) {
+        std::cout << std::format(
+            "{}[member] {}.{}() → {}    (method{}{})\n",
+            inferIndent(),
+            actualType->name, expr.memberName,
+            method->returnType ? method->returnType->toString() : "?",
+            method->isVirtual ? ", virtual" : "",
+            declCls != actualType->name ? std::format(" via '{}'", declCls) : "");
+        return method->returnType;
     }
 
     // ── 成员模板（[temp.mem]）：名字存在，但"是哪一个函数"要等实参 ──
@@ -4373,6 +4456,19 @@ TypePtr SemanticAnalyzer::inferIndex(IndexExpr& expr) {
             "Class '{}' has no at() method —— subscript requires the "
             "at()/set() convention (see docs/learn/12)", actualType->name),
             expr.location);
+    }
+
+    // ★ 回填两个约定方法的【符号】：CodeGen 不能硬拼 `类名_at` / `类名_set`
+    //   —— Sema 给带参成员方法名加了"参数个数"后缀（IntVec_at_1 / IntVec_set_2），
+    //   硬拼得到的是 IntVec_at，链接期 undefined reference。
+    //   set 只回填不强制：类里没有 set 时留空串，CodeGen 退回硬拼，
+    //   报错仍推迟到链接期（与既有行为一致）。
+    expr.atSymbol = atMethod->mangledName;
+    for (auto& method : classIt->second->methods) {
+        if (method->name == "set" && method->parameters.size() == 2) {
+            expr.setSymbol = method->mangledName;
+            break;
+        }
     }
 
     // 下标表达式推导 + 与 at() 形参类型校验

@@ -492,6 +492,8 @@ FuncDeclPtr TemplateInstantiator::instantiateFunction(
     //   不能只编模板实参 —— 那是类模板的编法（docs/BUGS.md B2）。
     //   这里用的是蓝图（尚未替换）的返回类型与参数表：形参在签名里保留为
     //   T_ / T0_… 形态，与 clang 的编法一致。
+    //   demo: `template<class T> T twice(T x);` 蓝图签名 = T→T ⇒ 实例 twice<int>
+    //         编出 _Z5twiceIiET_T_（_Z + 5twice + I i E 模板实参 + T_ 返回类型 + T_ 形参表）
     //   成员模板（[temp.mem]）另走一套：符号是 `类名_方法名` + 实参后缀 —— 与普通
     //   成员函数同款前缀，使 CodeGen 既有的调用约定（`Cls_method`）能对上，
     //   而不同实参的实例又靠 `_int` / `_double` 后缀区分开（自由函数模板的
@@ -1113,7 +1115,7 @@ ExprPtr TemplateInstantiator::cloneExpr(
             return cloned;
         }
 
-        // ── delete 表达式 DeleteExpr（ast.h:300）──
+        // ── delete 表达式（ast.h 的 DeleteExpr 节点）──
         // 表达式位置的 `delete p`/`delete[] p`（如 `return delete p, 0;` 或作为子表达式）。
         // pointerExpr 递归克隆，isArray 原样带上。
         // ★ 必须深拷贝：蓝图 ExprPtr 被多实例共享时，任一实例改写都会污染其它实例。
@@ -1175,7 +1177,7 @@ StmtPtr TemplateInstantiator::cloneStmt(
             return cloned;
         }
 
-        // ── 赋值语句（C++ 里赋值是表达式 [expr.ass]，本项目简化为语句，ast.h:316）──
+        // ── 赋值语句（C++ 里赋值是表达式 [expr.ass]，本项目简化为语句，ast.h 的 AssignStmt）──
         // target/value 两侧都过 cloneExpr；变量名不变，故通常无替换发生。
         // demo: "item = x;" ⇒ "item = x;"（结构深拷贝，内容不变）
         case NodeKind::Assign: {

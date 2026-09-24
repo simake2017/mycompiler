@@ -90,12 +90,31 @@ enum class AccessModifier : uint8_t {
 //              FieldInfo{name=y, type=int, offset=4, size=4} ]
 //   （int 按 4 字节对齐，x 在偏移 0，y 紧随其后在偏移 4）
 struct FieldInfo {
-    std::string name;
+    std::string name;            // 显示名 —— MI 下带限定前缀，仅用于打印与"全限定名"查找
     TypePtr     type;
     uint32_t    offset  = 0;     // 字段在对象内存中的字节偏移量
     uint32_t    size    = 0;     // 字段占用的字节数
     AccessModifier access = AccessModifier::Public;
-    std::string sourceClass;     // 字段来源的类名（空 = 自身字段；非空 = 继承自该类）
+    std::string sourceClass;     // 声明该字段的类名（空 = 自身字段；非空 = 继承自该类）
+
+    // ── 下面三项：把"这个字段住在哪个子对象里"变成可精确回答的问题 ──
+    // ★ 为什么不能靠 name 字符串反推来源：name 是【显示标签】不是【路径】。祖辈前缀
+    //   （"B.x"）传进来时看不出它走的是哪条子对象路径；两个次基类同名字段、或祖辈前缀
+    //   恰好与某个直接基类撞名时，字符串会塌陷成同一条 ⇒ 偏移被算到错的子对象上
+    //   （BUGS.md B13 / B15）。
+    // 对照 clang：成员是 FieldDecl* + getFieldIndex()，布局按【下标】寻址；
+    //   本项目补上 viaBase + baseFieldIndex 后与之一致（名字只用于查找，不参与寻址）。
+    std::string declaredName;    // 裸名（不含任何限定前缀）—— 名字查找的权威键
+    std::string viaBase;         // 装着它的【直接基类】子对象名（空 = 本类自身字段）
+    int         baseFieldIndex = -1;  // 在 viaBase 那个基类布局 fields[] 中的下标
+
+    // 权威裸名：declaredName 优先，缺失时退回"显示名剥掉最外层前缀"
+    // demo：bareName() 对 name="B.x" / declaredName="x" ⇒ "x"；对 name="x" ⇒ "x"
+    std::string bareName() const {
+        if (!declaredName.empty()) return declaredName;
+        auto dot = name.find('.');
+        return dot == std::string::npos ? name : name.substr(dot + 1);
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,17 +156,18 @@ struct BaseSubobject {
 // =============================================================================
 // TemplateArg：模板实参的 tagged 值（[temp.arg]）—— 详见 docs/learn/18（NTTP）
 // =============================================================================
-// C++20 允许四类模板实参，本结构覆盖其中两类：
-//     template<class T>  → 类型实参        Box<int>   → kind=Type
-//     template<int N>    → 非类型实参 NTTP  Buf<4>     → kind=Integral
-//     template<template<class> class TT> → 模板模板实参（未实现）；包展开 ...（未实现）
+// C++20 允许四类模板实参，本结构覆盖其中三类：
+//     template<class T>  → 类型实参        Box<int>       → kind=Type
+//     template<int N>    → 非类型实参 NTTP  Buf<4>         → kind=Integral
+//     template<template<class> class TT> → 模板模板实参  Wrap<Box,int> → kind=Template
+//     包展开 `Ts...`（未实现）
 //
 // ★ 约束：实参【不能】一律存成 TypePtr —— template<int N> 的实参 4 是值不是类型，
 //   TypePtr 结构上就表达不了。故用 tagged union 让"类型 or 值"共存于同一槽位。
 //
 // 【clang 对照】clang::TemplateArgument（clang/AST/TemplateBase.h）是真正多形态的 tagged
 //   union（ArgKind{Type, Declaration, Integral, Template, Pack, ...}，Integral 形态带
-//   llvm::APSInt Integer）；本实现只取 Type / Integral 两形态。形参侧对应
+//   llvm::APSInt Integer）；本实现只取 Type / Integral / Template 三形态。形参侧对应
 //   TemplateTypeParmDecl / NonTypeTemplateParmDecl ⟷ 本项目的 TemplateParamKind。
 //
 // demo: template<int N> class Buf ⇒ Buf<4> ⇒ 替换表 { "N" → TemplateArg{Integral, 4} }
@@ -248,19 +268,42 @@ struct ClassLayout {
     // 在汇编层面：vtable[-1] = type_info_address
     std::string              rttiMangledName;    // RTTI 符号名
 
-    // 查找字段偏移量
-    // 精确匹配 + 按 sourceClass 的限定名匹配（MI 下继承字段名带 "BaseName." 前缀）
+    // 查找字段偏移量（[class.member.lookup] 的字段版）
+    // 三级顺序，缺一不可：
+    //   ① 全限定名精确匹配 —— 调用方自己写了 "A.a" 时照单全收
+    //   ② 【本类自身字段】优先 —— [class.member.lookup]/3：派生类的声明【隐藏】基类同名
+    //      声明。自身字段与基类字段撞名时会被重命名成 "D.x"，靠 declaredName 才认得出
+    //   ③ 继承字段 —— 名字对各来源一视同仁，先到先得（真 C++ 在此应报歧义，
+    //      [class.member.lookup]/8；minicc 只做"能查到"，歧义诊断见 docs/BUGS.md B13）
     const FieldInfo* findField(const std::string& name) const {
-        // ① 精确匹配（自身字段 或 全限定名 "A.a"）
-        for (auto& f : fields) {
-            if (f.name == name) return &f;
+        auto all = findFields(name);
+        return all.empty() ? nullptr : all.front();
+    }
+
+    // 同上，但返回该层级的【全部】命中 —— 长度 > 1 即 [class.member.lookup]/8 的歧义
+    // （`struct A{int x;}; struct B{int x;}; struct D:A,B{}; d.x` 在真 C++ 里 ill-formed）。
+    // 分出这个接口的理由：findField 只能回答"取哪一条"，回答不了"是不是只有一条"；
+    // 而"静默取第一条"正是 BUGS.md B13 的观感（布局打印出两条同名、偏移还错）。
+    // 对照 clang：LookupResult::isAmbiguous() + 承载多个 NamedDecl。
+    std::vector<const FieldInfo*> findFields(const std::string& name) const {
+        // ★ declaredName 才是权威键：name 是显示串，MI 下带前缀（"B.x"），拿它当键会让
+        //   查找结果依赖"前缀是哪一代留下的"。旧实现用 sourceClass + "." + name 反拼
+        //   前缀来配对 —— 那是把显示层当索引层用（BUGS.md B14 的成因）。
+        std::vector<const FieldInfo*> hit;
+        for (auto& f : fields) {                                  // ① 全限定名
+            if (f.name == name) hit.push_back(&f);
         }
-        // ② 限定名匹配：name="a" 时，试 "A.a" / "B.a"（按 sourceClass 分组）
-        for (auto& f : fields) {
-            if (!f.sourceClass.empty() && f.name == f.sourceClass + "." + name)
-                return &f;
+        if (!hit.empty()) return hit;
+        for (auto& f : fields) {                                  // ② 自身字段（隐藏）
+            if ((f.sourceClass.empty() || f.sourceClass == className) &&
+                f.bareName() == name) hit.push_back(&f);
         }
-        return nullptr;
+        if (!hit.empty()) return hit;                             // 自身命中即隐藏基类同名
+        for (auto& f : fields) {                                  // ③ 继承字段（可能多条）
+            if (!f.sourceClass.empty() && f.sourceClass != className &&
+                f.bareName() == name) hit.push_back(&f);
+        }
+        return hit;
     }
 };
 
@@ -268,7 +311,7 @@ struct ClassLayout {
 // 【指针 / 引用 / const 的组合规则】—— 详见 docs/learn/23
 // =============================================================================
 // Type 是"洋葱式"嵌套：每个修饰符一个独立节点，靠 pointeeType / referencedType /
-// innerType 三条链指向内层。组合顺序见 src/parser.cpp parseType :168 —— 记下 const 前缀
+// innerType 三条链指向内层。组合顺序见 src/parser.cpp parseType() —— 记下 const 前缀
 // → 解析基础类型 → 叠加后缀 * / & / && → 最后把 const 包到它该在的位置。
 //
 // 【写法 ⇒ 建出哪种节点】（外 → 内；encodeType 见 src/template_instantiation.cpp）

@@ -259,6 +259,14 @@ struct MemberExpr : Expression {
 struct IndexExpr : Expression {
     ExprPtr object;  // 被下标的容器对象（类类型）
     ExprPtr index;   // 下标表达式（按约定方法签名校验）
+
+    // Sema 回填的约定方法【符号】（at = 读，set = 写）。
+    // ★ CodeGen 不能硬拼 `类名_at`：成员方法名由 Sema 追加了"参数个数"后缀
+    //   （IntVec_at_1 / IntVec_set_2，见 semantic_analyzer.cpp 的 mangledName 规则），
+    //   硬拼会拼出一个谁也没定义过的符号 ⇒ 链接期 undefined reference。
+    //   空串 = 类里没有对应约定方法 ⇒ CodeGen 退回硬拼（把报错留给链接期）。
+    std::string atSymbol;
+    std::string setSymbol;
     IndexExpr(ExprPtr obj, ExprPtr idx)
         : Expression(NodeKind::Index),
           object(std::move(obj)), index(std::move(idx)) {}

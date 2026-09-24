@@ -309,6 +309,10 @@ TypePtr Parser::parseType() {
             //   值实参（见 template_instantiation.cpp）。对照 clang：该区分发生在
             //   ParseTemplateArgument（实参位）而非 ParseTypeName（类型位）。
             //   已知边界：`template<int N> struct A { N x; }` 仍报 "unknown type name 'N'"。
+            // demo: 类型形参 `template<class T> struct Box { T v; };` 的 `T v;`
+            //         ⇒ "[parse:type] base = T (template param, scope hit)" ⇒ TemplateParam("T")
+            //       值形参 `template<int N> struct A { };` 里的 N 走 else ⇒ Class("N")
+            //         （只在【模板实参位】被还原成值：`template<int N> using BufA = Buf<N>;`）
             if (tp && tp->kind == TemplateParamKind::Type) {
                 base = Type::makeTemplateParam(name);
                 std::cout << std::format("  [parse:type] base = {} (template param, scope hit)\n", name);
@@ -850,6 +854,11 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                 //   template <template <class> class C, class T> struct Wrap;
                 // 形态是「内层 template <...> 形参表」+「自己的 class/typename」+「名字」。
                 // 内层表只数个数（templateArity），不做逐位签名匹配 —— 见 ast.h 的说明。
+                // demo: `template<template<class> class C, class T> struct Wrap { C<T> inner; };`
+                //   声明点 ⇒ "★ template template parameter registered: 'C'
+                //              (accepts a template with 1 parameter(s), [temp.param]/4)"
+                //   实例化点 Wrap<Box,int> ⇒ "[subst] ★ 模板模板形参 'C' → 模板 'Box'：C<int> → Box<int>"
+                //   产物 ⇒ 实例类 Wrap_Box_int（Itanium 对照 clang：_Z4WrapI3BoxiE）
                 // ★ 内层表要【单独吃掉】，不能复用本循环：这里吞的是 C 的形参，
                 //   不是外层模板的形参，混在一起会多注册出假的形参位。
                 // 对照 clang：ParseTemplateParameter 遇 kw_template 递归
@@ -1221,7 +1230,12 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
     // ── 类名后的模板 id（特化专用，[temp.class.spec]）──
     // 主模板写 `class Box {`，特化写 `class Box<T*, T> {`。
     // 尖括号里的那串模式回填给调用方（parseTemplateDecl 存进 specPattern）。
-    // 只允许类型实参作模式：NTTP 模式的偏特化（Box<int, N>）本项目未实现。
+    // ★ 判据里的 `outSpecPattern &&` 不是可有可无的防御，它就是"这是不是特化"的
+    //   全部判据：只有 parseTemplateDecl（即 `template<...>`/`template<>` 之后的那个
+    //   类声明）会传非空指针；普通 class 声明走默认的 nullptr ⇒ 短路 ⇒ **名后的 '<'
+    //   根本进不来**。于是 `struct Box<int> { };`（漏写 template<>）不会在这里被
+    //   悄悄当成特化，而是在下面报 "Expected '{' after class name"。
+    //   对照 clang：同一条漏写报 "template specialization requires 'template<>'"。
     if (outSpecPattern && check(TokenType::Less)) {
         // 模式位可以是类型（`T*`、`int`）也可以是值（`true`、`N`）——
         // [temp.class.spec] 不区分形态，两者都能出现在尖括号里，故原样收下
@@ -1319,6 +1333,11 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
         //  （每个元函数都靠 `using type = ...` 交回结果；见 test_tmpl_48，理论见 docs/learn/24）。
         // 【依赖情形】目标可以是模板形参（`using type = T;`），实例化时由
         //   TemplateInstantiator 做结构化替换，与字段/方法同一条路。
+        // demo: 三处使用点（回归 tests/tmpl/test_tmpl_48_class_type_aliases.cpp）
+        //   ① 类外限定名（非模板）    `Plain::Int y;`     ⇒ 查符号表条目 Plain::Int
+        //   ② 类外限定名（模板实例）  `Box<int>::type x;` ⇒ 限定者先实例化成 Box_int，
+        //      再查实例类的 typeAliases ⇒ int（目标里的形参 T 已随实例化替换）
+        //   ③ 类体内非限定名          `type v;`          ⇒ resolveType 的类作用域回退
         // 对照 clang：ParseTypedefDecl / ParseAliasDeclaration，产物都是 TypedefNameDecl。
         if (check(TokenType::KwUsing)) {
             advance();
@@ -1372,6 +1391,10 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
         //   只是挂在类的 memberTemplates 上、实例化出的函数带 ownerClassName。
         //   这一点是刻意的：调用点的推导逻辑（TemplateDeducer）完全复用，
         //   不需要为"成员"再造一套合一算法 —— [temp.deduct] 对两者是同一套。
+        // demo: `struct Acc { template<class T> T add(T a) { return a; } };`
+        //         a.add(1)  ⇒ T := int  ⇒ 符号 Acc_add_int
+        //         a.add(&v) ⇒ T := int* ⇒ 符号 Acc_add_intP（靠实参后缀区分，与上不撞）
+        //       回归 tests/tmpl/test_tmpl_56_member_templates.cpp
         // 对照 clang：ParseCXXMemberSpecification 里 kw_template 走
         //   ParseTemplateDeclarationOrSpecialization，产物是 MemberTemplateDecl。
         if (check(TokenType::KwTemplate)) {
@@ -1746,8 +1769,9 @@ StmtPtr Parser::parseBlockStmt() {
 // 文法：var-decl-stmt := IDENT ['=' expr] ';'
 //   注：类型由调用方（parseStatement）预先 parseType 后作为入参传入，
 //       这样"试探判定是不是声明"与"正式解析类型"可以解耦。
-//   简化点：不支持括号初始化 `T x(...)`、列表初始化 `T x{...}`、
-//           一条语句声明多个变量 —— 正是这些简化回避了 most-vexing-parse。
+//   简化点：不支持列表初始化 `T x{...}`、一条语句声明多个变量 ——
+//           正是这些简化回避了 most-vexing-parse。
+//           （括号初始化 `T x(args)` 见下方 LParen 分支，CTAD 的前置条件）
 // 对应 clang：ParseSimpleDeclaration（ParseDecl.cpp）
 // 入参 demo：入参 type=int；Token 流 [x][=][42][;]
 //   → 产出 VarDeclStmt{ name="x", type=int, init=IntLiteral(42) }

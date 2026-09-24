@@ -161,6 +161,51 @@ clang 同此分法：`RecursiveASTVisitor` 只服务遍历，类型计算走 `dy
 测试 tests/lang/test_basics_01 + tests/tmpl/test_tmpl_52/53/54/56；文档 docs/learn/31..34。
 顺带修 PITFALLS **I4**（蓝图摘要把 NTTP 打成 `typename N`）与 **F2 残留**（Phase 4 演示只看第二位形参，
 `template<bool B, class T>` 被喂 `<int,double>` 触发形态自检）。全量 159 → **224** 单测 / 94 集成测试。
+✅ **带参成员方法符号回填（bug 修复，docs/BUGS.md B10）** ——
+**症状**：`class C { public: int f(int x) { return x; } };` 的 `c.f(1)` 一律
+`undefined reference to 'C_f'`；下标糖 `v[i]` 同样中招（调用点拼 `IntVec_at`，
+定义点其实是 `IntVec_at_1`）。错误停在链接期，编译期全程绿灯。
+**根因**：同一条语义判断写在两处且不一致 —— 定义点（Sema `registerFunction`）给
+**带参**成员方法名追加"参数个数"后缀，调用点（CodeGen）硬拼 `类名_方法名`。
+**修法**：让普通成员方法复用成员模板早就用上的回填机制
+（`MemberExpr::resolvedCalleeSymbol`），并给 `IndexExpr` 增 `atSymbol`/`setSymbol` 两槽；
+CodeGen 优先用回填值、空则退回硬拼。**虚调用不受影响**（CodeGen 先查 vtable 即 return）
+—— 实证：修复后的基线差异**恰好只有 `test_stl_02..05` 四个文件**，其余 90 个逐字节不变。
+测试 tests/stl/test_stl_02..05（四个文件头即回归说明）+ 新增单测
+tests/unit/test_symbol_consistency.cpp（`SymbolConsistency.*` 5 例，断言【不变量】
+"每个 callq 目标都有 .globl 定义"，而非具体符号名 —— 命名规则随便改都不会误报）。
+★ 顺带发现【另案缺口】（**已修**，见下批 B12）：继承来的成员方法调用
+（`Derived d; d.f(3)`，f 在 Base）报 `No member 'f' in class 'Derived'`
+—— 成员查找不走基类链（继承的字段访问是通的）。
+**同批顺带修好**：`tests/pp/test_pp_01_include.cpp` 的 `#include` 路径写错
+（`"pp/math_helper.h"` ⇒ 搜到 `tests/pp/pp/` 下，必然找不到），使 `#include` /
+`#pragma once` 这个 P0 特性**从来没有被真正测到**（rc=1 被基线固化成"契约"）；
+现已真跑通。另：`tests/mi/test_mi_03` 原文用未实现的三元 `?:` ⇒ 停在**词法期**，
+已改写为 if，暴露出真缺口「跨转型 `B*`→`A*` 未实现」并写进文件头。
+**教训**：logdiff 基线会把**失败**也固化成契约 —— 修完必须回头看 rc，不能只看"零差异"。
+
+✅ **多继承「成员住在哪个子对象里」一批修复已完成（BUGS.md B11~B15）** ——
+起点是一个问题："多继承下基类字段要不要改名"。
+①**B11 vptr 压字段**（**真 miscompile**：本类自身有虚函数、基类全非多态时，
+`[relocate]` 把首基类当 primary 摆到 0，而本类自己的 `_vptr` 也要占 0
+⇒ 写基类字段即写坏虚表指针，随后虚调用跳飞 SIGSEGV）。Itanium 的 primary **只在动态基类里选**，
+一个都没有时 vptr 自己占 0、基类从 8 起 —— 旧判据只写了两态，补上第三态。
+②**B12 继承方法查不到**（`D d; d.g()` 报 `No member 'g'`）：成员查找收口成
+`findMethodInClass` / `findMethodInHierarchy` 两个原语，`inferMember` 与 `inferCall` 共用同一谓词
+（承 B10 教训：同一判据不许写两份）。
+③**B13/B14/B15 同根**：**把显示名当成了索引**。`FieldInfo` 补
+`declaredName`（权威裸名，查找的键）/ `viaBase`（装着它的**直接**基类子对象）/
+`baseFieldIndex`（在基类布局里的下标）；`computeClassLayout` 的字段放置合并成
+`子对象偏移(viaBase) + 基类布局[下标].offset`（主基类偏移恒 0 ⇒ 自动退化，与旧实现同值）；
+`findField` 改三级（全限定名 / **自身字段优先**（[class.member.lookup]/3 隐藏）/ 继承），
+新增 `findFields` + 歧义诊断（[class.member.lookup]/8：`Member 'x' is ambiguous ...`）。
+修掉的两条**真 miscompile**：B14 `d.x` 曾静默指向 `A::x`（隐藏方向做反）、B11 段错误。
+测试 tests/mi/test_mi_08..11 + tests/unit/test_layout_lookup.cpp（`LayoutLookup.*` 4 例，
+断言的是**不变量**「多态类任何字段不得落在 `[0,8)`」「`d.x` 命中的那条必须 `viaBase` 为空」等）；
+**五条修复逐条做了突变负向验证**（单测级 + 集成级双跑）。
+单测 229 → **233**，集成 94 → **98**，logdiff 重刷基线（既有 94 个**零漂移**）。
+索引与根因复盘见 docs/BUGS.md 的 B11~B15 与文末「小结 字符串兼任 ID 与路径」。
+
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、

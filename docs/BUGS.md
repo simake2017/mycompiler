@@ -22,6 +22,15 @@
 | [B7](#b7-自由函数重载根本不做-mangling) | `pick(int)` 与 `pick(S)` 同为裸名 `pick` ⇒ 汇编期符号重复 | `src/semantic_analyzer.cpp:2091` | **大**（全量重刷基线 + main/libc 特例） | ⬜ 未修 |
 | [B8](#b8-mangling-没有替换表--符号与-clang-不逐字符等同) | 缺 Itanium 替换表（`S0_`）⇒ `_Z5twiceIiET_S0_` 缩不成 | `src/template_instantiation.cpp` encodeType | 中（只影响与 clang 逐字符等同） | ⬜ 未修 |
 | [B9](#b9-struct-的默认继承级别被当成-private-处理) | `struct D : Base` 被拒（默认继承级别看错关键字） | `src/parser.cpp` parseClassDecl | 小（一个分支） | ✅ 已修 |
+| [B10](#b10-带参成员方法的调用符号拼不出来) | 带参成员方法调用全线 `undefined reference`（连下标糖一起） | `src/semantic_analyzer.cpp` inferCall + `src/codegen.cpp` | **大**（4 个集成测试长期 rc=1） | ✅ 已修 |
+| [B11](#b11-本类自身多态而基类全非多态时-_vptr-与首基类字段压在同一-offset) | 本类有虚函数且无多态基类 ⇒ `_vptr` 与字段都占 0 | `src/semantic_analyzer.cpp` `[relocate]` | **大**（合法程序编译通过、运行 SIGSEGV） | ✅ 已修 |
+| [B12](#b12-继承来的成员方法查不到) | `D d; d.g()`（g 在基类）报 `No member 'g'` | `src/semantic_analyzer.cpp` inferMember | 中（合法程序被拒） | ✅ 已修 |
+| [B13](#b13-两个次基类各有一个同名字段时显示名塌陷且第二条偏移算成-0) | 两条记录压成同名 ⇒ 第二条偏移算成 0；歧义不报错 | 扁平化循环 + `computeClassLayout` | 中（非法程序被静默接受 + 布局打印错） | ✅ 已修 |
+| [B14](#b14-派生类同名字段的隐藏方向做反了) | `d.x` 静默指向 `A::x` 而非 `D::x`（隐藏方向反了） | `include/type.h` `findField` | **大**（合法程序静默取错成员） | ✅ 已修 |
+| [B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) | 祖辈带来的前缀被当成"本类直接基类" ⇒ 偏移算错 | 扁平化循环 + `computeClassLayout` | 中（同 B13 的性质，根因更本质） | ✅ 已修 |
+
+> **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
+> B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
 
 ---
 
@@ -382,6 +391,61 @@ minicc：`[Parse Error] 2:18 at 'Base': 仅支持 public 继承（每个基类�
 
 ---
 
+## B10. 带参成员方法的调用符号拼不出来
+
+**复现**（不需要下标糖 —— 普通方法调用就够了）
+
+```cpp
+class C { public: int f(int x) { return x; } };
+int main() { C c; return c.f(1) - 1; }   // clang = 0
+```
+
+minicc：`[LINK ERROR] undefined reference to 'C_f'`
+
+**性质**：**正常程序编不过**，且错误一路推迟到链接期 —— 编译期的 Parser/Sema 全程绿灯，
+用户看到的是"符号没定义"，完全指不到真正的原因。
+
+**根因**：同一条语义判断写在了两个地方，两侧算法不一致。
+
+| 位置 | 规则 | `IntVec::at(int)` 的产物 |
+|---|---|---|
+| 定义点 `semantic_analyzer.cpp` registerFunction | 带参成员方法名追加"参数个数"后缀 | `IntVec_at_1` |
+| 调用点 `codegen.cpp` visit(CallExpr) | 硬拼 `类名 + "_" + 方法名` | `IntVec_at` |
+
+```text
+定义：.globl IntVec_at_1   .globl IntVec_set_2
+调用：callq IntVec_at      callq IntVec_set        ⇒ 谁也匹配不上
+```
+
+**影响面**：**大** —— 凡"类方法带参数"即中招。集成测试里 `test_stl_02..05`
+四个长期 rc=1；因为 logdiff 基线把 rc=1 当成了契约，**坏了很久没人发现**
+（这本身就是教训：*基线固化失败 ⇒ 缺陷变成"预期行为"*）。
+
+**修复** ✅ —— 沿用项目既有的"符号回填"套路
+
+`MemberExpr::resolvedCalleeSymbol` 早已存在（成员模板 `Acc_add_int` 靠它绕开硬拼），
+本次把**普通成员方法**也接上同一根线：
+
+| 改动点 | 内容 |
+|---|---|
+| `semantic_analyzer.cpp` `inferCall` | 成员方法命中 ⇒ `mem->resolvedCalleeSymbol = method->mangledName` |
+| `include/ast.h` `IndexExpr` | 新增 `atSymbol` / `setSymbol` 两个回填槽 |
+| `semantic_analyzer.cpp` `inferIndex` | 查 `at()` 时顺带回填 `set()` 符号（`set` 只填不强制） |
+| `codegen.cpp` `visit(IndexExpr)` / `AssignStmt(Index)` | 优先用回填符号，空则退回旧硬拼 |
+
+**为什么虚调用不受影响**：`CodeGen::visit(CallExpr)` 先查 vtable 条目，命中即
+`emitVirtualCall` 并 `return` —— 回填值只作用于其后的"非虚直接调用"分支。
+修复后的基线差异**恰好只有那 4 个 stl 文件**，其余 90 个集成测试逐字节不变，
+即是此判断的实证。
+
+**回归用例**：`tests/stl/test_stl_02..05`（四个文件头都写明了本回归点）。
+
+**顺带暴露（未处理）**：`inferIndex` 只校验 `at()`、从不校验 `set()` ——
+类里没写 `set()` 时，错误同样一路推到链接期。本次按"只回填不强制"保持既有行为，
+补校验是另一件事。
+
+---
+
 ## B4. 带 return 的函数里局部对象析构是死代码
 
 **复现**（析构里写全局变量，看有没有跑）
@@ -522,3 +586,300 @@ i = (end == std::string::npos) ? line.size() : end + 1;   // ← 跨行状态在
 
 > 工程教训：这个 bug 能潜伏这么久，是因为**既有测试里的块注释恰好都写在同一行**，
 > 而多行块注释（`/*` 换行正文再 `*/`）才是最普通的写法 —— 测试覆盖的是"能过"的形态。
+
+---
+
+## B11. 本类自身多态而基类全非多态时 _vptr 与首基类字段压在同一 offset
+
+**位置**：`src/semantic_analyzer.cpp` 的 `[relocate]` 子对象摆放阶段（`processClassDecl` 内）
+
+**复现**（最朴素的单继承 + 一个虚函数）
+
+```cpp
+struct B { int name; };
+struct A : B { virtual int f() { return 5; } };
+int main() { A a; a.name = 3; return a.f() + a.name; }   // clang = 8
+```
+
+| | 编译 | 运行 | A 的布局 |
+|---|---|---|---|
+| clang++-18 | ✅ | `8` | `sizeof(A)=16`、`offsetof(A,name)=8` |
+| minicc（修复前） | ✅ rc=0 | **SIGSEGV** | `+0: _vptr`、`+0: B.name` ← 同一格 |
+
+**性质**：**真 miscompile** —— 合法程序编译通过、运行崩溃。写基类字段即写坏虚表指针，
+下一次虚调用经 `[vptr=3]` 跳飞（实测 `exit=139`）。
+
+**根因**：primary 的选择只扫了基类，没扫自己。
+
+Itanium 的主基类优化：**primary base 只在动态（多态）基类里选**。一个多态基类都没有、
+而本类**自身**有虚函数时 ⇒ **没有主基类**：vptr 自己占 offset 0，全部基类子对象从 8 起摆。
+
+`[relocate]` 里那份判据只写了两态：
+
+| 基类里有多个态基类吗 | 本类自身多态吗 | 旧行为 | 正确行为 |
+|---|---|---|---|
+| 有 | 任意 | primary = 第一个多态基类 @0 | ✅ 同左 |
+| 无 | 否 | 首个基类当 primary @0 | ✅ 同左（全非多态，单继承兼容） |
+| 无 | **是** | 首个基类当 primary @0 ❌ | **无 primary**：vptr@0、基类从 8 起 |
+
+漏的正是第三态。而"本类自身多态"要到**更后面**的方法注册循环才置
+`classLayout.hasVTable = true`，`[relocate]` 时还看不见 ——
+两处各自看到的"多态性"不一致，又是一次"同一判断两处各算一份"。
+`struct A : B, C { virtual ... }`（两个非多态基类）同理：首个基类 @0 与 vptr 重叠。
+
+**影响面（大）**：单继承最朴素的写法就会中招，且**编译期全程绿灯**。
+不崩只是因为恰好没人读那个被踩烂的 vptr —— 本 bug 的第一版用例返回 6"看着对"，正是如此。
+
+**修复** ✅：判据补上第三态。
+
+| 改动 | 内容 |
+|---|---|
+| 新增 `selfPoly` 预判 | 无多态基类时，扫 `decl->methods` 有无带 `virtual` 的方法 |
+| 新增 `noPrimary` | `!anyPoly && selfPoly` ⇒ 所有子对象 `isPrimary=false`，`place` 从 8 起 |
+| 日志 | 该分支打印"本类自身多态 ⇒ 无主基类，_vptr 占 0" |
+
+★ `selfPoly` 只需看 `virtual` 关键字：无多态基类 ⇒ 没有可覆写的虚函数，
+"覆写"这条来源不可能成立（与下方 override 检测同源，不重复实现）。
+★ 既有分支的日志**逐字节不变**（`primary='X' 占 0` 原文保留）——
+94 个集成测试零漂移，是"只影响此前算错的那一支"的实证。
+
+**回归用例**：
+- `tests/mi/test_mi_08_self_poly_no_poly_base.cpp` —— 两场景合一，返回 `111`
+  （`5+3` 单非多态基类、`100+1+2` 双非多态基类）。
+- `tests/unit/test_layout_lookup.cpp` 的 `LayoutLookup.VptrNeverOverlapsFields`
+  —— 断言**不变量**「多态类的任何字段都不得落在 `[0,8)`」，覆盖三种继承形态；
+  而不是"某类某字段在 8"这种症状值。
+- **负向已验证**（单测）：`noPrimary` 改回恒 `false` ⇒ 立刻报
+  "字段 'B.name' 偏移 0 落在 _vptr 区（0..7）—— 写它即写坏虚表指针"。
+- **负向已验证**（集成）：同一突变重编 minicc ⇒ `test_mi_08` 运行 `-11`（SIGSEGV）。
+
+---
+
+## B12. 继承来的成员方法查不到
+
+**位置**：`src/semantic_analyzer.cpp` 的 `inferMember`（查方法那一段）
+
+**复现**
+
+```cpp
+struct A { int g() { return 5; } };
+struct D : A { };
+int main() { D d; return d.g(); }        // clang = 5
+```
+
+minicc：`[ERROR] [Semantic Error] 3:27: No member 'g' in class 'D'` —— **合法程序被拒**。
+
+**根因**：成员查找只查了本类。
+
+| 成员种类 | 存放在哪 | 查得到吗 |
+|---|---|---|
+| 字段 | 已**扁平化**进 `classLayout.fields`（含继承来的） | ✅ |
+| 方法 | 各基类自己的 `decl->methods` 里，**没有**扁平化 | ❌ 只扫了本类 |
+
+讽刺的是 `inferCall` 里**另有一条**搜基类的 BFS（成员调用走它），
+但它被更早的 `inferType(callee)` → `inferMember` 的 `error()` 挡死 ——
+`d.g()` 永远走不到那条 BFS。**同一条查找规则写在两处，只有一处带基类链**，
+与 [B10](#b10-带参成员方法的调用符号拼不出来) 的"双份判据"同型。
+
+**修复** ✅：把判据收口成两个原语，两条通路共用。
+
+| 原语 | 作用 | 调用者 |
+|---|---|---|
+| `findMethodInClass(类, 名, arity)` | 在**单个类**里找方法；`arity < 0` 表示不看参数个数 | `inferCall`（arity=实参个数）、`findMethodInHierarchy` |
+| `findMethodInHierarchy(类, 名, *declaringClass)` | 沿 `baseClassNames` 遍历（含本类），回填命中层 | `inferMember` |
+
+★ 遍历顺序与 `inferCall` 的搜索**逐字一致**（基类名 `insert` 到队首、从队尾取）——
+否则"两个基类都有同名方法"时两条通路会选中不同的那一个。
+★ 隐藏规则由此自动成立：本类先于基类 ⇒ `D::g` 胜过 `A::g`。
+★ 日志保持原文，命中基类时追加 `via 'A'`（本类命中不加 ⇒ 既有输出逐字节不变）。
+
+**回归用例**：`tests/mi/test_mi_09_inherited_member.cpp`（多级链 `C:B:A`、指针形态、
+同名隐藏三件事合一，返回 8）；单测 `LayoutLookup.InheritedMethodIsFound`。
+**负向已验证**：`findMethodInHierarchy` 换回 `findMethodInClass` ⇒ 单测红；
+重编 minicc ⇒ `test_mi_09` 编译 `rc=1`。
+
+---
+
+## B13. 两个次基类各有一个同名字段时显示名塌陷且第二条偏移算成 0
+
+**复现**
+
+```cpp
+struct B { int name; };
+struct C { int name; };
+struct A : B, C { };
+struct D : A { int tag; };
+```
+
+修复前的 `--dump-layout`：
+
+```text
+    ══ Memory Layout of 'D' ══
+    +0: A.name : int (4 bytes)     ← 应该是 B::name
+    +0: A.name : int (4 bytes)     ← ★ 应该是 +8，却算成了 0
+    +16: tag : int (4 bytes)
+```
+
+**性质**：**只影响真 C++ 本来就 ill-formed 的程序**（两个子对象各有一份 `name`
+⇒ [class.member.lookup]/8 歧义，`d.name` 必须报错）—— 不是 miscompile，
+而是"静默接受非法程序 + 布局打印错"。但它与 B14/B15 同根，故一并根治。
+
+**根因（两处叠加）**
+
+| # | 位置 | 症状 |
+|---|---|---|
+| ① | 扁平化循环 | 改名时"剥掉第一个 `.` 再拼直接基类名" ⇒ `B.name` 与 `C.name` 剥成裸名 `name` 后都变成 `A.name` |
+| ② | `computeClassLayout` | 主/次基类分支都按**裸名**在基类布局里找**第一个**命中 ⇒ 两条记录都命中 `B.name@0` |
+
+**修法（根治）：让名字不再兼任"路径"**
+
+`FieldInfo` 补三项，把"住在哪个子对象里"变成可精确回答的问题：
+
+| 新字段 | 含义 |
+|---|---|
+| `declaredName` | 权威裸名 —— 名字查找的键（不再用显示名反拼前缀） |
+| `viaBase` | 装着它的**直接基类**子对象名（空 = 本类自身字段） |
+| `baseFieldIndex` | 在 `viaBase` 那个基类布局 `fields[]` 中的**下标** |
+
+`computeClassLayout` 的字段放置随之合并成一条式子：
+
+```text
+field.offset = 子对象偏移(viaBase) + 基类布局[baseFieldIndex].offset
+```
+
+主基类子对象偏移恒为 0 ⇒ 该式自动退化成"直接复用基类偏移"，与旧实现同值；
+两条分支合一后，`currentPrimaryBase` 变量连同"先挑主基类再分派"的逻辑一并删除。
+**对照 clang**：成员是 `FieldDecl*` + `getFieldIndex()`，`RecordLayoutBuilder` 从不做字符串匹配。
+
+**配套：歧义诊断**（[class.member.lookup]/8）
+
+`findField` 只能回答"取哪一条"，回答不了"是不是只有一条"。新增
+`ClassLayout::findFields(name)`（自身字段命中即隐藏基类，否则返回**全部**继承命中），
+`inferMember` 在 `size() > 1` 时报：
+
+```text
+[ERROR] [Semantic Error] 43:6: Member 'name' is ambiguous in class 'D':
+  found in 2 base-class subobjects (经 'A' 的 'A.name'、经 'A' 的 'A.name')
+```
+
+**回归用例**：`tests/mi/test_mi_11_ambiguous_member.cpp` —— **预期编译失败 rc=1**，
+基线固化其报错原文（rc 若变 0，即说明歧义检测退化）；
+单测 `LayoutLookup.LookupIsPrefixIndependentAndAmbiguityIsVisible` 的后半段断言必须抛错。
+**负向已验证**：关掉歧义检测 ⇒ 单测红；重编 minicc ⇒ `test_mi_11` 变成 `rc=0`
+（正是修复前"静默接受"的样子）。
+
+---
+
+## B14. 派生类同名字段的隐藏方向做反了
+
+**位置**：`include/type.h` 的 `ClassLayout::findField`
+
+**复现**
+
+```cpp
+class A { public: int x; void setA(int v) { x = v; } int getA() { return x; } };
+class D : public A { public: int x; };
+int main() { D d; d.setA(7); d.x = 5; return d.getA() * 10 + d.x; }   // clang = 75
+```
+
+minicc（修复前）= **55** —— `d.x` 落到了 `A::x`（`d.getA()` 也读出 5 而不是 7）。
+
+**性质**：**真 miscompile** —— 合法、**无歧义**（[class.member.lookup]/3：派生类声明
+**隐藏**基类同名声明，`d.x` 唯一 = `D::x`），却静默绑到基类那一份。
+
+**根因**：把**显示名**当成了**查找键**。
+
+| 步骤 | 旧行为 |
+|---|---|
+| 扁平化 | 自身字段 `x` 与基类字段撞名 ⇒ 把**自身**改名成 `D.x`，基类那条留 `A.x` |
+| 查找 | 第二步按 `f.name == f.sourceClass + "." + name` **反拼前缀** ⇒ 裸名 `x` 精确配上 `A.x` ⇒ 命中基类 |
+
+方向就这样反了：为了让字符串不撞，动的是自身字段；而"精确匹配先到先得"
+又让 `d.x` 指到了基类成员 —— **显示层的改动泄漏进了索引层**。
+
+**修复** ✅：`findField` 改三级，键换成 `declaredName`
+
+| 顺序 | 命中条件 | 依据 |
+|---|---|---|
+| ① | `f.name == name` | 调用方自己写了全限定名 `"A.a"` |
+| ② | **自身字段**（`sourceClass` 空或 == 本类名）且 `declaredName == name` | [class.member.lookup]/3 隐藏 |
+| ③ | 继承字段且 `declaredName == name` | 兜底 |
+
+★ 显示名（`D.x` / `A.x`）仍照旧生成 —— 它只用于打印，不再参与判定。
+
+**回归用例**：`tests/mi/test_mi_10_field_hiding.cpp`（返回 75）；
+单测 `LayoutLookup.OwnFieldHidesInheritedOne`（断言**不变量**：`d.x` 命中的那条
+必须 `viaBase` 为空 = 本类自身）。
+**负向已验证**：把 ② 的条件改回"只认 `sourceClass` 为空"（= 旧行为）⇒ 单测红；
+重编 minicc ⇒ `test_mi_10` 运行 `55`。
+
+---
+
+## B15. 祖辈前缀与直接基类撞名时偏移算到错的子对象
+
+**位置**：扁平化循环 + `computeClassLayout`（与 B13 同一段代码）
+
+**复现**
+
+```cpp
+struct Q { virtual int g() { return 0; } };
+struct B { int x; };
+struct P : Q, B { int y; };
+struct X : P, B { int tag; };
+```
+
+修复前：从 `P` 主基类链带出来的那份 `B.x` 被算到了 **X 的直接 B 子对象**上，
+于是两条记录**同偏移**（本该一条 +8、一条 +24）。
+
+**性质**：clang 对 `o.x` 报 ill-formed ——
+`non-static member 'x' found in multiple base-class subobjects of type 'B'`。
+与 B13 同属"本就非法 + 布局错"，单列是因为它的根因更本质。
+
+**根因**：`sourceClass` 一个字段兼任了两件事。
+
+| 它想说的事 | 它实际是 | 破口 |
+|---|---|---|
+| 谁**声明**了这个字段 | 一个裸类名 | 同一类名在一条链上出现两次就分不开 |
+| 它住在哪个**子对象**里 | 靠 `sourceClass` 去 `bases[]` 里**反查** | 反查命中的是**本类**的同名直接基类 |
+
+主基类分支是**原样拷贝**（`FieldInfo fi = baseField;`），祖辈留下的 `sourceClass="B"`
+一路带到 X —— 而 X 恰好真有一个直接基类叫 `B`。
+
+**修复** ✅：`viaBase` 在扁平化时**覆盖**为本层的直接基类、`baseFieldIndex` 记录下标；
+`computeClassLayout` 按 `(viaBase, 下标)` 定位，不再看 `sourceClass`、也不再按名字匹配。
+祖辈前缀从此只是显示标签，去多少代都不影响查找；它与"源自 B"这件事各由
+`declaredName` / `sourceClass` 独立承载。
+
+**回归用例**：单测 `LayoutLookup.LookupIsPrefixIndependentAndAmbiguityIsVisible`
+—— 断言两条同名记录**偏移必须不同**、且各自的 `viaBase` 必须是**本类的直接基类**。
+**负向已验证**：把派发改回 `sourceClass` + 按名字查内部偏移（**忠实复刻旧代码**）⇒
+该单测报 `Expected: (hits[0]->offset) != (hits[1]->offset), actual: 24 vs 24` —— 正是旧 bug 的形态。
+
+---
+
+## 小结 字符串兼任 ID 与路径
+
+三条 bug 的最小复现各不相同，根因却是同一句话：**把"显示名"当成了"索引"。**
+
+| 层 | 它该用来做什么 | 用错之后的后果 |
+|---|---|---|
+| 显示名 `"B.x"` | 打印给人看 | 看不出前缀是第几代留下的 ⇒ **B15** |
+| 查找键 | 必须是**声明名**（`declaredName`） | 反拼前缀去配对 ⇒ **B14** |
+| 子对象定位 | 必须是**结构信息**（`viaBase` + 下标） | 靠裸名在基类布局里找第一个命中 ⇒ **B13 / B15** |
+
+这与踩坑史 **T1**（`Type::toString()` 不是单射、而实例缓存键吃它 —— 见
+[docs/learn/23](learn/23-cv-qualifier-position.md)）是**同一个坑的另一次现形**。
+可以概括成一条项目级教训：
+
+> **凡是拿"给人看的字符串"当"机器用的键"，早晚出事。**
+
+clang 那边这两种东西从设计上就是分开的：成员是 `FieldDecl*`，
+布局按 `getFieldIndex()` 寻址，名字只交给 `LookupResult` 做查找、
+且查找结果自带"来自哪个子对象"（歧义因此天然可检出）。
+
+**顺带记录的两条方法论**：
+
+1. **补第三态**（B11）：`if/else` 写"优化决策"时，两态往往是从旧代码继承来的，
+   新情形出现时最容易漏 —— 先枚举出**全部**情形再写分支。
+2. **判据只许有一处**（B12，承 B10）：同一句"成员叫什么/是不是它"写在两条通路上，
+   就会各自演化。本轮的收口是 `findMethodInClass` / `findMethodInHierarchy` 两个原语。

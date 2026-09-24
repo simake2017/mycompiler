@@ -37,8 +37,10 @@
 //   expr             := or-expr（运算符优先级链：|| > && > == > < > + > * > 一元 > 后缀）
 //
 // ⚠ most-vexing-parse 简化：真 C++ 里 `T x(Foo());` 是函数声明（[stmt.dcl]）。本实现
-//   从源头回避该歧义 —— 语句级变量声明只认【类型关键字】或【标识符 + 标识符/(*)】
-//   开头（不支持括号初始化 `T x(...)`），类体内同样用"标识符后是否跟 '(' "区分方法与字段。
+//   从源头回避该歧义 —— 语句级变量声明只认【类型关键字】或【标识符 + 标识符/(*)】开头；
+//   带实参的括号初始化 `T x(args)` 【已支持】（parseVarDeclStmt 的 LParen 分支，
+//   也是 CTAD 的前置条件），列表初始化 `T x{...}` 仍不支持。
+//   类体内同样用"标识符后是否跟 '(' "区分方法与字段。
 //
 // 对照 clang（llvm-project/clang/lib/Parse/）：Parser.cpp parseTranslationUnit / 语句分派 /
 //   ParseDecl.cpp ParseDeclOrFunctionDefInternal / ParseTemplate.cpp ParseTemplateDeclaration /
