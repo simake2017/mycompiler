@@ -206,12 +206,29 @@ tests/unit/test_symbol_consistency.cpp（`SymbolConsistency.*` 5 例，断言【
 单测 229 → **233**，集成 94 → **98**，logdiff 重刷基线（既有 94 个**零漂移**）。
 索引与根因复盘见 docs/BUGS.md 的 B11~B15 与文末「小结 字符串兼任 ID 与路径」。
 
+✅ **模板模板实参的逐位签名匹配已完成**（[temp.arg.template]/2，P0522R0 口径）——
+**缺口**：模板模板形参的内层表此前**只数个数**（`size_t templateArity`，且该字段**从没被读过**）
+⇒ `template<template<class,class> class C>` 收一个只有 1 位的 `Box` 一路放行，
+直到替换出假类型 `Box<int,int>` 才在下游报"Box 至多 1 个实参"（诊断指向派生类型，不是根因）。
+**改法**：内层表逐位建 `TemplateParam` 节点存进 `TemplateParam::innerParams`
+（kind / NTTP 类型 / 默认值全带上），`checkTemplateArguments` 的模板位分支新增
+`ttpSignatureMismatch` 三条判据：①位数相同 ②逐位同 kind ③值位声明类型相同。
+★ **口径全部以 clang++-18 -std=c++20 探针实测确定**（docs/learn/33 §3.4 六条探针）——
+第一版我按旧规则写"实参多出的位有默认实参即可"，clang 当场报 `too many`（P0522R0 已废除该放宽）。
+**顺带验证**：别名模板作模板模板实参（形参表取别名自身、替换期正常解糖。
+测试 tests/tmpl/test_tmpl_57（正例：类模板 / 别名模板 / 形参顺序交换）+
+test_tmpl_58（too few）/ 59（kind 不符）+ 新增单测 tests/unit/test_ttp_signature.cpp
+（`TtpSignature.*` 5 例：四条判据分支 + 正例不变量，**四条分支逐条做了突变负向验证**）；
+文档 docs/learn/33 §3.3/§3.4/§5/§6/§7。**有意日志漂移**：模板位的绑定标签
+`(non-type)` → `(template)` + 新增 `✓ 签名匹配` 行（仅 test_tmpl_53），已重刷基线。
+
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
 函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；
-别名模板偏特化、别名模板作模板模板实参 —— 见 docs/learn/27 §5 边界表；
-模板模板参数的逐位签名匹配 [temp.arg.template]/2 —— 见 docs/learn/33 §5。
+别名模板偏特化 —— 见 docs/learn/27 §5 边界表；
+模板模板参数：形参包 `class...`（签名的偏序不可达）、模板位默认实参、嵌套模板模板参数
+（depth > 1 直接报错）—— 见 docs/learn/33 §5。
 ⏭ 后续计划见 **docs/ROADMAP.md**（主线 C 控制流 → D 常量折叠 → E 数组/高级类型 → F 深水区选做，
 每条含理论点/clang 参照/任务分解/验收）。新会话接手：先读本文件与 ROADMAP，选定主线再开工。
 

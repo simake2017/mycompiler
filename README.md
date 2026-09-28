@@ -390,6 +390,15 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_49_dependent_type_name.cpp` | **依赖类型名** `typename T::type` | [temp.res]/5 的悬案：定义期不知道 `T::x` 是类型还是值，`typename` 消歧、替换期才兑现（[temp.inst]）。★ 探测惯用法 `void_t<typename T::type>` 靠的正是 [temp.deduct]/8 的**直接上下文**：查不到必须**当场软失败** |
 | `test_tmpl_50_alias_templates.cpp` | **别名模板** `template<class T> using Vec = MyPtr<T>;` | [temp.alias]/1：别名**不是新类型**，`Vec<int>` 与 `MyPtr<int>` 就是同一个类型 ⇒ 没有"实例化"只有"解糖"，不产生新符号。三级落点：① 使用点 `Vec<int> v;` 由 resolveType 解糖；② 模板体内 `Vec<T>` 保持依赖，在替换的**直接上下文**里解（substituteType Case 5.8）；③ ★ 推导侧也要解 —— `T f(Vec<T>)` 的 P 侧不解糖就与 A 侧 `MyPtr_int` 合不上，候选被**静默剔除**。顺带补齐类模板 id 的结构合一（[temp.deduct.type]/8 的 `T<T1...>` 情形）与实例"出身"记录 |
 | `test_tmpl_51_ctad_and_guides.cpp` | **CTAD + 推导指引** `MyPtr m(7);` / `Two(int) -> Two<int,int>;` | [dcl.type.class.deduct]：没写 `<...>` 时拿**构造实参**反推类模板形参 —— 与函数模板推导是**同一套合一算法的反向使用**（模式来自构造函数形参表，实现上直接复用 `deducePair`）。只在直接初始化触发，故顺带补上 `Type name(args);` 文法。[temp.deduct.guide]：显式指引**优先于**构造函数（指引存在的意义就是改写默认规则），非模板指引用来补构造函数根本推不出的形参。★ 顺带暴露一个真问题：**替换 ≠ 实例化** —— 实例化函数后签名里残留的 `MyPtr<int>` 半成品必须再过一次 resolveType 才成 `MyPtr_int` |
+| `test_tmpl_52_reference_collapsing.cpp` | **引用折叠** [dcl.ref]/6 | `T& &`/`T& &&` → `T&`、`T&& &&` → `T&&`；不是"造新类型"而是**消除矛盾**（C++ 里不存在引用的引用）。两个曾经答错的落地点 |
+| `test_tmpl_52_nttp_spec_pattern.cpp` | **特化模式里的非类型位** | `enable_if<true,T>` 的第 1 位是值不是类型：`specPattern` 由 `vector<TypePtr>` 改型为 `vector<TemplateArg>`，拆掉"实参含值位就跳过特化"的旧守卫 —— `std::enable_if_t` 由此端到端可用 |
+| `test_tmpl_53_template_template_param.cpp` | **模板模板参数** [temp.param]/4 | `Wrap<Box,int>`：二级替换（`C<int>` → `Box<int>` → 落地解析）；mangling `_Z4WrapI3BoxiE` 与 clang 逐字符相同。实参位上的 `Box` 与 `int` 在 Parser 眼里同形 —— 形态只能由形参表裁定 |
+| `test_tmpl_54_error_ttp_not_template.cpp` | 错误：拿类型填模板位 | `Wrap<int,int>` 必须报 `must be a class template`；放行会造出模板名叫 `int` 的假实例，编译通过、汇编期才炸 |
+| `test_tmpl_55_auto_cv_forms.cpp` | **auto 的六种带壳形态** | `const auto` / `auto const` / `auto*` / `auto&` / `const auto&` / `auto&&`：等价于把 auto 当模板形参跑一次推导，外壳照抄、A 同步剥层 |
+| `test_tmpl_56_member_templates.cpp` | **成员模板** [temp.mem] | 类是普通类、成员自己带模板形参按调用点推导；标准明说规则与 [temp.deduct] **完全一致** ⇒ 直接复用同一套合一算法，只多 `ownerClassName` 与 `类名_方法名_实参后缀` 符号 |
+| `test_tmpl_57_ttp_signature_match.cpp` | **模板模板实参的逐位签名匹配** [temp.arg.template]/2 | 内层形参表由"只数个数"改为存完整 `TemplateParam` ⇒ 位数相同 + 逐位同 kind + 值位类型相同；别名模板作实参取别名自己的形参表 |
+| `test_tmpl_58_error_ttp_arity_mismatch.cpp` | 错误：签名**位数**不符 | `template<template<class,class> class C>` 收只有 1 位的 `Box` ⇒ `too few`；缺这道校验会一路放行到下游报"假类型实参过多"，诊断不指向根因 |
+| `test_tmpl_59_error_ttp_kind_mismatch.cpp` | 错误：签名**逐位 kind** 不符 | 形参位要值位（`template<int> class C`）、实参模板对应位是类型位 ⇒ `different kind` |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -428,6 +437,9 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 31. tests/decl/test_decl_02_adl_and_qualified_lookup.cpp ← ADL：名字查找的第三个入口
 32. test_tmpl_50_alias_templates.cpp ← ★ 别名模板：只是名字，不是类型（推导侧也要解糖）
 33. test_tmpl_51_ctad_and_guides.cpp ← ★ CTAD：把构造函数当指引，反向用一次合一算法
+34. test_tmpl_53_template_template_param.cpp ← ★ 模板模板参数：形参表里的第三种形态
+35. test_tmpl_56_member_templates.cpp ← ★ 成员模板：规则与函数模板逐字相同
+36. test_tmpl_57_ttp_signature_match.cpp ← ★ 模板位的签名匹配：位数 + 逐位 kind（口径来自 clang 探针）
 ```
 
 ---
@@ -523,6 +535,9 @@ mycompiler/
 │   ├── test_tmpl_49_*.cpp          # 依赖类型名 typename T::type 与探测惯用法
 │   ├── test_tmpl_50_*.cpp          # 别名模板 template<T> using（解糖而非实例化）
 │   ├── test_tmpl_51_*.cpp          # CTAD 类模板实参推导 + 推导指引
+│   ├── test_tmpl_52..56_*.cpp      # 引用折叠 / NTTP 特化模式 / 模板模板参数 /
+│   │                               #   auto 带壳形态 / 成员模板
+│   ├── test_tmpl_57..59_*.cpp      # 模板模板实参的逐位签名匹配（+ 两条负向）
 │   └── unit/                       # 单元测试（ctest 驱动，159 个用例）
 │       ├── test_template_deduction.cpp  # 推导 / 替换 / 偏特化匹配 / NTTP
 │       ├── test_decltype_sfinae.cpp     # Decltype.* / Sfinae.* / PartialOrder.* / SfinaeProtocol.*
@@ -716,6 +731,16 @@ MyClass::foo(int)   → _ZN7MyClass3fooEi (类方法)
 - [x] **CTAD + 推导指引**：`MyPtr m(7);` 由构造实参反推类模板形参、
       直接初始化 `Type name(args);` 文法、`X(T) -> X<T>;` 模板/非模板指引
       （文档 docs/learn/28）
+- [x] **继承的默认访问级别**：`struct X : Base` 默认 **public**（[class.derived]/2）
+- [x] **一元 `*p` 解引用**（[expr.unary.op]/1，按 pointee 宽度分派读/写）、
+      **后置 const 成员函数**（[dcl.fct]/7）、**类内 static 成员函数**（[class.static]/2）
+- [x] **NTTP 值位参与偏特化模式**：`enable_if<true, T>` 的地基，`std::enable_if_t` 端到端可用
+- [x] **模板模板参数**：`template<template<class> class C>` + `Wrap<Box,int>`，
+      二级替换；**模板模板实参的逐位签名匹配**（[temp.arg.template]/2，P0522R0 口径：
+      位数相同 + 逐位同 kind + 值位类型相同，别名模板作实参取别名自身的形参表）
+      （文档 docs/learn/33）
+- [x] **成员模板**：`A::add(T)` 按调用点推导，规则与函数模板逐字相同（[temp.mem]）
+      （文档 docs/learn/34）
 
 ---
 

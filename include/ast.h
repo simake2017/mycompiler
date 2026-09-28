@@ -714,16 +714,24 @@ enum class TemplateParamKind {
     Template, // template <class> class C —— 模板模板参数 [temp.param]/4
 };
 
+struct TemplateParam;                       // 前置声明，理由见下方「指针形式」说明
+using TemplateParamPtr = std::shared_ptr<TemplateParam>;
+
 struct TemplateParam {
     TemplateParamKind kind = TemplateParamKind::Type;
     std::string       name;
     TypePtr           nonType = nullptr; // 非类型形参对应的类型（如 int）
 
-    // ── kind == Template 时有效：被接受模板的【形参个数】───────────────
-    // `template <template <class> class C>` ⇒ C.templateArity = 1。
-    // 只记元数：本项目不做 [temp.arg.template]/2 的"逐位形参表至少一样特化"
-    // 匹配，形态自检只要求"这一位得是个模板名"。
-    size_t            templateArity = 0;
+    // ── kind == Template 时有效：被接受模板的【内层形参表】（[temp.param]/4）──
+    // `template <template <class> class C>` ⇒ C 的内层表 = 一个{Type} 形参。
+    // ★ 存【节点】而不是只记个数：实参位 `Wrap<Box, int>` 要对 Box 做
+    //   [temp.arg.template]/2 的逐位签名匹配，就必须知道内层【每位期望什么
+    //   kind】——只记个数只能查元数。（旧版这里是个 size_t templateArity，
+    //   全项目连一处读取都没有：既查不了 kind，也查不了元数。）
+    // demo: template<template<class, int> class C> ⇒ innerParams = [Type, NonType]
+    // 对照 clang：TemplateTemplateParmDecl::getTemplateParameters() 自带
+    //   TemplateParameterList（TemplateDecl 子类，形参表是它的组成部分）。
+    std::vector<TemplateParamPtr> innerParams;
 
     // ── 默认模板实参（[temp.param]/12）──
     // demo: template<typename T, typename U = void> 里 U 的 `= void` ⇒ hasDefault = true
@@ -753,7 +761,8 @@ struct TemplateParam {
 //   push_back 会 reallocate，先前取得的 `const TemplateParam*` 立刻失效：
 //   demo：`template<class T, class U>` 解析到 T 时又 push_back(U) ⇒ 指向 T 的指针作废，
 //   而模板形参作用域的查询恰发生在 push_back 进行中（见 parser.h 的帧）。
-using TemplateParamPtr = std::shared_ptr<TemplateParam>;
+//   （别名 TemplateParamPtr 因此前置到结构体之前声明 —— TemplateParam 的
+//     innerParams 自己就是一个 TemplateParamPtr 表。）
 
 // ─── 模板声明的种类（[temp.class.spec] / [temp.expl.spec]）──────────────────
 // 一个类模板可以有三种"版本"，同名共存，靠实参匹配择优：

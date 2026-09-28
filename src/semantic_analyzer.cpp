@@ -3676,6 +3676,7 @@ TypePtr SemanticAnalyzer::resolveTemplateCall(
 // 对照 clang：Sema::CheckTemplateArgumentList（clang/Sema/SemaTemplate.cpp）—— 真实现还会
 //   做隐式转换（Buf<4> 的 4 → unsigned/枚举）、默认模板实参填充、参数包匹配；本项目只留
 //   ①②③三条主干，够讲清"类型 vs 值"的判定。逐位判定结果见下方 DEMO 的真实日志。
+//   ④ 模板模板位：实参模板的形参表要与内层表【逐位签名匹配】（[temp.arg.template]/2，见 ②-c）
 // ┌─ DEMO（真实日志）──────────────────────────────────────────────────────────
 // │ 源码  Box<int> bi;      Box<int*> bp;      Buf<4> b;
 // │ 日志  [sema:targ]   ✓ param 1: 'T' (type) ← int
@@ -3683,7 +3684,75 @@ TypePtr SemanticAnalyzer::resolveTemplateCall(
 // │ 反例  Buf<int> → ②-b 命中：
 // │       [ERROR] template argument 1 for 'Buf' ('N') must be a non-type argument
 // │               of type 'int', but 'int' is a type
+// │ 反例  Wrap2<Box, int>（形参位要 2 位、Box 只有 1 位）→ ②-c 命中：
+// │       [ERROR] template template argument has different template parameters
+// │               than its corresponding template template parameter ...
 // └────────────────────────────────────────────────────────────────────────────
+namespace {
+
+/// 模板形参 kind 的可读名（诊断文案用）
+std::string ttpKindName(TemplateParamKind k) {
+    switch (k) {
+        case TemplateParamKind::Type:     return "a type parameter";
+        case TemplateParamKind::NonType:  return "a non-type parameter";
+        case TemplateParamKind::Template: return "a template template parameter";
+    }
+    return "a parameter";
+}
+
+/// ── [temp.arg.template]/3：模板模板实参的【逐位签名匹配】（简化版）──────────
+/// P = 形参位声明的内层表（`template<template<class, int> class C>` 的 [class, int]）
+/// A = 实参模板自己的形参表（`Wrap<Pair>` 里 Pair 的形参表）
+///
+/// 规则**照 clang++-18 -std=c++20 实测口径**（探针见 docs/learn/33 §3.4）：
+///   ① 位数必须【相同】—— 少了不行（too few），多了也不行（too many，
+///      哪怕多出的位有默认实参：旧标准的"多出的位有默认即可"已被 P0522R0 取代）。
+///      唯一的例外是 P 里写参数包 `template<class...> class C`（可吸收任意位数），
+///      本项目不支持形参包，故不设该例外。
+///   ② 逐位同 kind：类型 ↔ 类型、值 ↔ 值、模板 ↔ 模板
+///   ③ 值位还要声明类型相同：`template<int>` 与 `template<unsigned>` 不匹配
+///
+/// ★ 少写这条校验的后果：`Wrap2<Box, int>`（形参位 2 位、Box 1 位）会一路放行，
+///   直到替换出 `Box<int,int>` 才在下游报"Box 至多 1 个实参"——报是报了，但诊断
+///   指向派生出的假类型而不是根因（实参列表）。
+///
+/// 返回空串 = 匹配通过；否则返回诊断正文。
+/// 对照 clang：Sema::CheckTemplateTemplateArgument（clang/Sema/SemaTemplate.cpp）
+///   的 relaxed 分支（isTemplateTemplateParameterAtLeastAsSpecializedAs）。
+///   真实现是两张形参表之间的【偏序】，本实现取"位数 + 逐位 kind/类型"主干。
+std::string ttpSignatureMismatch(const TemplateParam& p,
+                                 const std::vector<TemplateParamPtr>& a) {
+    // ① 位数（对照 clang 的两条 note：too few / too many template parameters
+    //    in template template argument）
+    if (a.size() != p.innerParams.size()) {
+        return std::format("{} template parameters: '{}' declares {} parameter(s), "
+                           "but the template argument provides {}",
+                           a.size() < p.innerParams.size() ? "too few" : "too many",
+                           p.name, p.innerParams.size(), a.size());
+    }
+    // ②③ 逐位形态（对照 clang 的 note：template parameter has a different kind /
+    //    template non-type parameter has a different type）
+    for (size_t i = 0; i < p.innerParams.size(); i++) {
+        const TemplateParam& wp = *p.innerParams[i];   // want：形参位声明的
+        const TemplateParam& ap = *a[i];               // given：实参模板声明的
+        if (wp.kind != ap.kind) {
+            return std::format("parameter {} has a different kind: '{}' declares {}, "
+                               "but the template argument declares {}",
+                               i + 1, p.name, ttpKindName(wp.kind), ttpKindName(ap.kind));
+        }
+        if (wp.kind == TemplateParamKind::NonType && wp.nonType && ap.nonType
+            && !wp.nonType->equals(ap.nonType)) {
+            return std::format(
+                "non-type parameter {} has a different type: '{}' declares '{}', "
+                "but the template argument declares '{}'",
+                i + 1, p.name, wp.nonType->toString(), ap.nonType->toString());
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
 void SemanticAnalyzer::checkTemplateArguments(
     const TemplateDeclPtr& blueprint, const TypePtr& templateIdType,
     SourceLocation loc) {
@@ -3723,8 +3792,10 @@ void SemanticAnalyzer::checkTemplateArguments(
         const std::string want =
             (p.kind == TemplateParamKind::Type)
                 ? "a type argument"
-                : std::format("a non-type argument of type '{}'",
-                              p.nonType ? p.nonType->toString() : "?");
+                : (p.kind == TemplateParamKind::Template
+                       ? "a template argument"
+                       : std::format("a non-type argument of type '{}'",
+                                     p.nonType ? p.nonType->toString() : "?"));
 
         // ②-a 类型形参 收到 值实参：Box<4> 而 T 是类型形参
         if (p.kind == TemplateParamKind::Type && a.isValue()) {
@@ -3759,10 +3830,49 @@ void SemanticAnalyzer::checkTemplateArguments(
                 tname, p.name, a.valueType->toString(), p.nonType->toString()), loc);
         }
 
+        // ②-c 模板模板形参 [temp.arg.template]/2：实参模板的形参表要逐位对上内层表。
+        //     走到这儿时实参已被 resolveType 改写成【模板名】形态（sema 的
+        //     `⤷ 第 N 位期望模板` 那一步）；若还没改写（别处直接造 id 的路径），
+        //     这里兜底报"这一位要的是模板"。
+        if (p.kind == TemplateParamKind::Template && a.isTemplate()) {
+            // 实参模板自己的形参表：类模板 / 别名模板都从注册表取
+            const std::vector<TemplateParamPtr>* argParams = nullptr;
+            if (auto it = m_classTemplates.find(a.templateName);
+                it != m_classTemplates.end()) {
+                argParams = &it->second->templateParams;
+            } else if (auto it = m_aliasTemplates.find(a.templateName);
+                       it != m_aliasTemplates.end()) {
+                argParams = &it->second->templateParams;
+            }
+            if (argParams == nullptr) {
+                error(std::format(
+                    "template argument {} for '{}' ('{}') must be {}, but '{}' is not "
+                    "a template", i + 1, tname, p.name, want, a.templateName), loc);
+            }
+            if (const std::string why = ttpSignatureMismatch(p, *argParams); !why.empty()) {
+                error(std::format(
+                    "template template argument has different template parameters than "
+                    "its corresponding template template parameter ('{}'): {}",
+                    p.name, why), loc);
+            }
+            std::cout << std::format(
+                "  [sema:targ]   ✓ 签名匹配: '{}' ← '{}'（{} 位逐位一致，"
+                "[temp.arg.template]/2）\n",
+                p.name, a.templateName, p.innerParams.size());
+        }
+        else if (p.kind == TemplateParamKind::Template) {
+            error(std::format(
+                "template argument {} for '{}' ('{}') must be {}, but '{}' is {}",
+                i + 1, tname, p.name, want, a.toString(),
+                a.isType() ? "a type" : "a value"), loc);
+        }
+
         std::cout << std::format(
             "  [sema:targ]   ✓ param {}: '{}' ({}) ← {}\n",
             i + 1, p.name,
-            p.kind == TemplateParamKind::Type ? "type" : "non-type",
+            p.kind == TemplateParamKind::Type
+                ? "type"
+                : (p.kind == TemplateParamKind::Template ? "template" : "non-type"),
             a.toString());
     }
 

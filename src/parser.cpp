@@ -814,7 +814,8 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
     TemplateParamFrame frame(this, decl.get());
 
     if (!check(TokenType::Greater)) {
-        int unnamedSeq = 0;   // 无名形参的合成名序号（见下方 unnamed 分支）
+        int unnamedSeq = 0;        // 无名形参的合成名序号（见下方 unnamed 分支）
+        int innerUnnamedSeq = 0;   // 模板模板形参【内层表】自己的合成名序号
         do {
             TemplateParam param;
             param.location = current().location;
@@ -853,7 +854,9 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                 // ── 模板模板参数 [temp.param]/4 ──
                 //   template <template <class> class C, class T> struct Wrap;
                 // 形态是「内层 template <...> 形参表」+「自己的 class/typename」+「名字」。
-                // 内层表只数个数（templateArity），不做逐位签名匹配 —— 见 ast.h 的说明。
+                // 内层表存成【节点】（TemplateParam::innerParams）：实参位要对
+                //   `Wrap<Box, int>` 的 Box 做逐位签名匹配，得知道每位期望什么 kind。
+                //   匹配本身在 Sema 的 checkTemplateArguments（[temp.arg.template]/2）。
                 // demo: `template<template<class> class C, class T> struct Wrap { C<T> inner; };`
                 //   声明点 ⇒ "★ template template parameter registered: 'C'
                 //              (accepts a template with 1 parameter(s), [temp.param]/4)"
@@ -867,29 +870,44 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
                 advance();   // 'template'
                 expect(TokenType::Less,
                        "Expected '<' after 'template' in template template parameter");
-                size_t innerArity = 0;
                 if (!check(TokenType::Greater)) {
                     do {
+                        // ★ 与【外层形参表】同一套形态分支，区别只在建出的节点挂到
+                        //   C 自己的子表 innerParams 上 —— 不能塞进外层那个 vector，
+                        //   那会多出假的形参位（docs/learn/33 §3.1 记的坑）。
+                        // 内层形参名只为诊断好看：它不进模板体（模板体里用的是实参
+                        //   模板的形参，跟这里的名字无关）。
+                        TemplateParam inner;
+                        inner.location = current().location;
                         if (check(TokenType::KwTypename) || check(TokenType::KwClass)) {
+                            inner.kind = TemplateParamKind::Type;
                             advance();
-                            if (check(TokenType::Identifier)) advance();  // 内层形参名可省
+                            if (check(TokenType::Identifier)) {
+                                inner.name = advance().text;   // 内层形参名可省
+                            } else {
+                                inner.name = "$unnamed" + std::to_string(innerUnnamedSeq++);
+                                inner.isUnnamed = true;
+                            }
                         }
                         else if (check(TokenType::KwTemplate)) {
-                            // 内层又是模板模板参数：递归吃掉它的内层表
-                            // （本项目只做一层，更深的嵌套在此报错而不是静默算错）
+                            // 内层又是模板模板参数：本项目只做一层
+                            // （更深的嵌套在此报错而不是静默算错）
                             error("nested template template parameters are not implemented "
                                   "(depth > 1)");
                         }
                         else {
-                            parseType();                    // 内层 NTTP：如 int N
-                            if (check(TokenType::Identifier)) advance();
+                            // 内层 NTTP：如 `template<template<int> class C>`
+                            inner.kind = TemplateParamKind::NonType;
+                            inner.nonType = parseType();
+                            if (check(TokenType::Identifier)) inner.name = advance().text;
                         }
-                        innerArity++;
+                        param.innerParams.push_back(
+                            std::make_shared<TemplateParam>(std::move(inner)));
                     } while (match(TokenType::Comma));
                 }
                 expect(TokenType::Greater,
                        "Expected '>' to close template template parameter list");
-                param.templateArity = innerArity;
+                const size_t innerArity = param.innerParams.size();
                 // 自己的 class / typename 关键字
                 if (!check(TokenType::KwClass) && !check(TokenType::KwTypename)) {
                     error("Expected 'class' or 'typename' after the template parameter "

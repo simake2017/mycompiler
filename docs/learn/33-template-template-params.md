@@ -74,8 +74,8 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
 ```text
    template <template <class> class C, class T> struct Wrap { C<T> inner; };
                      │                        │
-                     │ Parser: 内层 <...> 只数个数   │
-                     │         （templateArity = 1）  │
+                     │ Parser: 内层 <...> 逐位建节点  │
+                     │   （innerParams = [class]）    │
                      ▼                        ▼
               TemplateParam{Template,"C"}   TemplateParam{Type,"T"}
 
@@ -89,6 +89,8 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
    │        ├─ 是：检查名字确实是类模板              │
    │        │       ⇒ TemplateArg::ofTemplate(name) │  ← 不进 resolveType
    │        └─ 否：TemplateArg::ofType(resolveType) │
+   │   （★ 内层表存下来后，此处再补一道            │
+   │      ttpSignatureMismatch 逐位签名匹配）        │
    └──────────────┬─────────────────────────────────┘
                   ▼
    ┌────────────────────────────────────────────────┐
@@ -111,14 +113,15 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
 
 | # | 文件:位置 | 改动 |
 |---|---|---|
-| 1 | `include/ast.h` · `TemplateParamKind` | 加 `Template`；`TemplateParam` 加 `templateArity` |
+| 1 | `include/ast.h` · `TemplateParamKind` | 加 `Template`；`TemplateParam` 加 `innerParams`（内层形参表，见 §3.3） |
 | 2 | `include/type.h` · `TemplateArgKind` | 加 `Template`；`TemplateArg` 加 `templateName` + `ofTemplate` / `isTemplate` |
 | 3 | `src/type.cpp` · `toString` / `equals` | 模板实参印名字、按名字判等 |
-| 4 | `src/parser.cpp` · 形参循环 | 新增 `KwTemplate` 分支：**单独吃掉内层形参表**（只数个数） |
+| 4 | `src/parser.cpp` · 形参循环 | 新增 `KwTemplate` 分支：**单独吃掉内层形参表**，逐位建 `TemplateParam` 节点存进 `innerParams` |
 | 5 | `src/semantic_analyzer.cpp` · `resolveType` 模板 id 分支 | 逐位看形参，`Template` 位取名字改标 + "必须是类模板"校验 |
 | 6 | `src/template_instantiation.cpp` · `substituteType` | 新增 **Case 5.3**：模板模板形参改名 |
 | 7 | `src/template_instantiation.cpp` · `mangleTemplateInstance` | 模板实参按 `<name>` 编码（`3Box`），**不能落到 NTTP 分支** |
 | 8 | `src/main.cpp` · Phase 4 演示 | 含模板模板形参的模板跳过"固定类型演示" |
+| 9 | `src/semantic_analyzer.cpp` · `checkTemplateArguments` 模板位分支 | **逐位签名匹配** `ttpSignatureMismatch`（[temp.arg.template]/2，见 §3.3） |
 
 ### 3.1 内层形参表必须单独吃掉
 
@@ -130,8 +133,12 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
 2. 把紧随其后的 `C` 当成形参名；
 3. 下一轮撞上 `,` 之前那个 `class T` 前面已经错位 —— 得到一张**多出一位的形参表**。
 
-故内层表用**独立的 do-while** 吃掉，一个形参都不注册。这也让
-`templateArity` 顺手可得（本项目只用它做形态检查，不做逐位签名匹配）。
+故内层表用**独立的 do-while** 吃掉，一个形参都不注册到外层形参表，而是逐位建成
+`TemplateParam` 节点存进 `param.innerParams`（§3.3 会用到这些节点）。
+
+★ 这一环最初是"只数个数"（存 `size_t templateArity`）——**够用于形态检查，但不够做
+签名匹配**：签名匹配要的恰恰是每位**是什么 kind**、值位**是什么类型**，而这些信息
+在"只数个数"的那一刻就丢了。这正是本批要补的缺口。
 
 ### 3.2 mangling：模板实参不是值
 
@@ -147,6 +154,72 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
 只是与全世界其他编译器不兼容。故新增形态时必须同步问一句
 "这个 kind 在主流程的每一个 `if/else` 里都有归宿吗"。
 
+### 3.3 逐位签名匹配（[temp.arg.template]/2）
+
+内层形参表存下来之后，`checkTemplateArguments` 的模板位分支就能拿**两张形参表**做对比：
+
+```text
+   形参位 P（Wrap2 声明的）     实参模板 A（Pair 声明的）
+   template<template<class,class> class C, class T>   template<class T, int N> struct Pair
+                      └──────┬──────┘                          └───┬───┘
+                          P.innerParams                       m_classTemplates["Pair"].templateParams
+                             └──────────────► ttpSignatureMismatch ◄────────────┘
+                                                     │
+                                            空串 = 匹配；否则返回诊断正文
+```
+
+判据三条（**全部以 clang 实测口径为准**，见 §3.4）：
+
+| # | 判据 | 不符时 |
+|---|---|---|
+| ① | 位数**相同**（唯一的例外是形参位写参数包 `template<class...>`，本项目不支持形参包，故不设例外） | `too few / too many template parameters` |
+| ② | 逐位同 kind | `parameter N has a different kind` |
+| ③ | 值位还要**声明类型相同** | `non-type parameter N has a different type` |
+
+实参模板的形参表从**注册表**取（类模板 `m_classTemplates` / 别名模板 `m_aliasTemplates`）——
+别名模板没有"实例化"，但**有形参表**，所以 `Wrap3<Alias>` 这一位天然能对上
+（`Alias` 是 `template<class T, int N> using Alias = Pair<T,N>`，位数与 kind 都取别名自身）。
+
+★ 对照 clang：`Sema::CheckTemplateTemplateArgument`（`clang/Sema/SemaTemplate.cpp`）
+的 relaxed 分支走的是 `isTemplateTemplateParameterAtLeastAsSpecializedAs` —— 那是
+**两张形参表之间的偏序**（等价于 [temp.arg.template]/2 的完整规则）。本项目取
+"位数 + 逐位 kind/类型"主干，够把教学用例的错法全部拦下，但不做偏序。
+
+### 3.4 clang oracle 探针（本批口径的出处）
+
+`clang++-18 -std=c++20 -fsyntax-only` 逐条实测（★ 第 1 条否掉了我第一版的实现）：
+
+| 探针 | P（形参位内层表） | A（实参模板） | clang 判定 |
+|---|---|---|---|
+| Q2 | `[class, class]` | `[class]` | ❌ `too few template parameters` |
+| Q3 | `[class]` | `[class, class = int]` | ❌ `too many template parameters`（**默认实参不救**） |
+| Q4 | `[class...]`（参数包） | `[class, class]` | ✅ 参数包可吸收任意位数 |
+| Q5 | `[int]` | `[class]` | ❌ `template parameter has a different kind` |
+| Q7 | `[int]` | `[unsigned]` | ❌ `template non-type parameter has a different type` |
+| Q8 | `[class, int]`（别名位） | `[class]` | ❌ `too few` |
+
+Q3 是**最容易写反**的一条：P0522R0 之前的规则是"实参多出的位只要有默认实参就合法"，
+照旧规则写 `ttpSignatureMismatch` 会把 `Wrap1<Box2>`（Box2 第二位带 `= void`）放行，
+而 clang 报错。**教训：标准条文的记忆必须先过 oracle，再写实现** ——
+Q2/Q3/Q5/Q7/Q8 五条探针全跑一遍只花了不到一分钟。
+
+复现：
+
+```bash
+mkdir -p /tmp/ttpcases && cd /tmp/ttpcases
+cat > q3.cpp <<'EOF'
+template <template <class> class C> struct Wrap1 { C<int> inner; };
+template <class T, class U = void> struct Box2 { T a; U b; };
+int main() { Wrap1<Box2> w; return 0; }
+EOF
+clang++-18 -std=c++20 -fsyntax-only q3.cpp
+# ⇒ error: template template argument has different template parameters ...
+#   note: too many template parameters in template template argument
+./minicc q3.cpp -o /tmp/q3; echo $?
+# ⇒ [ERROR] [Semantic Error] 1:1: ... too many template parameters: 'C' declares 1
+#   parameter(s), but the template argument provides 2   （rc=1）
+```
+
 ---
 
 ## 4. 可复现实验
@@ -161,7 +234,12 @@ clang++-18 -std=c++20 tests/tmpl/test_tmpl_53_template_template_param.cpp -o /tm
   | grep -E "template template parameter|期望模板|模板模板形参" | grep -v "\[pp\]"
 
 # ③ 错误用例（期望 exit=1）
-./minicc tests/tmpl/test_tmpl_54_error_ttp_not_template.cpp; echo "exit=$?"
+./minicc tests/tmpl/test_tmpl_54_error_ttp_not_template.cpp; echo "exit=$?"   # 拿类型填模板位
+./minicc tests/tmpl/test_tmpl_58_error_ttp_arity_mismatch.cpp; echo "exit=$?" # 位数不符 too few
+./minicc tests/tmpl/test_tmpl_59_error_ttp_kind_mismatch.cpp;  echo "exit=$?" # 逐位 kind 不符
+
+# ③' 签名匹配的单测（四条分支 + 正例不变量）
+./build-linux/unit_tests --gtest_filter='TtpSignature.*'
 
 # ④ mangling 与 clang 逐字符核对
 cat > /tmp/ttp_mng.cpp <<'EOF'
@@ -182,10 +260,12 @@ clang++-18 -std=c++20 -c /tmp/ttp_mng.cpp -o /tmp/ttp_mng.o && nm /tmp/ttp_mng.o
 
 | 缺口 | 症状 | 卡在哪 |
 |---|---|---|
-| 逐位签名匹配 [temp.arg.template]/2 | `template<template<class,class> class C>` 收 `Box`（只 1 位）不报错 | 只存了 `templateArity`，没存内层形参的 **kind**；要补齐得让内层表也走完整 `TemplateParam` |
-| 默认模板实参 | `template <template <class> class C = Box>` | `TemplateParam::defaultArg` 是 `TemplateArg`，加一个 Template 形态即可，但实参位还没支持 |
+| ~~逐位签名匹配 [temp.arg.template]/2~~ | ✅ **本批已补**（§3.3）：位数 / 逐位 kind / 值位类型三条判据；测试 `test_tmpl_57..59` + 单测 `TtpSignature.*` | — |
+| 签名的**偏序**（完整 [temp.arg.template]/2） | 参数包形参位 `template<template<class...> class C>` 收任意位数的模板；以及重载决议里"哪个模板模板实参更特化" | 本项目不支持形参包（[temp.variadic]），签名的全序比对不可达 → 见下条 |
+| 形参包 `class...` / `int...` | 一切 [temp.variadic] 用法 | 无 `ParameterPack` 形态；`parseTemplateDecl` 遇 `...` 直接报错 |
+| 默认模板实参（模板位） | `template <template <class> class C = Box>` | `TemplateParam::defaultArg` 是 `TemplateArg`，加一个 Template 形态即可，但实参位还没支持 |
 | 嵌套模板模板参数 | `template <template <template<class> class> class C>` | Parser 显式报错（depth > 1），不是静默算错 |
-| 别名模板作模板模板实参 | `Wrap<Vec, int>`（Vec 是别名模板） | 判定里已放行 `m_aliasTemplates`，但替换期拿到名字后走不到解糖 —— 未验证 |
+| ~~别名模板作模板模板实参~~ | ✅ **本批已验证**：`Wrap3<Alias>` 位宽/kind 取别名自身，替换期正常解糖（日志 `[alias] ★ Alias<...> 解糖 ⇒ Pair_int_5`） | — |
 | 模板模板形参当类型用 | `C c;`（不带实参） | 报 `unknown type name 'C'`，诊断不指向根因 |
 
 ---
@@ -194,10 +274,10 @@ clang++-18 -std=c++20 -c /tmp/ttp_mng.cpp -o /tmp/ttp_mng.o && nm /tmp/ttp_mng.o
 
 | clang（`~/cppproject/llvm-project/`） | 本实现位置 | 简化了什么 |
 |---|---|---|
-| `TemplateTemplateParmDecl`（`TemplateDecl` 子类，自带形参表） | `TemplateParam{kind=Template, templateArity}` | 不建独立的 Decl 节点，只在外层形参上记元数 |
+| `TemplateTemplateParmDecl`（`TemplateDecl` 子类，自带 **`TemplateParameterList*`**） | `TemplateParam{kind=Template, innerParams}` | 不建独立的 Decl 节点，内层表挂在形参上；嵌套深度 > 1 直接报错 |
 | `TemplateArgument::Template`（带 `TemplateDecl*`） | `TemplateArg{kind=Template, templateName}` | 存名字而非指针（本项目模板注册表按名字索引） |
-| `ParseTemplateParameter` 遇 `kw_template` 递归 `ParseTemplateParameterList` | `parseTemplateDecl` 的 `KwTemplate` 分支 | 内层表只数个数；嵌套深度 > 1 直接报错 |
-| `Sema::CheckTemplateArgument` 的 `CheckTemplateTemplateArgument` | `resolveType` 模板 id 分支的逐位检查 | 不做 [temp.arg.template]/2 的逐位形参匹配 |
+| `ParseTemplateParameter` 遇 `kw_template` 递归 `ParseTemplateParameterList` | `parseTemplateDecl` 的 `KwTemplate` 分支 | 内层表逐位建 `TemplateParam`（含 kind / NTTP 类型），但不注册进符号表 |
+| `Sema::CheckTemplateArgument` 的 `CheckTemplateTemplateArgument` | `checkTemplateArguments` 模板位分支 → `ttpSignatureMismatch` | 做**位数 + 逐位 kind/类型**；不做 relaxed 分支的偏序 `isTemplateTemplateParameterAtLeastAsSpecializedAs` |
 | `TreeTransform::TransformTemplateSpecializationType` | `substituteType` Case 5.3 | 只换名字段；不做 clang 的 sugar 重建 |
 | `ItaniumMangle` 的模板模板实参路径 | `mangleTemplateInstance` 的 `isTemplate()` 分支 | 只支持简单模板名（`3Box`），不支持 `X<...>E` 的复杂形态 |
 
@@ -210,7 +290,13 @@ clang++-18 -std=c++20 -c /tmp/ttp_mng.cpp -o /tmp/ttp_mng.o && nm /tmp/ttp_mng.o
 ```text
   [parse:template]   ★ template template parameter registered: 'C' (accepts a template with 1 parameter(s), [temp.param]/4)
   [sema:targ]   ⤷ 第 1 位期望模板 ⇒ 实参 'Box' 按【模板名】处理（[temp.arg.template]）
+  [sema:targ]   ✓ 签名匹配: 'C' ← 'Box'（1 位逐位一致，[temp.arg.template]/2）   ← §3.3 新增
+  [sema:targ]   ✓ param 1: 'C' (template) ← Box                                  ← 标签是 template
+  [sema:targ]   ✓ param 2: 'T' (type) ← int
 ```
+
+★ 注意绑定日志里这一位的标签：本批之前一律印 `(non-type)`（当时只区分"类型位 / 其它"两态），
+现在按三态印 —— 日志是契约（`logdiff.sh`），这条改动是**有意漂移**，已随本批重刷基线。
 
 实例化期的二级替换（`C<T>` → `Box<T>` → `Box_int`）：
 
