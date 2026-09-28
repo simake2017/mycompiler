@@ -142,7 +142,27 @@ TEST(TtpSignature, NonTypeParameterTypeMismatch) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ⑤ 正例不变量：签名对上 ⇒ 绑定成功，且日志把这一位标成 (template)
+// ⑤ 形态层：模板【特化类型】`Box<int>` 不是模板名 —— 必须拒，不能"看名字眼熟就放行"
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ 这是本文件里唯一一条**不是**关于"两张形参表对比"的判据，而是它的前置：
+//   Parser 把 `Box` 与 `Box<int>` 都建成 Class 节点、名字段**都是 "Box"**，
+//   只查"这个名字在注册表里吗"就会被 `Box<int>` 骗过去 ⇒ `<int>` 静默蒸发、
+//   这一位按裸 `Box` 用；产物与 `Wrap<Box,int>` 逐字节相同，**连算错都看不出来**。
+TEST(TtpSignature, TemplateIdArgumentIsNotATemplateName) {
+    const std::string src =
+        "template <template <class> class C, class T>\n"
+        "struct Wrap { C<T> inner; };\n"
+        "template <class T> struct Box { T value; };\n"
+        "int main() { Wrap<Box<int>, int> w; return 0; }\n";
+
+    const std::string err = semaErrorOf(src);
+    EXPECT_NE(err.find("must be a class template"), std::string::npos) << err;
+    EXPECT_NE(err.find("'Box<int>'"), std::string::npos)
+        << "诊断要把带实参的那个 id 原样印出来（'Box<int>'），而不是只印名字段 'Box'：" << err;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ⑥ 正例不变量：签名对上 ⇒ 绑定成功，且日志把这一位标成 (template)
 // ─────────────────────────────────────────────────────────────────────────────
 TEST(TtpSignature, MatchingSignatureBinds) {
     const std::string src =

@@ -399,6 +399,7 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_57_ttp_signature_match.cpp` | **模板模板实参的逐位签名匹配** [temp.arg.template]/2 | 内层形参表由"只数个数"改为存完整 `TemplateParam` ⇒ 位数相同 + 逐位同 kind + 值位类型相同；别名模板作实参取别名自己的形参表 |
 | `test_tmpl_58_error_ttp_arity_mismatch.cpp` | 错误：签名**位数**不符 | `template<template<class,class> class C>` 收只有 1 位的 `Box` ⇒ `too few`；缺这道校验会一路放行到下游报"假类型实参过多"，诊断不指向根因 |
 | `test_tmpl_59_error_ttp_kind_mismatch.cpp` | 错误：签名**逐位 kind** 不符 | 形参位要值位（`template<int> class C`）、实参模板对应位是类型位 ⇒ `different kind` |
+| `test_tmpl_60_error_ttp_arg_is_template_id.cpp` | 错误：拿**特化类型**填模板位 | `Wrap<Box<int>,int>` 的 `Box<int>` 是**类型**不是模板名。★ 最阴的一条：`Box` 与 `Box<int>` 的名字段都是 `"Box"`，只查名字会被骗过去、`<int>` 静默蒸发，而产物与 `Wrap<Box,int>` 逐字节相同 —— **连算错都看不出来** |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -737,7 +738,8 @@ MyClass::foo(int)   → _ZN7MyClass3fooEi (类方法)
 - [x] **NTTP 值位参与偏特化模式**：`enable_if<true, T>` 的地基，`std::enable_if_t` 端到端可用
 - [x] **模板模板参数**：`template<template<class> class C>` + `Wrap<Box,int>`，
       二级替换；**模板模板实参的逐位签名匹配**（[temp.arg.template]/2，P0522R0 口径：
-      位数相同 + 逐位同 kind + 值位类型相同，别名模板作实参取别名自身的形参表）
+      位数相同 + 逐位同 kind + 值位类型相同，别名模板作实参取别名自身的形参表）+
+      形态关（拿类型填 `Wrap<int,int>`、拿特化类型填 `Wrap<Box<int>,int>` 都报错）
       （文档 docs/learn/33）
 - [x] **成员模板**：`A::add(T)` 按调用点推导，规则与函数模板逐字相同（[temp.mem]）
       （文档 docs/learn/34）

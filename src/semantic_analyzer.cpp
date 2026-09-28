@@ -945,12 +945,20 @@ TypePtr SemanticAnalyzer::resolveType(TypePtr type) {
                         const TemplateParam* fp =
                             (fps && i < fps->size()) ? fps->at(i).get() : nullptr;
                         if (fp && fp->kind == TemplateParamKind::Template) {
-                            // 这一位要的是【模板名】：`Wrap<int, ...>` 这种拿类型来填的
-                            // 必须在此响亮报错，否则会造出一个模板名叫 "int" 的假实例，
-                            // 一路算到汇编期才炸。对照 clang：err_template_template_parm_mismatch
-                            // / "template template argument must be a class template"。
+                            // 这一位要的是【模板名】：两种东西不能填 ——
+                            //   ① 普通类型（`Wrap<int, ...>`）：会造出模板名叫 "int" 的
+                            //      假实例，一路算到汇编期才炸；
+                            //   ② ★ 模板【特化类型】（`Wrap<Box<int>, ...>`）：它名字段
+                            //      与裸模板名同为 "Box"（Parser 把两者都建成 Class 节点，
+                            //      差别只在 templateArgs 空不空），只查名字就会被当成
+                            //      `Box` 放行、`<int>` 静默蒸发 —— 而它产物与 `Wrap<Box,int>`
+                            //      【逐字节相同】，连"算错"这个症状都没有。
+                            //   两者都在此响亮报错。对照 clang：err_template_template_parm_mismatch
+                            //   / "template template argument must be a class template or
+                            //   type alias template"。
                             const std::string& tn = arg.type ? arg.type->name : std::string();
                             if (!arg.type || !arg.type->isClass() || tn.empty()
+                                || !arg.type->templateArgs.empty()   // ②：带实参的 id 是类型不是模板名
                                 || (!m_classTemplates.count(tn)
                                     && !m_aliasTemplates.count(tn))) {
                                 error(std::format(

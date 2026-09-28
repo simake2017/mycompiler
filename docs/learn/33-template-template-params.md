@@ -168,6 +168,20 @@ Parser 判不了（它不查符号表），只有 Sema 逐位看形参表才知�
                                             空串 = 匹配；否则返回诊断正文
 ```
 
+★ 在这三条之前还有一道**形态关**（`resolveType` 的模板 id 分支）：
+
+```cpp
+if (!arg.type || !arg.type->isClass() || tn.empty()
+    || !arg.type->templateArgs.empty()      // ← 带实参的 id 是【类型】，不是模板名
+    || (!m_classTemplates.count(tn) && !m_aliasTemplates.count(tn)))
+```
+
+`Wrap<Box<int>, int>` 必须在这里被拒（clang：`err_template_template_parm_mismatch`）。
+**为什么只查名字会漏**：Parser 把 `Box` 与 `Box<int>` **都建成 Class 节点**，
+名字段都是 `"Box"` —— 差别只有 `templateArgs` 空不空。漏掉最后那个条件，
+`<int>` 会静默蒸发、这一位按裸 `Box` 用，而产物与 `Wrap<Box,int>` **逐字节相同**：
+**连"算错"这个症状都没有**。测试 `test_tmpl_60`。
+
 判据三条（**全部以 clang 实测口径为准**，见 §3.4）：
 
 | # | 判据 | 不符时 |
@@ -313,6 +327,13 @@ clang++-18 -std=c++20 -c /tmp/ttp_mng.cpp -o /tmp/ttp_mng.o && nm /tmp/ttp_mng.o
 ```text
 [ERROR] [Semantic Error] 1:1: template argument 1 for 'Wrap' ('C') must be a class
 template, but 'int' is not a template
+```
+
+错误用例（`Wrap<Box<int>, int>` —— 同一个出口，但走的是"带实参的 id"那条判据）：
+
+```text
+[ERROR] [Semantic Error] 1:1: template argument 1 for 'Wrap' ('C') must be a class
+template, but 'Box<int>' is not a template
 ```
 
 ★ 注意 `Wrap_Box_int` 这个名字里出现了模板名 `Box` —— 实例名清洗把实参的

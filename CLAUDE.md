@@ -215,6 +215,13 @@ tests/unit/test_symbol_consistency.cpp（`SymbolConsistency.*` 5 例，断言【
 `ttpSignatureMismatch` 三条判据：①位数相同 ②逐位同 kind ③值位声明类型相同。
 ★ **口径全部以 clang++-18 -std=c++20 探针实测确定**（docs/learn/33 §3.4 六条探针）——
 第一版我按旧规则写"实参多出的位有默认实参即可"，clang 当场报 `too many`（P0522R0 已废除该放宽）。
+**顺带修一个同族的静默接受**：`Wrap<Box<int>, int>`（拿**模板特化类型**填模板位）——
+Parser 把 `Box` 与 `Box<int>` 都建成 Class 节点、**名字段都是 "Box"**，于是"查名字在不在
+注册表"的形态守卫被骗过去，`<int>` 静默蒸发、这一位按裸 `Box` 用；更糟的是产物与
+`Wrap<Box,int>` **逐字节相同**（替换期 `C<int>` → `Box<int>` 后落地成同一个 `Box_int`），
+**连"算错"这个症状都没有**。修法：守卫补 `!arg.type->templateArgs.empty()`
+（带实参的 id 是类型，不是模板名）。测试 tests/tmpl/test_tmpl_60 + 单测
+`TtpSignature.TemplateIdArgumentIsNotATemplateName`（突变验证：删掉该条件即变红）。
 **顺带验证**：别名模板作模板模板实参（形参表取别名自身、替换期正常解糖。
 测试 tests/tmpl/test_tmpl_57（正例：类模板 / 别名模板 / 形参顺序交换）+
 test_tmpl_58（too few）/ 59（kind 不符）+ 新增单测 tests/unit/test_ttp_signature.cpp
