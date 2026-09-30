@@ -159,7 +159,7 @@ struct A<T, T*> {
 
 int main() {
 
-    // A<int>;
+    A<int*, int**> x;
 
     auto result = add(1, 2);
     return 0;
