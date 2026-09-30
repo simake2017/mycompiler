@@ -43,10 +43,30 @@ using DecltypeExprPtr = std::shared_ptr<Expression>;
 // ─────────────────────────────────────────────────────────────────────────────
 // TypeKind：类型的种类
 // ─────────────────────────────────────────────────────────────────────────────
+// ── 整型家族（[basic.fundamental]/2）────────────────────────────────────────
+// 每个「独立的类型」一个 kind，与 clang BuiltinType 一一对应。★ 三处易混：
+//   ① char / signed char / unsigned char 是【三个不同类型】([basic.fundamental]/7)，
+//      尽管 char 在 x86-64 Linux 上就是 signed char 的表示 —— 故 c / a / h 三个编码都不同，
+//      重载与模板特化都必须把它们当不同类型。本项目只体现"类型不同"，不实现
+//      `char` 的符号性实现定义行为差异。
+//   ② `unsigned` 单独写 ≡ `unsigned int`；`long` ≡ `long int` —— 多关键字序列在
+//      parseType 里规范化（见 Parser::parseBuiltinTypeSpecifierSeq）。
+//   ③ bool 不是整型家族成员（它是独立的算术类型），但【能参与整型转换】，
+//      故 isInteger() 把它算进来 —— 判据点见 type.h 的 isInteger 注释。
 enum class TypeKind : uint8_t {
     Void,           // void
     Bool,           // bool
+    Char,           // char            —— 与下面两个是不同类型
+    SChar,          // signed char
+    UChar,          // unsigned char
+    Short,          // short / short int / signed short
+    UShort,         // unsigned short
     Int,            // int
+    UInt,           // unsigned / unsigned int
+    Long,           // long / long int
+    ULong,          // unsigned long
+    LongLong,       // long long / long long int
+    ULongLong,      // unsigned long long
     Double,         // double
     Pointer,        // T*
     LValueReference, // T&（左值引用）
@@ -61,16 +81,24 @@ enum class TypeKind : uint8_t {
 // ─────────────────────────────────────────────────────────────────────────────
 // TypeKind ↔ clang 类型类 ↔ Itanium mangling 编码
 // ─────────────────────────────────────────────────────────────────────────────
-//   TypeKind                 clang（include/clang/AST/Type.h）  encodeType
-//   Void/Bool/Int/Double     BuiltinType::Void/Bool/Int/Double  v / b / i / d
-//   Pointer                  PointerType                        P + 内层
-//   LValueReference          LValueReferenceType                R + 内层
-//   RValueReference          RValueReferenceType                O + 内层
-//   Const                    （clang 用 Qualifier，非独立节点）  K + 内层
-//   Class                    RecordType / CXXRecordDecl         <名字长度><名字>
-//   TemplateParam            TemplateTypeParmType               参数名原样输出
-//   Auto                     AutoType                           （阶段 3 后应已消除）
+//   TypeKind                       clang（include/clang/AST/Type.h）      encodeType
+//   Void / Bool / Double           BuiltinType::Void/Bool/Double          v / b / d
+//   Char / SChar / UChar           BuiltinType::Char_S/SChar/UChar        c / a / h
+//   Short / UShort                 BuiltinType::Short/UShort              s / t
+//   Int / UInt                     BuiltinType::Int/UInt                  i / j
+//   Long / ULong                   BuiltinType::Long/ULong                l / m
+//   LongLong / ULongLong           BuiltinType::LongLong/ULongLong        x / y
+//   Pointer                        PointerType                            P + 内层
+//   LValueReference                LValueReferenceType                    R + 内层
+//   RValueReference                RValueReferenceType                    O + 内层
+//   Const                          （clang 用 Qualifier，非独立节点）      K + 内层
+//   Class                          RecordType / CXXRecordDecl             <名字长度><名字>
+//   TemplateParam                  TemplateTypeParmType                   参数名原样输出
+//   Auto                           AutoType                               Da（★ auto NTTP 用）
 //   encodeType 的实现见 src/template_instantiation.cpp 的 NameMangler::encodeType。
+//
+// ★ Itanium 的整型编码取自 ABI §5.1.2 的 <builtin-type> 表；`j`/`m`/`t`/`y` 这几个
+//   "无符号版"最易漏 —— 漏一个就会把 `Buf<4u>` 编成 `Buf<4>`（与 int 实例撞符号）。
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccessModifier：访问修饰符
@@ -418,7 +446,19 @@ struct Type {
     // 各工厂函数的入参含义、产物形状与 encodeType 结果见 src/type.cpp 对应实现。
     static TypePtr makeVoid();
     static TypePtr makeBool();
+    // ── 整型家族（[basic.fundamental]/2）──
+    // makeChar 造的是裸 `char`，不是 signed char —— 两者是不同类型，各有工厂。
+    static TypePtr makeChar();
+    static TypePtr makeSChar();
+    static TypePtr makeUChar();
+    static TypePtr makeShort();
+    static TypePtr makeUShort();
     static TypePtr makeInt();
+    static TypePtr makeUInt();          // `unsigned` / `unsigned int`
+    static TypePtr makeLong();
+    static TypePtr makeULong();
+    static TypePtr makeLongLong();
+    static TypePtr makeULongLong();
     static TypePtr makeDouble();
     static TypePtr makePointer(TypePtr pointee);
     static TypePtr makeLValueReference(TypePtr referenced);   // T&
@@ -435,6 +475,59 @@ struct Type {
     bool isBool()             const { return kind == TypeKind::Bool; }
     bool isInt()              const { return kind == TypeKind::Int; }
     bool isDouble()           const { return kind == TypeKind::Double; }
+    // ── 整型家族谓词 ──
+    // ★ isInteger() 把 bool 也算进来：bool 不是整型家族的成员（[basic.fundamental]/2 里
+    //   它与整型并列），但它能参与【整型转换】（[conv.integral]/1，bool → int 是转换，
+    //   int → bool 也是）。凡是"按整型规则互相转换/比较"的判据点都该用 isInteger()，
+    //   而不是 isInt() —— 这正是 `Flag<1>`（bool 形参收 int 字面量）此前被误拒的根因类。
+    bool isInteger()          const {
+        switch (kind) {
+            case TypeKind::Bool:
+            case TypeKind::Char:   case TypeKind::SChar:  case TypeKind::UChar:
+            case TypeKind::Short:  case TypeKind::UShort:
+            case TypeKind::Int:    case TypeKind::UInt:
+            case TypeKind::Long:   case TypeKind::ULong:
+            case TypeKind::LongLong: case TypeKind::ULongLong:
+                return true;
+            default: return false;
+        }
+    }
+    // 三个字符类型：char / signed char / unsigned char 是【三个不同类型】([basic.fundamental]/7)
+    bool isChar()             const {
+        return kind == TypeKind::Char || kind == TypeKind::SChar
+            || kind == TypeKind::UChar;
+    }
+    // 无符号整型（不含 bool，bool 的"可表示值"只有 0/1，是另一条规则，见 checkTemplateArguments）
+    bool isUnsignedInteger()  const {
+        switch (kind) {
+            case TypeKind::UChar: case TypeKind::UShort: case TypeKind::UInt:
+            case TypeKind::ULong: case TypeKind::ULongLong:
+                return true;
+            default: return false;
+        }
+    }
+    // 整型值 v 能否被本类型【无损表示】（[dcl.init]/7 的窄化 + [expr.const]/10 的
+    // converted constant expression 例外：常量表达式只要"值装得下"就不算窄化）。
+    // 定义放 src/type.cpp（要用到 integerBitWidth 的移位，且这是"类型自己答得出"的问题）。
+    // demo: makeBool().canRepresentValue(1)   ⇒ true   （bool 的可表示集合是 {0,1}）
+    //       makeBool().canRepresentValue(2)   ⇒ false
+    //       makeUInt().canRepresentValue(-1)  ⇒ false  （无符号装不下负值）
+    //       makeShort().canRepresentValue(70000) ⇒ false
+    bool canRepresentValue(int64_t v) const;
+
+    // 整型宽度（位）：bool 按 1 位处理 —— 它的可表示集合是 {0,1}，正是 [dcl.init]/7
+    // 对 bool 窄化判定的口径。
+    uint32_t integerBitWidth() const {
+        switch (kind) {
+            case TypeKind::Bool:    return 1;
+            case TypeKind::Char:    case TypeKind::SChar: case TypeKind::UChar: return 8;
+            case TypeKind::Short:   case TypeKind::UShort:                      return 16;
+            case TypeKind::Int:     case TypeKind::UInt:                        return 32;
+            case TypeKind::Long:    case TypeKind::ULong:
+            case TypeKind::LongLong: case TypeKind::ULongLong:                  return 64;
+            default: return 0;
+        }
+    }
     bool isPointer()          const { return kind == TypeKind::Pointer; }
     bool isLValueReference()  const { return kind == TypeKind::LValueReference; }
     bool isRValueReference()  const { return kind == TypeKind::RValueReference; }
@@ -444,7 +537,9 @@ struct Type {
     bool isTemplateParam()    const { return kind == TypeKind::TemplateParam; }
     bool isAuto()             const { return kind == TypeKind::Auto; }
     bool isDecltype()         const { return kind == TypeKind::Decltype; }
-    bool isNumeric()          const { return isInt() || isDouble(); }
+    // 算术类型（numeric）：整型家族 + bool + double —— 能参与二元算术表达式的都是它。
+    // 旧版写死 isInt() || isDouble()，char/unsigned 一进来就会漏判。
+    bool isNumeric()          const { return isInteger() || isDouble(); }
 
     // 去除引用和 const 的"裸类型"（用于类型比较和推导）
     TypePtr stripReferences() const;

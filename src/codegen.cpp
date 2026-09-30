@@ -1465,6 +1465,13 @@ void CodeGen::visit(IntLiteralExpr& expr) {
     emit(std::format("movq ${}, %rax           # 整数字面量载入 rax", expr.value));
 }
 
+// 字符字面量：值与整数字面量同形（立即数进 rax），差别在【类型是 char】——
+// 落到存储点时按 1 字节写（宽度分派由声明/字段类型决定，见 emitStore）。
+// demo: 'a' → movq $97, %rax
+void CodeGen::visit(CharLiteralExpr& expr) {
+    emit(std::format("movq ${}, %rax           # 字符字面量（char, 1 字节）", expr.value));
+}
+
 // 布尔字面量：本项目 bool 按整数 0/1 表示，
 // 与比较运算 setcc/movzbq 的产出形式天然一致。
 // demo: true → movq $1, %rax      false → movq $0, %rax

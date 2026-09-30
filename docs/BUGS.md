@@ -28,6 +28,7 @@
 | [B13](#b13-两个次基类各有一个同名字段时显示名塌陷且第二条偏移算成-0) | 两条记录压成同名 ⇒ 第二条偏移算成 0；歧义不报错 | 扁平化循环 + `computeClassLayout` | 中（非法程序被静默接受 + 布局打印错） | ✅ 已修 |
 | [B14](#b14-派生类同名字段的隐藏方向做反了) | `d.x` 静默指向 `A::x` 而非 `D::x`（隐藏方向反了） | `include/type.h` `findField` | **大**（合法程序静默取错成员） | ✅ 已修 |
 | [B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) | 祖辈带来的前缀被当成"本类直接基类" ⇒ 偏移算错 | 扁平化循环 + `computeClassLayout` | 中（同 B13 的性质，根因更本质） | ✅ 已修 |
+| [B17](#b17-值位实参要求形态精确相等拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -854,6 +855,116 @@ struct X : P, B { int tag; };
 —— 断言两条同名记录**偏移必须不同**、且各自的 `viaBase` 必须是**本类的直接基类**。
 **负向已验证**：把派发改回 `sourceClass` + 按名字查内部偏移（**忠实复刻旧代码**）⇒
 该单测报 `Expected: (hits[0]->offset) != (hits[1]->offset), actual: 24 vs 24` —— 正是旧 bug 的形态。
+
+---
+
+## B17. 值位实参要求「形态精确相等」⇒ 拒收合法程序
+
+**复现**（三形态，只有"形态恰好等于形参类型"的那一种活）
+
+```cpp
+template<bool B> struct Flag { int v; };
+template<int  N> struct A    { int v; };
+
+int main() {
+    Flag<1>  f;   // int 1  ⇒ bool ：本应合法
+    A<4L>    a;   // long 4 ⇒ int  ：本应合法
+    A<true>  b;   // bool   ⇒ int  ：本应合法
+    return 0;
+}
+```
+
+minicc：三条全报 `non-type template argument … cannot be narrowed to type '…'`（rc=1）
+clang++-18 `-std=c++20`：三条**全过**，零诊断。
+
+**性质**：**错误拒绝合法程序** —— 与 [B9](#b9-struct-的默认继承级别被当成-private-处理) 同类
+（B9 拒的是 `struct D : Base` 的默认继承级别，这条拒的是合法实参转换）。
+
+**根因**：判据选错了。旧版第三道检查写的是
+
+```cpp
+else if (!a.valueType->equals(p.nonType)) { error("… cannot be narrowed …"); }
+```
+
+即要求"实参的字面量形态与形参类型**精确相等**"。标准要的不是这个：
+
+| 标准位置 | 说的是什么 |
+|---|---|
+| [temp.arg.nontype]/1 | 实参须是形参类型的 **converted constant expression** |
+| [expr.const]/10 | 该术语的定义直接引用 [dcl.init]/7 的初始化规则 |
+| [dcl.init]/7 | 窄化禁令，但**常量表达式豁免"值恰好装得下"的那部分** |
+
+⇒ 正确判据是**可表示性**（值装不装得下），不是**形态相等**。三条合法用例恰好各踩一个面：
+
+| 用法 | 标准依据 | 形态 | 值 |
+|---|---|---|---|
+| `Flag<1>` | [conv.bool]：int → bool，1 ⇒ true | int ≠ bool | 1 ∈ {0,1} ✅ |
+| `A<4L>` | [conv.integral]：long → int | long ≠ int | 4 ∈ int ✅ |
+| `A<true>` | [conv.prom]：bool → int 整型提升 | bool ≠ int | 恒不窄化 ✅ |
+
+**为什么"碰巧拒对了"掩盖了它**：`F<2>`（2 → bool）这类**真该拒**的用例旧版也拒，
+于是负向测试全绿 —— 只有拿正向用例去撞才会露馅。这正是
+「负向测试全绿 ≠ 判据正确」的又一例（与 [B10](#b10-带参成员方法的调用符号拼不出来) 的
+"错误停在链接期、编译期全程绿灯"是同一类盲区）。
+
+**修法**：判据换成 `Type::canRepresentValue(v)`（[dcl.init]/7 + [expr.const]/10 的合体）：
+
+```cpp
+else if (p.nonType && !p.nonType->canRepresentValue(a.value)) {
+    // clang 原文：non-type template argument evaluates to N, which cannot be
+    // narrowed to type 'T' [-Wc++11-narrowing]（本项目按错误处理）
+    error("non-type template argument evaluates to {}, which cannot be narrowed to type '{}'");
+}
+else if (!a.valueType->equals(p.nonType)) {
+    // ③-c 形态【归一】：把实参形态改写成形参类型
+    a.valueType = p.nonType;
+}
+```
+
+★ 两条设计约束：
+
+1. **判据单点**：`canRepresentValue` 定义在 `src/type.cpp`，被 semantic_analyzer
+   与 `src/main.cpp` 的 Phase 4 演示路径共用 —— 不允许在调用点再写一份
+   （承 B10 / B12 的教训："同一判据不许写两份"）。
+2. **归一不是修饰而是语义必需**：归一之后 `Buf<4L>` 与 `Buf<4>` 的可读串 / 缓存键 /
+   mangling 才会一致。clang 也认它们是同一实例（`template struct A<4>;
+   template struct A<4L>;` 报 duplicate explicit instantiation）。
+
+**同批牵出的第二个 bug（同源，也是"字符串当键"）**：
+`template<auto V>` 下 `K<4>`（int）与 `K<4L>`（long）是**两个实例**，
+但实例名 / 缓存键此前由 `TemplateArg::toString()` 生成 —— 它对两者都产 `"4"`，
+于是第二个**静默复用**第一个实例。既没有报错，也没有算错（值恰好都是 4），
+**连"看起来不对"的症状都没有**。修法：键与实例名同源于
+`NameMangler::losslessArgumentsKey` / `renderArgLossless`，形态只在 `auto` 形参位写入
+⇒ `K_4Cint` / `K_4Clong`（`C` 是 `:` 的安全转义，`sanitizeSymbolChars` 同批补的）。
+★ 这与 [B13~B15](#小结-字符串兼任-id-与路径) 和 docs/learn/23 的坑**同源**：
+**拿"给人看的字符串"当"机器用的键"，早晚出事。**
+
+**影响面**：中。
+① 拒收合法程序（正向用例）；
+② 静默撞键（`auto` 形参下的实例复用）—— 后者无声无息，更难发现。
+
+**修复记录**：`src/semantic_analyzer.cpp` checkTemplateArguments ③-b/③-c；
+`Type::canRepresentValue` 新增于 `include/type.h` + `src/type.cpp`；
+`NameMangler::losslessArgumentsKey` / `renderArgLossless` 新增于
+`include/template_instantiation.h` + `src/template_instantiation.cpp`。
+
+**回归用例**：
+· 集成 `tests/tmpl/test_tmpl_64_nttp_integral_conversion.cpp`（三条正向，文件头注明回归 B17）
+· 集成 `tests/tmpl/test_tmpl_65/66/67_error_nttp_*`（三条负向，文案与 clang 逐字同）
+· 集成 `tests/tmpl/test_tmpl_68_nttp_auto_param.cpp`（`K<4>` / `K<4L>` 各自成实例 + 全特化只吃 int 形态）
+· 单测 `tests/unit/test_nttp_type_domain.cpp`（`NttpTypeDomain.*` 10 例）
+
+**突变负向验证**（每条判据删掉后必须变红，已逐条实跑）：
+
+| 突变 | 红掉的用例 |
+|---|---|
+| `canRepresentValue` 的无符号分支改成 `return true` | `CanRepresentValueBoundaries` + `NarrowingIsRejectedWithClangWording` |
+| 判据退回 `a.valueType->equals(p.nonType)` | `IntegralConversionIsAcceptedWhenValueFits` + `ConversionNormalizesArgumentFormToOneInstance` |
+| 缓存键退回 `args[i].toString()` | `AutoParamDistinguishesArgumentForms` |
+| 字符字面量日志不转义 | `CharLiteralLogStaysOnOneLine` |
+
+**状态**：✅ 已修
 
 ---
 

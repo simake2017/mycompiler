@@ -229,13 +229,62 @@ test_tmpl_58（too few）/ 59（kind 不符）+ 新增单测 tests/unit/test_ttp
 文档 docs/learn/33 §3.3/§3.4/§5/§6/§7。**有意日志漂移**：模板位的绑定标签
 `(non-type)` → `(template)` + 新增 `✓ 签名匹配` 行（仅 test_tmpl_53），已重刷基线。
 
+✅ **NTTP 类型域扩展已完成**（形参从「只认 `int`」扩到 整型家族 + 字符 + `auto`）——
+三段各自独立的知识点，此前全缺：
+① **形参写法**（[dcl.type.simple] 的 type-specifier-seq）：`unsigned long` / `long unsigned` /
+   `short` / `char` / `long long int` ⇒ `Parser::parseBuiltinTypeSpecifierSeq`
+   **先收集六组计数器、再一次归一**（对照 clang `DeclSpec` 的四组位掩码），
+   非法组合（`long long long`、`signed unsigned`、`char int`）各自报错；
+   新 TypeKind 10 个 + `isInteger/isChar/isUnsignedInteger/integerBitWidth` 谓词，
+   `sizeInBytes` 改为**从位宽推导**（不再两处各写一份）。
+② **实参字面量**（[lex.icon]/2）：进制前缀 `0x`/`0b`/前导 `0` + 后缀 `u/U/l/L` 任意组合 +
+   `'` 数字分隔符；**Lexer 只切片、`Parser::parseIntLiteral` 才解释成 `(value, type)`**
+   （对照 clang 的 `Lexer` vs `NumericLiteralParser` 分工）。该函数**刻意不打日志**
+   —— 它被每条整数表达式调用，打点会把日志淹掉（实测全量漂移数百行）；
+   观测点改在 `[parse:targ] … (形态 X)` 与 `[infer] IntLiteral(4) → long`。
+   另加 `[lex.ccon]` 字符字面量（`'a'`/`'\n'`/`'ab'` 折叠成 24930）；
+   ★ 词法已翻译转义 ⇒ 回吐日志必须 `escapeCharText` 重新转义，否则一行被裸换行截断。
+③ **★ 判据归位（BUGS.md B17，拒收合法程序）**：旧版要求
+   `a.valueType->equals(p.nonType)`（**形态精确相等**）⇒ `Flag<1>`(bool←int 1) /
+   `A<4L>`(int←long 4) / `A<true>`(int←bool 提升) **三条 clang 认可的合法程序全被拒**，
+   而 `F<2>`/`U<-1>`/`D<300>` 这三条真该拒的**旧版也拒** —— 负向全绿掩盖了它。
+   正解是 [temp.arg.nontype]/1 → [expr.const]/10 → [dcl.init]/7 的**可表示性**，
+   收口成 `Type::canRepresentValue`（判据**单点**，Sema 与 main.cpp 演示路径共用）；
+   通过后新增 **③-c 形态归一**（`a.valueType = p.nonType`）——这不是修饰而是语义必需，
+   归一后 `Buf<4L>` 与 `Buf<4>` 的可读串/缓存键/mangling 才一致（clang 亦认同一实例）。
+④ **`template<auto V>`**（[temp.param]/6 的 deduced non-type parameter）：
+   形态即类型 ⇒ `K<4>`(int) 与 `K<4L>`(long) 是**两个实例**。
+   ★ 顺带修掉一个**静默撞键**：实例名/缓存键此前用 `TemplateArg::toString()`
+   （对两者都产 `"4"`）⇒ 第二个**静默复用**第一个，不报错、不算错、连症状都没有。
+   修法是键与实例名同源于 `losslessArgumentsKey`/`renderArgLossless`，
+   **形态只在 `auto` 形参位写入**（既有测试零漂移），实例名 `K_4Cint`/`K_4Clong`
+   —— `sanitizeSymbolChars` 同批补 `:` → `C`（第一版忘了，汇编期吐非法符号）。
+   承 docs/learn/23 与 B13~B15 的同一句教训：**拿给人看的字符串当机器用的键，早晚出事**。
+⑤ **CodeGen 一行未改** —— `codegen.cpp` 全程按宽度（1/≤4/8 字节）分派、零 `TypeKind` 引用，
+   新标量类型的代码生成成本为 0。
+mangling 12/12 与 clang **逐字符相同**（`b c a h s t i j l m x y`，含
+`char`≠`signed char`≠`unsigned char` 三元区分）；`TnDa`（`<template-param-decl>`）
+**有意不写** —— 它只出现在**函数**模板的 `auto` NTTP 上，而函数模板的显式 NTTP 实参
+目前直接报 `not supported yet`，没有能到达该编码的路径。★ 但**未做**「字面量溢出自动升格」
+（[lex.icon]/2 规定十进制 `3000000000` 类型是 `long`）、`\x`/`\u` 转义。
+测试 tests/tmpl/test_tmpl_61..68（正例 61/62/63/64/68 各返回 7，负例 65/66/67 rc=1
+且文案与 clang **逐字相同**）+ 单测 tests/unit/test_nttp_type_domain.cpp
+（`NttpTypeDomain.*` 10 例：四条判据分支 + 三条不变量，**四条分支逐条做了突变负向验证**）；
+文档 docs/learn/35；BUGS.md 新增 **B17**；ROADMAP 主线 D 的「与 NTTP 的接口」段落已更新
+（**下游接口全部就绪，主线 D 只剩"把字面量分支换成完整常量表达式分支"**）。
+全量 239 → **249** 单测 / 110 集成测试；**有意日志漂移**只有
+`[parse:targ] … (形态 X)` 一处（10 个既有文件），已重刷基线。
+
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
 函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；
 别名模板偏特化 —— 见 docs/learn/27 §5 边界表；
 模板模板参数：形参包 `class...`（签名的偏序不可达）、模板位默认实参、嵌套模板模板参数
-（depth > 1 直接报错）—— 见 docs/learn/33 §5。
+（depth > 1 直接报错）—— 见 docs/learn/33 §5；
+NTTP：**任意常量表达式** `Buf<2+2>` / `Buf<k>`（主线 D）、字面量溢出自动升格、
+`\x`/`\u` 转义、非整型 NTTP（指针/引用/枚举/字面量类）、`template<auto V>` 的**偏特化**模式
+—— 见 docs/learn/35 §5。
 ⏭ 后续计划见 **docs/ROADMAP.md**（主线 C 控制流 → D 常量折叠 → E 数组/高级类型 → F 深水区选做，
 每条含理论点/clang 参照/任务分解/验收）。新会话接手：先读本文件与 ROADMAP，选定主线再开工。
 

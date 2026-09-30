@@ -187,6 +187,9 @@ public:
     void visit(IntLiteralExpr& e) override {
         printNode(m_prefix, m_isLast, std::format("IntLiteral: {}", e.value));
     }
+    void visit(CharLiteralExpr& e) override {
+        printNode(m_prefix, m_isLast, std::format("CharLiteral: {} (char)", e.value));
+    }
     void visit(BoolLiteralExpr& e) override {
         printNode(m_prefix, m_isLast, std::format("BoolLiteral: {}", e.value ? "true" : "false"));
     }
@@ -725,8 +728,15 @@ int main(int argc, char* argv[]) {
                     std::cout << std::format(
                         "\n  ─── Instantiation (NTTP): {}<4> ───\n",
                         tmpl->classTemplate->name);
+                    // ★ 演示值 4 的【形态】取自形参声明的类型，不能硬写 int：
+                    //   `template<unsigned N>` 若按 int 编码会得到 _Z1BILi4EE，
+                    //   与使用点实例化（Sema 归一后）编出的 _Z1BILj4EE 不一致 ——
+                    //   同一个实例两处两个符号名，正是本项目反复踩的"同判据写两遍"。
+                    //   形参类型装不下 4（如 bool）时退回 int：演示分支不产生非法实参。
+                    TypePtr vt = tmpl->templateParams[0]->nonType;
+                    if (!vt || !vt->canRepresentValue(4)) vt = Type::makeInt();
                     auto instance = instantiator.instantiate(
-                        tmpl, {TemplateArg::ofValue(4)});
+                        tmpl, {TemplateArg::ofValue(4, vt)});
                     std::cout << std::format("  → Instantiated: {}\n", instance->name);
                 }
                 else if (tmpl->typeParams.size() == 1) {

@@ -44,37 +44,39 @@ bool TemplateArg::equals(const TemplateArg& o) const {
 // 工厂方法：创建各种类型实例
 // ─────────────────────────────────────────────────────────────────────────────
 
+// 内置标量类型的统一构造：kind + 规范可读名，两者是【一一对应】的
+// （kind 决定 sizeInBytes/encodeType/equals，name 只服务日志与报错）。
+// 抽成一个原语而不是逐个手写 6 行样板：10 个整型各写一遍只会让"哪几个是不同类型"
+// 这件事淹没在重复代码里 —— 而"char / signed char / unsigned char 是三个类型"
+// 恰恰是本批最想让人看见的一行（故三者的 name 也【不】归一）。
+static TypePtr makeBuiltin(TypeKind k, const char* name) {
+    auto t = std::make_shared<Type>();
+    t->kind = k;
+    t->name = name;
+    return t;
+}
+
 // void 类型。无入参。demo：void f(); 的返回类型 → Type{kind=Void, name="void"}
-TypePtr Type::makeVoid() {
-    auto t = std::make_shared<Type>();
-    t->kind = TypeKind::Void;
-    t->name = "void";
-    return t;
-}
-
+TypePtr Type::makeVoid()      { return makeBuiltin(TypeKind::Void,      "void"); }
 // bool 类型。无入参。demo：bool b; 的声明类型 → Type{kind=Bool, name="bool"}，encodeType→"b"
-TypePtr Type::makeBool() {
-    auto t = std::make_shared<Type>();
-    t->kind = TypeKind::Bool;
-    t->name = "bool";
-    return t;
-}
-
+TypePtr Type::makeBool()      { return makeBuiltin(TypeKind::Bool,      "bool"); }
+// ── 整型家族（[basic.fundamental]/2）：kind ↔ 名字 ↔ Itanium 编码 ──
+// demo：makeUInt() → name="unsigned int"，encodeType→"j"（不是 "i"！）
+//       makeChar() → name="char"，    encodeType→"c"
+TypePtr Type::makeChar()      { return makeBuiltin(TypeKind::Char,      "char"); }
+TypePtr Type::makeSChar()     { return makeBuiltin(TypeKind::SChar,     "signed char"); }
+TypePtr Type::makeUChar()     { return makeBuiltin(TypeKind::UChar,     "unsigned char"); }
+TypePtr Type::makeShort()     { return makeBuiltin(TypeKind::Short,     "short"); }
+TypePtr Type::makeUShort()    { return makeBuiltin(TypeKind::UShort,    "unsigned short"); }
 // int 类型。无入参。demo：int x; 的声明类型 → Type{kind=Int, name="int"}，encodeType→"i"
-TypePtr Type::makeInt() {
-    auto t = std::make_shared<Type>();
-    t->kind = TypeKind::Int;
-    t->name = "int";
-    return t;
-}
-
+TypePtr Type::makeInt()       { return makeBuiltin(TypeKind::Int,       "int"); }
+TypePtr Type::makeUInt()      { return makeBuiltin(TypeKind::UInt,      "unsigned int"); }
+TypePtr Type::makeLong()      { return makeBuiltin(TypeKind::Long,      "long"); }
+TypePtr Type::makeULong()     { return makeBuiltin(TypeKind::ULong,     "unsigned long"); }
+TypePtr Type::makeLongLong()  { return makeBuiltin(TypeKind::LongLong,  "long long"); }
+TypePtr Type::makeULongLong() { return makeBuiltin(TypeKind::ULongLong, "unsigned long long"); }
 // double 类型。无入参。demo：double d; → Type{kind=Double, name="double"}，encodeType→"d"
-TypePtr Type::makeDouble() {
-    auto t = std::make_shared<Type>();
-    t->kind = TypeKind::Double;
-    t->name = "double";
-    return t;
-}
+TypePtr Type::makeDouble()    { return makeBuiltin(TypeKind::Double,    "double"); }
 
 // 指针类型 T*。入参 pointee = 被指向的内层类型。
 // demo：makePointer(Int) → Pointer(Int)，toString="int*"，encodeType→"Pi"
@@ -197,16 +199,49 @@ TypePtr Type::makeDecltype(DecltypeExprPtr expr, bool paren) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// canRepresentValue：整型值能否被本类型无损表示（[dcl.init]/7 + [expr.const]/10）
+// ─────────────────────────────────────────────────────────────────────────────
+// 这是 converted constant expression 判据的核心一步：非类型模板实参 `Buf<4L>` 填
+// `template<int N>` 合法，`Buf<-1>` 填 `template<unsigned N>` 不合法 —— 分界就是
+// "值装不装得下"，而不是"形态是否字面相同"。
+// ★ bool 单独走一条：它的 integerBitWidth() 是 1，但"1 位量"描述不了它的值域 ——
+//   bool 的可表示集合是 {0,1}。clang 对 `F<2>` 报的正是 cannot be narrowed to 'bool'。
+// demo: (1, bool) ⇒ true │ (2, bool) ⇒ false │ (-1, unsigned int) ⇒ false
+//       (4, long) ⇒ true │ (70000, short) ⇒ false │ (4, char) ⇒ true
+bool Type::canRepresentValue(int64_t v) const {
+    if (!isInteger()) return false;
+    if (isBool()) return v == 0 || v == 1;
+
+    const uint32_t bits = integerBitWidth();
+    if (bits == 0 || bits > 64) return false;
+
+    if (isUnsignedInteger()) {
+        if (v < 0) return false;
+        const uint64_t uv = static_cast<uint64_t>(v);
+        return bits >= 64 || uv <= ((1ull << bits) - 1);
+    }
+    // 有符号：[-(2^(bits-1)), 2^(bits-1) - 1]；bits == 64 时即 int64_t 全域，
+    // 不能写 (1ll << 63) - 1（移位溢出是 UB），故特判。
+    if (bits >= 64) return true;
+    const int64_t hi = (1ll << (bits - 1)) - 1;
+    const int64_t lo = -(1ll << (bits - 1));
+    return v >= lo && v <= hi;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sizeInBytes：获取类型占用的字节数
 // ─────────────────────────────────────────────────────────────────────────────
-// "运行期看偏移量"的基础。简化模型按 64 位系统：void=0，bool=1，int=4，double=8，
-// 指针与引用=8（引用本质是指针），class 取 classLayout.totalSize；
-// TemplateParam / Auto / Decltype 大小未知，返回 0（正常流程下不应活到 CodeGen）。
-uint32_t Type::sizeInBytes() const {
+// "运行期看偏移量"的基础。按 LP64（x86-64 System V）模型：
+//   bool/char/三个 char 变体 = 1，short = 2，int = 4，long/long long = 8（★ long 在
+//   LP64 上是 8 字节，与 Windows 的 LLP64 不同 —— 本项目按本机 ABI）。
+//   double = 8，指针与引用 = 8（引用本质是指针），class 取 classLayout.totalSize；
+//   TemplateParam / Auto / Decltype 大小未知，返回 0（正常流程下不应活到 CodeGen）。
+// ★ 整型家族的字节数【不在这里逐个写死】，而是从 integerBitWidth() 推出来 ——
+//   宽度表在 type.h 一处维护，sizeInBytes 与它不可能对不上（此前两处各写一份
+//   "int=4" 的口子正是这类漂移的温床）。
+std::uint32_t Type::sizeInBytes() const {
     switch (kind) {
         case TypeKind::Void:   return 0;
-        case TypeKind::Bool:   return 1;
-        case TypeKind::Int:    return 4;
         case TypeKind::Double: return 8;
         case TypeKind::Pointer: return 8;
         case TypeKind::LValueReference: return 8;  // 引用本质是指针，占 8 字节
@@ -216,6 +251,17 @@ uint32_t Type::sizeInBytes() const {
         case TypeKind::TemplateParam: return 0; // 模板参数大小未知
         case TypeKind::Auto:   return 0; // auto 大小未知，等待推导
         case TypeKind::Decltype: return 0; // decltype 未求值，大小未知
+        case TypeKind::Bool:
+        case TypeKind::Char:   case TypeKind::SChar:   case TypeKind::UChar:
+        case TypeKind::Short:  case TypeKind::UShort:
+        case TypeKind::Int:    case TypeKind::UInt:
+        case TypeKind::Long:   case TypeKind::ULong:
+        case TypeKind::LongLong: case TypeKind::ULongLong: {
+            // bool 的 integerBitWidth() 是 1（那是"可表示集合只有 {0,1}"的意思），
+            // 但它在内存里占【1 个字节】—— 故此处单独兜底，不能直接 1/8。
+            if (kind == TypeKind::Bool) return 1;
+            return integerBitWidth() / 8;
+        }
     }
     return 0;
 }
@@ -233,8 +279,16 @@ bool Type::equals(const TypePtr& other) const {
     switch (kind) {
         case TypeKind::Void:
         case TypeKind::Bool:
-        case TypeKind::Int:
         case TypeKind::Double:
+        // ★ 整型家族：每个 kind 一个独立类型，equals 就是 kind 相等。
+        //   char / signed char / unsigned char 三者【互不相等】（[basic.fundamental]/7）；
+        //   `unsigned` 与 `unsigned int` 在解析期就归一成同一个 kind（UInt），
+        //   故这里看不到"多关键字写法"的痕迹。
+        case TypeKind::Char:  case TypeKind::SChar:  case TypeKind::UChar:
+        case TypeKind::Short: case TypeKind::UShort:
+        case TypeKind::Int:   case TypeKind::UInt:
+        case TypeKind::Long:  case TypeKind::ULong:
+        case TypeKind::LongLong: case TypeKind::ULongLong:
             return true; // 基础类型只比较 kind
 
         case TypeKind::Pointer:
@@ -286,8 +340,20 @@ std::string Type::toString() const {
     switch (kind) {
         case TypeKind::Void:   return "void";
         case TypeKind::Bool:   return "bool";
-        case TypeKind::Int:    return "int";
         case TypeKind::Double: return "double";
+        // 整型家族：印【规范化后】的名字（`unsigned` 统一印成 "unsigned int"），
+        // 与工厂里写死的 name 逐字一致 —— 日志里同一类型只有一种写法。
+        case TypeKind::Char:  return "char";
+        case TypeKind::SChar: return "signed char";
+        case TypeKind::UChar: return "unsigned char";
+        case TypeKind::Short: return "short";
+        case TypeKind::UShort: return "unsigned short";
+        case TypeKind::Int:   return "int";
+        case TypeKind::UInt:  return "unsigned int";
+        case TypeKind::Long:  return "long";
+        case TypeKind::ULong: return "unsigned long";
+        case TypeKind::LongLong: return "long long";
+        case TypeKind::ULongLong: return "unsigned long long";
         case TypeKind::Pointer:
             return pointeeType ? pointeeType->toString() + "*" : "?*";
         case TypeKind::LValueReference:

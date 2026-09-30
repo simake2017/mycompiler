@@ -56,7 +56,7 @@ using DeclPtr        = std::shared_ptr<Declaration>;
 // location 记录源码位置（token.h 的 SourceLocation），供报错定位。
 enum class NodeKind : uint8_t {
     // 表达式
-    IntLiteral, BoolLiteral, StringLiteral, NullptrLiteral,
+    IntLiteral, CharLiteral, BoolLiteral, StringLiteral, NullptrLiteral,
     Var, Binary, Unary, Call, Member, New, This, Delete, DynamicCast, Index,
     // 语句
     ExprStmt, VarDecl, Return, If, While, Block, Assign, DeleteStmt,
@@ -103,7 +103,27 @@ struct Expression : ASTNode {
 
 struct IntLiteralExpr : Expression {
     int64_t value;
+    // ── 字面量的【形态】（[lex.icon]）──
+    // 4 是 int、4L 是 long、4u 是 unsigned int —— 后缀决定类型，值一样形态不同。
+    // ★ 为空 = 未标注 ⇒ 按 int 处理。既有构造点（如 NTTP 替换期造的 IntLiteralExpr）
+    //   全部走单参构造，行为与日志一字不变。
+    TypePtr literalType;
     explicit IntLiteralExpr(int64_t v) : Expression(NodeKind::IntLiteral), value(v) {}
+    IntLiteralExpr(int64_t v, TypePtr t)
+        : Expression(NodeKind::IntLiteral), value(v), literalType(std::move(t)) {}
+
+    void accept(AstVisitor& v) override { v.visit(*this); }
+};
+
+// 字符字面量 'a'（[lex.ccon]）。★ 单独一个节点而不是复用 IntLiteralExpr：
+//   `'a'` 的【类型是 char】、占 1 字节，而 `97` 的类型是 int、占 4 字节 ——
+//   若共用节点，`char c = 'a';` 与 `int c = 97;` 在下游就分不开了
+//   （codegen 按宽度分派、重载/推导按类型匹配，两处都会错）。
+//   对照 clang：CharacterLiteral 与 IntegerLiteral 是两个独立 Stmt 类，同此理。
+// 值在构造时就定好（词法阶段已翻译转义）：'a' ⇒ 97。
+struct CharLiteralExpr : Expression {
+    int64_t value;          // 字符的码点值（本项目按 ASCII/单字节）
+    explicit CharLiteralExpr(int64_t v) : Expression(NodeKind::CharLiteral), value(v) {}
 
     void accept(AstVisitor& v) override { v.visit(*this); }
 };

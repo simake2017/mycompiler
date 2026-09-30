@@ -39,8 +39,10 @@
 // =============================================================================
 
 #include "parser.h"
+#include <cstdint>     // uint64_t —— 字面量按无符号 64 位解析（[lex.icon]/2 的表）
 #include <format>
 #include <iostream>
+#include <stdexcept>   // std::runtime_error —— 字面量超 64 位时报错
 
 namespace minicc {
 
@@ -182,6 +184,90 @@ bool Parser::isAtEnd() const {
 //   两者不可互换 —— 建错树，下游按结构匹配的偏特化会【静默选错】
 //   （demo: tests/tmpl/test_tmpl_47_cv_position.cpp；理论见 docs/learn/23）
 //   对照 clang：DeclSpec 的 const 在 GetTypeForDeclarator 里先于声明符算子生效，方向一致。
+// ─────────────────────────────────────────────────────────────────────────────
+// parseBuiltinTypeSpecifierSeq：内置整型家族的多关键字写法（[dcl.type.simple]）
+// ─────────────────────────────────────────────────────────────────────────────
+// 文法：simple-type-specifier 里的整型部分是【一串】关键字，不是单个：
+//   unsigned long long int / long int unsigned / signed char / short …
+// ★ 关键性质：**序列内关键字的顺序无语义**（`unsigned long long int` 与
+//   `long int unsigned long` 是同一个类型）—— 故实现不能"见到哪个就返回哪个"，
+//   必须【先收集、后规范化】两段：
+//     ① 收集段：贪婪吃掉这一段里所有的 char/short/long/signed/unsigned/int，
+//        只记计数与原文拼写（顺序信息只用来打印日志）；
+//     ② 规范化段：按 [basic.fundamental]/2 的表格把计数映射成唯一的 TypeKind。
+//   例：{long×2, int×1} ⇒ long long │ {unsigned×1, long×1} ⇒ unsigned long
+//                       │ {char×1, signed×1} ⇒ signed char
+// 对照 clang：Parser::ParseDeclarationSpecifiers 把 specifier 逐条塞进 DeclSpec，
+//   最后由 DeclSpec::getTypeSpecType + Sema::ActOnDeclSpec 做同样的归一；
+//   本项目把"收集 + 归一"压缩进一个函数（无 DeclSpec 中间层）。
+// demo: `unsigned long long int x;` ⇒ base = unsigned long long（encodeType → "y"）
+//       `char c;`                  ⇒ base = char（encodeType → "c"）
+TypePtr Parser::parseBuiltinTypeSpecifierSeq() {
+    int nChar = 0, nShort = 0, nLong = 0, nSigned = 0, nUnsigned = 0, nInt = 0;
+    std::string spelling;   // 原文拼写，仅用于日志（顺序到了规范化段就没用了）
+
+    // ── ① 收集段 ──
+    while (true) {
+        std::string kw;
+        if (check(TokenType::KwChar))          { kw = "char";     nChar++; }
+        else if (check(TokenType::KwShort))    { kw = "short";    nShort++; }
+        else if (check(TokenType::KwLong))     { kw = "long";     nLong++; }
+        else if (check(TokenType::KwSigned))   { kw = "signed";   nSigned++; }
+        else if (check(TokenType::KwUnsigned)) { kw = "unsigned"; nUnsigned++; }
+        else if (check(TokenType::KwInt))      { kw = "int";      nInt++; }
+        else break;                            // 序列到此为止（下一个是名字/'*'/'&'…）
+        advance();
+        if (!spelling.empty()) spelling += ' ';
+        spelling += kw;
+    }
+
+    // ── ② 规范化段：先挡掉所有非法组合，再查表 ──
+    // 非法组合一律响亮报错 —— 静默归一成某个类型会让 `unsigned double` 这类
+    // 无意义写法一路编到底（在 CodeGen 才炸，且炸点离根因很远）。
+    const std::string where = std::format("'{}'", spelling);
+    auto bad = [&](const std::string& why) -> void {
+        error(std::format("invalid type specifier sequence {}: {}", where, why));
+    };
+
+    if (nSigned + nUnsigned > 1)  bad("cannot be both 'signed' and 'unsigned'");
+    if (nShort > 1)               bad("'short' appears more than once");
+    if (nLong > 2)                bad("'long' appears more than once (at most 'long long')");
+    if (nInt > 1)                 bad("'int' appears more than once");
+    if (nLong > 0 && nShort > 0)  bad("cannot be both 'short' and 'long'");
+    if (nChar > 1)                bad("'char' appears more than once");
+    if (nChar > 0) {
+        // char 只接受 signed / unsigned 这两种修饰（[basic.fundamental]/7）
+        if (nShort > 0 || nLong > 0 || nInt > 0) bad("'char' cannot be combined with 'short'/'long'/'int'");
+    } else if (nChar == 0 && nShort == 0 && nLong == 0 && nInt == 0
+               && nSigned == 0 && nUnsigned == 0) {
+        // 防御：调用约定保证至少有一个关键字；走到这里说明调用点写错了
+        bad("no type specifier");
+    }
+
+    const bool uns = nUnsigned == 1;
+    TypePtr base;
+    if (nChar > 0) {
+        // ★ char / signed char / unsigned char 是【三个不同类型】
+        base = uns ? Type::makeUChar()
+                   : (nSigned > 0 ? Type::makeSChar() : Type::makeChar());
+    } else if (nShort > 0) {
+        base = uns ? Type::makeUShort() : Type::makeShort();
+    } else if (nLong == 2) {
+        base = uns ? Type::makeULongLong() : Type::makeLongLong();
+    } else if (nLong == 1) {
+        base = uns ? Type::makeULong() : Type::makeLong();
+    } else {
+        // 没有长度修饰：`unsigned` ≡ `unsigned int`，`signed` ≡ `signed int` ≡ `int`
+        base = uns ? Type::makeUInt() : Type::makeInt();
+    }
+
+    std::cout << std::format(
+        "  [parse:type] type-specifier-seq: '{}' ⇒ base = {}  ({})\n",
+        spelling, base->toString(),
+        (nUnsigned ? "无符号，Itanium 编码与有符号版不同" : "有符号"));
+    return base;
+}
+
 TypePtr Parser::parseType() {
     // ── Step 1: 处理 const 前缀（例如 const int, const Vec&）──
     bool isConst = false;
@@ -208,7 +294,15 @@ TypePtr Parser::parseType() {
     // ── Step 2: 解析基础类型（基本类型 / 标识符 / 命名空间限定类型）──
     TypePtr base;
 
-    if (match(TokenType::KwInt)) {
+    // 整型家族的多关键字写法（unsigned long long int / signed char / short …）：
+    // 只接【以 short/long/signed/unsigned/char 开头】的序列；单体写法 int/double/
+    // bool/void/auto 仍走下面的分支快筛 —— 既有代码的日志因此逐字节不变。
+    if (check(TokenType::KwShort) || check(TokenType::KwLong)
+        || check(TokenType::KwSigned) || check(TokenType::KwUnsigned)
+        || check(TokenType::KwChar)) {
+        base = parseBuiltinTypeSpecifierSeq();
+    }
+    else if (match(TokenType::KwInt)) {
         base = Type::makeInt();          // 样例: int
         std::cout << std::format("  [parse:type] base = int\n");
     }
@@ -447,6 +541,131 @@ TypePtr Parser::parseType() {
 //   constant-expression 做完整解析 + 常量求值 + 形参类型匹配；本项目只认整数字面量
 //   （Buf<2+2> 不支持，属常量折叠，见 ROADMAP 主线 D），类型匹配推迟到 Sema 实例化前
 //   做（checkTemplateArguments）。对照 clang：Parser::ParseTemplateArgumentList。
+// ─────────────────────────────────────────────────────────────────────────────
+// parseIntLiteral：把整数字面量的【原文】读成「值 + 形态」（[lex.icon]）
+// ─────────────────────────────────────────────────────────────────────────────
+// 词法只负责切出最长匹配的原文串（"0x1F" / "4UL"），解读在这里：
+//   ① 进制：0x/0X ⇒ 16，0b/0B ⇒ 2，前导 0 ⇒ 8，否则 10
+//   ② 后缀：u/U（unsigned）、l/L（long，两个即 long long）、z/Z（size_t 后缀）
+//   ③ 查 [lex.icon]/2 的表定出类型 —— 该表的要义是「按顺序取第一个装得下的」：
+//      十进制无后缀：int → long → long long（十进制【永不】取无符号）
+//      非十进制无后缀：int → unsigned int → long → unsigned long → long long → …
+//      带 u：unsigned int → unsigned long → unsigned long long
+// demo: "42"   ⇒ {42, int}          "4L"  ⇒ {4, long}
+//       "4u"   ⇒ {4, unsigned int}  "4UL" ⇒ {4, unsigned long}
+//       "0x10" ⇒ {16, int}          "0xFF" ⇒ {255, int}
+// ★ 为什么必须区分形态：`Buf<4>` 与 `Buf<4L>` 在 `template<long N>` 下是【同一个】
+//   实例（窄化到目标类型后同值），但在 `template<auto V>` 下是【两个不同】实例
+//   （V 的类型分别是 int / long）。形态不丢才判得对这两件事。
+// 对照 clang：Lexer 产出 numeric_constant 原文，Sema::ActOnNumericConstant +
+//   TargetInfo 按同一张表选类型（clang/lib/Sema/SemaExpr.cpp:ActOnIntegerConstant）。
+struct IntLiteralValue {
+    int64_t value = 0;
+    TypePtr type;                 // 形态；恒非空
+};
+
+static IntLiteralValue parseIntLiteral(const std::string& text, SourceLocation loc) {
+    // ── ① 进制 + 数字段 ──
+    size_t i = 0;
+    int    base = 10;
+    if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16; i = 2;
+    } else if (text.size() >= 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) {
+        base = 2;  i = 2;
+    } else if (text.size() >= 2 && text[0] == '0') {
+        base = 8;  i = 1;         // `0` 自己也算八进制（值相同，形态无关紧要）
+    }
+
+    std::string digits;
+    for (; i < text.size(); i++) {
+        const char c = text[i];
+        if (c == '\'') continue;                       // C++14 数字分隔符：跳过
+        if (base == 16 ? std::isxdigit(static_cast<unsigned char>(c))
+                       : (c >= '0' && c <= '9')) digits += c;
+        else break;                                    // 后缀从这里开始
+    }
+    // ── ② 后缀 ──
+    const std::string suffix = text.substr(i);
+    bool hasU = false, hasZ = false;
+    int  nLong = 0;
+    for (char c : suffix) {
+        if (c == 'u' || c == 'U') hasU = true;
+        else if (c == 'l' || c == 'L') nLong++;
+        else if (c == 'z' || c == 'Z') hasZ = true;
+    }
+
+    // ── ③ 值：按无符号 64 位解析，再按位模式存进 int64_t ──
+    // 用 stoull 而非 stoll：0xFFFFFFFFFFFFFFFF 这类字面量超过 INT64_MAX，
+    // stoll 会抛 overflow；而它的位模式（-1）正是要存的东西。
+    uint64_t u = 0;
+    try {
+        u = digits.empty() ? 0 : std::stoull(digits, nullptr, base);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::format(
+            "integer literal '{}' is too large to represent in 64 bits", text));
+    }
+
+    // ── ④ 查 [lex.icon]/2 的表 ──
+    // `fits*` 谓词按"该类型能否精确表示这个值"判断 —— 十进制字面量按数值比，
+    // 非十进制按位模式比（此处两者对本题的取值域恰好同形，故共用一组谓词）。
+    const bool fitsI32 = u <= 0x7FFFFFFFull;
+    const bool fitsU32 = u <= 0xFFFFFFFFull;
+    const bool fitsI64 = u <= 0x7FFFFFFFFFFFFFFFull;
+
+    TypePtr ty;
+    if (hasZ) {
+        ty = Type::makeULong();                        // size_t 后缀；LP64 下 size_t = unsigned long
+    } else if (hasU && nLong >= 2) {
+        ty = Type::makeULongLong();
+    } else if (hasU && nLong == 1) {
+        ty = Type::makeULong();
+    } else if (hasU) {
+        ty = fitsU32 ? Type::makeUInt() : Type::makeULong();
+    } else if (nLong >= 2) {
+        ty = fitsI64 ? Type::makeLongLong() : Type::makeULongLong();
+    } else if (nLong == 1) {
+        // 十进制：long → long long；非十进制：long → unsigned long → …
+        ty = fitsI64 ? Type::makeLong()
+                     : (base == 10 ? Type::makeLongLong() : Type::makeULong());
+    } else if (base == 10) {
+        // 十进制无后缀：int → long → long long（绝不取无符号）
+        ty = fitsI32 ? Type::makeInt() : (fitsI64 ? Type::makeLong() : Type::makeLongLong());
+    } else {
+        // 非十进制无后缀：int → unsigned int → long → unsigned long → long long → …
+        ty = fitsI32 ? Type::makeInt()
+                     : (fitsU32 ? Type::makeUInt()
+                                : (fitsI64 ? Type::makeLong() : Type::makeULong()));
+    }
+
+    // ★ 本函数【不打印日志】：它被每一条整数表达式调用，逐字面量打点会把日志淹掉，
+    //   而"字数形态"这件事的可观测点在两处更合适的地方：
+    //     ① NTTP 实参 —— 调用点现有的 [parse:targ] 行会带上形态；
+    //     ② 表达式   —— [infer] IntLiteral(4) → long 那行已说明类型。
+    (void)loc;
+    return {static_cast<int64_t>(u), ty};
+}
+
+// escapeCharText：把【已翻译过转义】的字符字面量正文还原成可打印形式。
+// 词法期 `'\n'` 的正文已经是真正的换行符（0x0A），直接塞进日志会把那一行
+// 拦腰截断（`char literal '` + 换行 + `' (10)`），既没法读、也让 logdiff
+// 的逐行对比失去意义。故回吐时把不可打印字符重新转义。
+// demo: escapeCharText("\n")  ⇒ "\\n"    escapeCharText("a") ⇒ "a"
+static std::string escapeCharText(const std::string& raw) {
+    std::string out;
+    for (char ch : raw) {
+        switch (ch) {
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            case '\0': out += "\\0";  break;
+            case '\\': out += "\\\\"; break;
+            case '\'': out += "\\'";  break;
+            default:   out += ch;     break;
+        }
+    }
+    return out;
+}
+
 std::vector<TemplateArg> Parser::parseTemplateArgumentList() {
     expect(TokenType::Less, "Expected '<' before template arguments");
 
@@ -468,17 +687,23 @@ std::vector<TemplateArg> Parser::parseTemplateArgumentList() {
                 //   此处只识别最常见的「负号 + 整数字面量」，覆盖 Buf<-3>。
                 //   对应 Itanium 编码 _Z3BufILin3EE（n 表负数，见 NameMangler）。
                 advance();  // '-'
-                int64_t value = -std::stoll(advance().text);
+                const Token& lit = advance();
+                // ★ 负号只改【值】不改【形态】：`-4L` 仍是 long（[expr.unary.op]/7
+                //   的整型提升在此不改变类型）。故形态取自字面量本身。
+                IntLiteralValue lv = parseIntLiteral(lit.text, lit.location);
+                lv.value = -lv.value;
                 std::cout << std::format(
-                    "  [parse:targ] ★ non-type argument (NTTP): negative integer {}\n", value);
-                args.push_back(TemplateArg::ofValue(value, Type::makeInt()));
+                    "  [parse:targ] ★ non-type argument (NTTP): negative integer {} (形态 {})\n",
+                    lv.value, lv.type->toString());
+                args.push_back(TemplateArg::ofValue(lv.value, lv.type));
             }
             else if (check(TokenType::IntLiteral)) {
                 const Token& tok = advance();
-                int64_t value = std::stoll(tok.text);
+                IntLiteralValue lv = parseIntLiteral(tok.text, tok.location);
                 std::cout << std::format(
-                    "  [parse:targ] ★ non-type argument (NTTP): integer literal {}\n", value);
-                args.push_back(TemplateArg::ofValue(value, Type::makeInt()));
+                    "  [parse:targ] ★ non-type argument (NTTP): integer literal {} (形态 {})\n",
+                    lv.value, lv.type->toString());
+                args.push_back(TemplateArg::ofValue(lv.value, lv.type));
             }
             // ★ bool 字面量作非类型实参（[temp.arg.nontype]）——
             //   `enable_if<true, T>` 这类偏特化选择的常客。
@@ -493,6 +718,20 @@ std::vector<TemplateArg> Parser::parseTemplateArgumentList() {
                     "  [parse:targ] ★ non-type argument (NTTP): bool literal {} ({})\n",
                     b ? "true" : "false", b ? 1 : 0);
                 args.push_back(TemplateArg::ofValue(b ? 1 : 0, Type::makeBool()));
+            }
+            // ★ 字符字面量作非类型实参 —— `Char<'a'>` 之于 `template<char C>`，
+            //   与 `Buf<4>` 之于 `template<int N>` 是同一回事，只是形态是 char。
+            //   对应 Itanium 编码 _Z4CharILc97EE（c = char，97 = 'a'）。
+            //   对照 clang：ParseTemplateArgument 里 tok::char_constant 走
+            //   ActOnCharacterConstant → ActOnNonTypeTemplateArgument。
+            else if (check(TokenType::CharLiteral)) {
+                const Token& tok = advance();
+                int64_t val = 0;
+                for (char ch : tok.text) val = (val << 8) | static_cast<unsigned char>(ch);
+                std::cout << std::format(
+                    "  [parse:targ] ★ non-type argument (NTTP): char literal '{}' ({})\n",
+                    escapeCharText(tok.text), val);
+                args.push_back(TemplateArg::ofValue(val, Type::makeChar()));
             }
             else {
                 args.push_back(TemplateArg::ofType(parseType()));
@@ -949,21 +1188,30 @@ TemplateDeclPtr Parser::parseTemplateDecl() {
             // 分派与实参表解析同构：整数字面量 → 值实参；否则 → 类型实参。
             if (match(TokenType::Assign)) {
                 if (check(TokenType::IntLiteral)) {
-                    param.defaultArg = TemplateArg::ofValue(
-                        std::stoll(advance().text), Type::makeInt());
+                    const Token& lit = advance();
+                    IntLiteralValue lv = parseIntLiteral(lit.text, lit.location);
+                    param.defaultArg = TemplateArg::ofValue(lv.value, lv.type);
                 }
                 else if (check(TokenType::Minus)
                          && m_pos + 1 < m_tokens.size()
                          && m_tokens[m_pos + 1].is(TokenType::IntLiteral)) {
                     advance();
-                    param.defaultArg = TemplateArg::ofValue(
-                        -std::stoll(advance().text), Type::makeInt());
+                    const Token& lit = advance();
+                    IntLiteralValue lv = parseIntLiteral(lit.text, lit.location);
+                    param.defaultArg = TemplateArg::ofValue(-lv.value, lv.type);
                 }
                 else if (check(TokenType::KwTrue) || check(TokenType::KwFalse)) {
                     // 默认值也可以是 bool（`template <bool B = true>`）
                     bool b = check(TokenType::KwTrue);
                     advance();
                     param.defaultArg = TemplateArg::ofValue(b ? 1 : 0, Type::makeBool());
+                }
+                else if (check(TokenType::CharLiteral)) {
+                    // 默认值也可以是字符（`template <char C = 'x'>`）
+                    const Token& tok = advance();
+                    int64_t val = 0;
+                    for (char ch : tok.text) val = (val << 8) | static_cast<unsigned char>(ch);
+                    param.defaultArg = TemplateArg::ofValue(val, Type::makeChar());
                 }
                 else {
                     param.defaultArg = TemplateArg::ofType(parseType());
@@ -2209,9 +2457,26 @@ ExprPtr Parser::parsePrimaryExpr() {
 
     // 整数字面量
     if (check(TokenType::IntLiteral)) {
-        int64_t val = std::stoll(advance().text);
-        auto expr = std::make_shared<IntLiteralExpr>(val);
+        const Token& tok = advance();
+        // 形态（后缀/进制决定的类型）随节点带走 —— `int x = 4L;` 里 4L 是 long
+        // 而不是 int，后续 typeCompatible / 推导都按 long 走。
+        IntLiteralValue lv = parseIntLiteral(tok.text, tok.location);
+        auto expr = std::make_shared<IntLiteralExpr>(lv.value, lv.type);
         expr->location = loc;
+        return expr;
+    }
+
+    // 字符字面量 'a'：词法已把转义翻译好，这里只把"字符"折算成"码点值"。
+    // ★ 单字符 ⇒ 该字节的值；多字符字面量（'ab'，Implementation-defined）按
+    //   "最后一个字符在最低字节"的常见实现折叠 —— 与 GCC/Clang 一致。
+    if (check(TokenType::CharLiteral)) {
+        const Token& tok = advance();
+        int64_t val = 0;
+        for (char ch : tok.text) val = (val << 8) | static_cast<unsigned char>(ch);
+        auto expr = std::make_shared<CharLiteralExpr>(val);
+        expr->location = loc;
+        std::cout << std::format("  [parse:literal] '{}' ⇒ 字符码点 {}\n",
+                                 escapeCharText(tok.text), val);
         return expr;
     }
 

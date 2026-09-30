@@ -148,6 +148,29 @@ public:
         const std::string& templateName,
         const std::vector<TemplateArg>& args);
 
+    // ── 实参表的「无损键」（injective）────────────────────────────────────
+    // 用途：① Sema 的实例缓存键（m_classInstanceCache）② 实例名的撞名守卫
+    //   （TemplateInstantiator 的 Step 2a）。两处此前各自用 `TemplateArg::toString()`
+    //   拼串 —— 那条路【不是单射】，`template<auto V>` 下 `K<4>`(V=int) 与
+    //   `K<4L>`(V=long) 会拼出同一个 "K<4>"，于是后者直接命中前者的缓存：
+    //   两个不同实例被静默合并，连"算错"的症状都没有。
+    //
+    // ★ 形态只在【auto 形参】的位才进键：
+    //     非 auto 位的形态由形参类型唯一确定（checkTemplateArguments 已把实参形态
+    //     归一成形参类型，`Buf<4L>` 与 `Buf<4>` 本就该是同一实例 ⇒ 同一键）；
+    //     auto 位的形态是【实参自己带来的】（[temp.param]/6 的推导结果）
+    //     ⇒ 必须进键，否则 int 4 与 long 4 分不开。
+    //   渲染：值位默认印 `4`；auto 位印 `4:int` / `4:long` / `1:bool`。
+    // demo：Buf<int N> + {4}        ⇒ "Buf<4>"
+    //       K<auto V>  + {4}(int)   ⇒ "K<4:int>"
+    //       K<auto V>  + {4}(long)  ⇒ "K<4:long>"
+    // 对照 clang：它靠 mangling 里的 TnDa（auto 形参的 <template-param-decl>）
+    //   达到同样的区分效果，本项目把这份信息放进可读键里。
+    static std::string losslessArgumentsKey(
+        const std::string& templateName,
+        const std::vector<TemplateArg>& args,
+        const std::vector<TemplateParamPtr>& params);
+
     // 函数模板实例的符号名（★ 比类模板实例多末尾一段 <bare-function-type>）
     // 格式: _Z + 名 + I<模板实参>E + <返回类型> + <各参数类型>
     // demo: template<class T> T twice(T x) 以 T=int 实例化 ⇒ _Z5twiceIiET_T_

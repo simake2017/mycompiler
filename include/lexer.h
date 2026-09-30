@@ -102,8 +102,9 @@ private:
     // ── 扫描各类 Token（DFA 的四大分支）──
     // 统一约定：调用时光标指向该 token 的首字符；返回时光标恰好停在它之后。
 
-    // 数字字面量（[lex.icon]，简化为十进制整数）：贪心消费连续数字。
-    // demo: "42;" ⇒ Token{IntLiteral,"42"}，光标停在 ';'
+    // 数字字面量（[lex.icon]）：按进制判前缀（0x/0b/前导 0），再吞整数后缀（u/U/l/L/z/Z）。
+    // ★ 只切串、不解读 —— "值 + 形态" 由 Parser::parseIntLiteral 按 [lex.icon]/2 的表定。
+    // demo: "42;" ⇒ Token{IntLiteral,"42"}，光标停在 ';'；"4ul" ⇒ Token{IntLiteral,"4ul"}
     Token scanNumber();
     // 标识符/关键字（[lex.name]/[lex.key]）：消费字母/数字/下划线后查 kKeywordMap
     // 决定是关键字还是标识符。
@@ -112,6 +113,9 @@ private:
     // 字符串字面量（[lex.string]）：消费到未转义的 '"' 为止，途中翻译转义序列。
     // demo: 源码 6 字符 "hi\n" ⇒ Token{StringLiteral, "hi"+换行符}，结尾引号被消费
     Token scanString();
+    // 字符字面量（[lex.ccon]）：消费到未转义的 '\'' 为止，转义规则与 scanString 同表。
+    // demo: 'a' ⇒ Token{CharLiteral,"a"}；'\n' ⇒ Token{CharLiteral, 换行符}；'' ⇒ 报错
+    Token scanChar();
     // 运算符/分隔符（[lex.operators]）：按最长匹配决定取双字符还是单字符。
     // demo: "<=" ⇒ Token{LessEqual}；"<x" ⇒ Token{Less}，光标停在 'x'
     Token scanOperator();

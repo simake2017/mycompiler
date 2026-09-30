@@ -145,6 +145,27 @@ ctor 初始化列表嵌套构造调用）。
 > 主线 D 落地后应把该处换成「解析完整常量表达式 → 折叠求值」，
 > 于是 `Buf<2+2>`、`Buf<N*2>`（依赖前面的 NTTP）随之打通。
 > 这是主线 D 最自然的第一个消费者。
+>
+> ★ **更新（NTTP 类型域扩展那一批，`docs/learn/35`）**：接口的**另一半已经补齐** ——
+> 形参与实参的**类型域**不再局限于 `int`：
+>
+> | 能力 | 状态 |
+> |---|---|
+> | 形参整型家族 `unsigned` / `long` / `short` / `char` / 多关键字写法 | ✅ `tests/tmpl/test_tmpl_61` |
+> | 实参字面量进制与后缀 `4L` / `4u` / `0x10` / `0b101` / `010` / `1'000` | ✅ `test_tmpl_62` |
+> | 字符字面量 `'a'` / `'\n'` / `'ab'`（[lex.ccon]） | ✅ `test_tmpl_63` |
+> | 值位整型转换 [temp.arg.nontype]/1（`Flag<1>` / `A<4L>`，**回归 B17**） | ✅ `test_tmpl_64` |
+> | 窄化拒绝（`F<2>` / `U<-1>` / `D<300>`，文案与 clang 逐字同） | ✅ `test_tmpl_65/66/67` |
+> | `template<auto V>`（类型由实参反推，[temp.param]/6） | ✅ `test_tmpl_68` |
+> | **任意常量表达式** `Buf<2+2>` / `Buf<k>` | ❌ **仍然是 Parse Error —— 主线 D 的全部剩余工作** |
+>
+> 换句话说：主线 D 现在只需在 `parseTemplateArgumentList` 里把
+> "字面量分支"换成"完整常量表达式分支"，**下游（形态归一 / 可表示性检查 /
+> 缓存键 / mangling）已经全部就绪**，不必再动。
+> mangling 的 `TnDa`（`<template-param-decl>`，只用于**函数**模板的 `auto` NTTP）
+> 仍未实现 —— 函数模板的显式 NTTP 实参目前直接报
+> `explicit non-type template argument … for function template … is not supported yet`，
+> 故没有写死代码。
 
 ## 主线 E：数组 / enum / namespace（P2，`[]` 与 `::` token 已留坑)
 

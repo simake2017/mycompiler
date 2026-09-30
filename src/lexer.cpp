@@ -34,10 +34,12 @@ const char* tokenTypeName(TokenType t) {
     switch (t) {
         case TokenType::Eof:           return "EOF";
         case TokenType::IntLiteral:    return "IntLiteral";
+        case TokenType::CharLiteral:   return "CharLiteral";
         case TokenType::StringLiteral: return "StringLiteral";
         case TokenType::Identifier:    return "Identifier";
         case TokenType::KwAuto:        return "auto";
         case TokenType::KwBool:        return "bool";
+        case TokenType::KwChar:        return "char";
         case TokenType::KwClass:       return "class";
         case TokenType::KwConst:       return "const";
         case TokenType::KwDecltype:    return "decltype";
@@ -50,6 +52,7 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwFor:         return "for";
         case TokenType::KwIf:          return "if";
         case TokenType::KwInt:         return "int";
+        case TokenType::KwLong:        return "long";
         case TokenType::KwNamespace:   return "namespace";
         case TokenType::KwNew:         return "new";
         case TokenType::KwNullptr:     return "nullptr";
@@ -58,6 +61,8 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwPrivate:     return "private";
         case TokenType::KwProtected:   return "protected";
         case TokenType::KwReturn:      return "return";
+        case TokenType::KwShort:       return "short";
+        case TokenType::KwSigned:      return "signed";
         case TokenType::KwStatic:      return "static";
         case TokenType::KwStruct:      return "struct";
         case TokenType::KwTemplate:    return "template";
@@ -65,6 +70,7 @@ const char* tokenTypeName(TokenType t) {
         case TokenType::KwTrue:        return "true";
         case TokenType::KwTypedef:     return "typedef";
         case TokenType::KwTypename:    return "typename";
+        case TokenType::KwUnsigned:    return "unsigned";
         case TokenType::KwUsing:       return "using";
         case TokenType::KwVirtual:     return "virtual";
         case TokenType::KwVoid:        return "void";
@@ -221,24 +227,67 @@ void Lexer::skipWhitespaceAndComments() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 扫描数字字面量（仅支持整数）
+// 扫描数字字面量（整数字面量，[lex.icon]）
 // ─────────────────────────────────────────────────────────────────────────────
-// 状态机（[lex.icon] 的极简版）：
-//   起始 ──数字──► [数字态] ──数字──► [数字态] ──非数字/EOF──► 返回 IntLiteral
+// 状态机（[lex.icon] 的整数部分）：
+//   起始 ──'0'──► [前缀态] ──'x'/'X'──► [十六进制态] ──hex──► …
+//                          ──'b'/'B'──► [二进制态]  ──0/1──► …
+//                          ──其他────►  [八进制态]  ──0~7──► …
+//   起始 ──'1'~'9'──► [十进制态] ──数字──► [十进制态]
+//   任一数字态 ──整数后缀──► [后缀态] ──非后缀──► 返回 IntLiteral
 // 扫到的字符 ⇒ 动作：
-//   `0`~`9`  ⇒ advance() 收进 text，继续贪心（这是数字分支内部的"最长匹配"）
+//   数字（按进制合法性）⇒ advance() 收进 text，继续贪心
+//   后缀 u/U/l/L（可组合，见下）⇒ 收进 text（本函数【不解读】它，留给 Parser）
 //   其他/EOF ⇒ 停，产 Token{IntLiteral, text}
 // demo: "42;" ⇒ Token{IntLiteral,"42"}，光标停在 ';'（贪心保证 42 不会被切成 4 和 2）
-// 省略：十六进制/八进制/二进制前缀、浮点、后缀（u/l/f…）、数字分隔符 '（教学重点是状态机形态本身）
+//       "0x1F" ⇒ "0x1F" │ "4ul" ⇒ "4ul"
+// ★ 后缀与进制【只收进 text，不在词法期解读】—— 解读放在 Parser::parseIntLiteral。
+//   理由：字面量的"值 + 形态"是【语义】信息（4L 的形态是 long），而 Token 只有
+//   一个 text 字段。让词法只负责"最长匹配切一刀"、解析器负责"读懂它"，
+//   职责边界与 clang 一致（Lexer 产出 tok::numeric_constant 的原始串，
+//   由 Sema::ActOnNumericConstant 配着 TargetInfo 决定类型）。
+// 省略：浮点字面量（[lex.fcon]）、数字分隔符 '（C++14）、后缀 f。
 Token Lexer::scanNumber() {
     // 先拍位置快照：token 位置指向第一个数字（若扫完再取就指向后面的字符了）
     auto loc = currentLocation();
     std::string text;
 
-    // 贪心消费连续数字——数字分支内部的"最长匹配"：
-    // 见数字就吃，直到第一个非数字字符才停，保证 42 不会被切成 4 和 2。
-    while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
+    // ── 进制分支：可能是前缀，也可能只是数字 0（如 `0` 与 `07` 与 `0x1F`）──
+    auto isHex = [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; };
+
+    if (peek() == '0') {
         text += advance();
+        if (!isAtEnd() && (peek() == 'x' || peek() == 'X')) {
+            text += advance();
+            while (!isAtEnd() && (isHex(peek()) || peek() == '\'')) text += advance();
+        } else if (!isAtEnd() && (peek() == 'b' || peek() == 'B')) {
+            text += advance();
+            while (!isAtEnd() && (peek() == '0' || peek() == '1' || peek() == '\'')) text += advance();
+        } else {
+            // 八进制：以 0 开头的十进制数字串（`0` 自己也算）
+            while (!isAtEnd() && ((peek() >= '0' && peek() <= '7') || peek() == '\'')) text += advance();
+        }
+    } else {
+        // 十进制：贪心消费连续数字——数字分支内部的"最长匹配"：
+        // 见数字就吃，直到第一个非数字字符才停，保证 42 不会被切成 4 和 2。
+        while (!isAtEnd() && (std::isdigit(static_cast<unsigned char>(peek())) || peek() == '\'')) {
+            text += advance();
+        }
+    }
+
+    // ── 整数后缀 [lex.icon]：unsigned-suffix / long-suffix / long-long-suffix /
+    //    size-suffix，可任意组合且大小写皆可（`4ul`、`4LU`、`4LL`、`4ULL` …）──
+    //    词法只需保证不会把 `4long` 这种标识符开头切碎：后缀只吃
+    //    u/U/l/L/z/Z 这几个字母，且 l/L 至多吃两个（long long）。
+    int nLong = 0;
+    while (!isAtEnd()) {
+        const char c = peek();
+        if (c == 'u' || c == 'U' || c == 'z' || c == 'Z') { text += advance(); }
+        else if (c == 'l' || c == 'L') {
+            if (nLong >= 2) break;          // 至多 long long
+            nLong++; text += advance();
+        }
+        else break;
     }
 
     return makeToken(TokenType::IntLiteral, text, loc);
@@ -316,6 +365,59 @@ Token Lexer::scanString() {
     advance(); // 消费结尾的 "
 
     return makeToken(TokenType::StringLiteral, text, loc);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 扫描字符字面量（[lex.ccon]）
+// ─────────────────────────────────────────────────────────────────────────────
+// 语法：' c-char ' 或 ' c-char-sequence '（多字符字面量，Implementation-defined）
+// 与 scanString 的唯一区别是**定界符不同**与**长度语义**：字符串是"一串字符"，
+// 字符字面量是"一个整数值"。故这里把翻译后的字符【原样存进 text】，
+// 由 Parser 负责取它的值（`'a'` ⇒ 97）—— 与整数字面量"词法切串、Parser 解读"同构。
+// demo: 'a' ⇒ Token{CharLiteral, text=="a"}；'\n' ⇒ text=="\n"（已翻译）
+//       'ab'（多字符）⇒ text=="ab"，Parser 按"末字节在前"的常见实现取值
+// 对照 clang：Lexer::LexCharConstant → Sema::ActOnCharacterConstant（值在 Sema 定，
+//   因为涉及目标字符集与 wchar_t 宽度）。
+Token Lexer::scanChar() {
+    auto loc = currentLocation();
+    advance(); // 消费开头的 '
+
+    std::string text;
+    while (!isAtEnd() && peek() != '\'') {
+        if (peek() == '\\') {
+            advance(); // 消费反斜杠
+            if (isAtEnd()) break;
+            char escaped = advance();
+            // 转义翻译表与 scanString 共用同一套规则（[lex.ccon] 的 simple-escape-sequence）
+            switch (escaped) {
+                case 'n':  text += '\n'; break;
+                case 't':  text += '\t'; break;
+                case 'r':  text += '\r'; break;
+                case '0':  text += '\0'; break;
+                case '\\': text += '\\'; break;
+                case '\'': text += '\''; break;
+                case '"':  text += '"';  break;
+                default:   text += escaped; break;
+            }
+        } else {
+            text += advance();
+        }
+    }
+
+    // 走到文件尾仍未见闭引号 → 报错（[lex.ccon] 要求字符字面量在同一行内终结）
+    if (isAtEnd()) {
+        throw std::runtime_error(
+            std::format("Unterminated character literal at {}", loc.toString()));
+    }
+    advance(); // 消费结尾的 '
+
+    if (text.empty()) {
+        throw std::runtime_error(std::format(
+            "Empty character literal at {} (C++ 不允许 ''，见 [lex.ccon])",
+            loc.toString()));
+    }
+
+    return makeToken(TokenType::CharLiteral, text, loc);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,6 +516,7 @@ Token Lexer::scanOperator() {
 //   数字 (0-9)        scanNumber()                "42"
 //   字母 / 下划线     scanIdentifierOrKeyword()   "foo"、"int"
 //   双引号            scanString()                "hi"
+//   单引号            scanChar()                  'a'
 //   其他              scanOperator()              "="、";"、"->"
 // demo: "int x = 42;" 连续调用 ⇒ {KwInt}{Identifier "x"}{Assign}{IntLiteral "42"}{Semicolon}{Eof}
 Token Lexer::nextToken() {
@@ -440,6 +543,11 @@ Token Lexer::nextToken() {
     // 双引号开头 → 字符串字面量
     if (c == '"') {
         return scanString();
+    }
+
+    // 单引号开头 → 字符字面量
+    if (c == '\'') {
+        return scanChar();
     }
 
     // 其他 → 运算符或分隔符

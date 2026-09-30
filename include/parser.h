@@ -132,7 +132,16 @@ private:
     // ── 类型解析 ──
     // type := ['const'] base-type ('*' | '&' | '&&')*
     // base-type := 'int'|'double'|'bool'|'void'|'auto' | IDENT(类名/模板参数名)
+    //            | type-specifier-seq（整型家族的多关键字写法，见下）
     TypePtr parseType();
+
+    // 内置整型家族的 type-specifier-seq（[dcl.type.simple]）——
+    //   `unsigned long long int` / `signed char` / `short` 这类由 1~3 个关键字拼成的写法。
+    // 调用约定：仅当【当前 Token 是 short/long/signed/unsigned/char 之一】时才调用；
+    //   函数负责把整段关键字吃干净并返回规范化的类型节点，不会回溯。
+    // 单个关键字的写法（int / double / bool / void / auto）不走这里，仍由 parseType
+    //   的分支快筛 —— 这样既有代码的日志逐字节不变。
+    TypePtr parseBuiltinTypeSpecifierSeq();
 
     // ── 模板实参解析（[temp.arg]）──
     // template-argument-list := '<' template-argument (',' template-argument)* '>'

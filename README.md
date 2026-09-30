@@ -400,6 +400,14 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_58_error_ttp_arity_mismatch.cpp` | 错误：签名**位数**不符 | `template<template<class,class> class C>` 收只有 1 位的 `Box` ⇒ `too few`；缺这道校验会一路放行到下游报"假类型实参过多"，诊断不指向根因 |
 | `test_tmpl_59_error_ttp_kind_mismatch.cpp` | 错误：签名**逐位 kind** 不符 | 形参位要值位（`template<int> class C`）、实参模板对应位是类型位 ⇒ `different kind` |
 | `test_tmpl_60_error_ttp_arg_is_template_id.cpp` | 错误：拿**特化类型**填模板位 | `Wrap<Box<int>,int>` 的 `Box<int>` 是**类型**不是模板名。★ 最阴的一条：`Box` 与 `Box<int>` 的名字段都是 `"Box"`，只查名字会被骗过去、`<int>` 静默蒸发，而产物与 `Wrap<Box,int>` 逐字节相同 —— **连算错都看不出来** |
+| `test_tmpl_61_nttp_integer_family.cpp` | **NTTP 形参的整型家族** `unsigned long` / `long unsigned` / `short` / `char` / `long long int` | [dcl.type.simple] 的 type-specifier-seq：多关键字顺序任意、可重复 ⇒ Parser 先收集再归一（`parseBuiltinTypeSpecifierSeq`）。mangling 表 `m`/`s`/`c`/`x` 与 clang 逐字符同 |
+| `test_tmpl_62_nttp_literal_forms.cpp` | **字面量的进制与后缀** `4L` / `4u` / `0x10` / `0b101` / `010` / `1'000` | [lex.icon]/2 的类型表。★ 词法只切片、Parser 才解释成 `(value, type)`（对应 clang 的 `Lexer` vs `NumericLiteralParser` 分工）。`L<4L>`/`L<4l>` 归一成同一实例 |
+| `test_tmpl_63_nttp_char_literal.cpp` | **字符字面量作 NTTP 实参** `'a'` / `'\n'` / `'\\'` / `'ab'` | [lex.ccon]：转义在**词法期**已翻译（token 正文是真 0x0A）⇒ 回吐日志必须**重新转义**，否则一行被裸换行截断。多字符字面量按 GCC/Clang 口径折叠（`'ab'` = 24930） |
+| `test_tmpl_64_nttp_integral_conversion.cpp` | **【正例】值位整型转换**（★ 回归 [B17](docs/BUGS.md)） | `Flag<1>`（int→bool）/ `A<4L>`（long→int）/ `A<true>`（bool→int 提升）三条**此前全被拒**。判据是 [dcl.init]/7 + [expr.const]/10 的**可表示性**，不是"形态精确相等" |
+| `test_tmpl_65_error_nttp_bool_narrowing.cpp` | 错误：值实参窄化到 `bool` | `F<2>`：2 ∉ {0,1}。★ 与 64 的 `F<1>` 只差一个值 —— 这条边界正是"判据是可表示性"的最锐利证据 |
+| `test_tmpl_66_error_nttp_unsigned_negative.cpp` | 错误：负值给无符号形参 | `G<-1>`：常量表达式**不豁免**负值→无符号的窄化（运行期 [conv.integral] 取模是另一回事） |
+| `test_tmpl_67_error_nttp_char_narrowing.cpp` | 错误：值实参窄化到 `char` | `D<300>`：300 ∉ [-128,127]。诊断必须点名**形参声明的那一个**类型（`char` ≠ `signed char` ≠ `unsigned char`） |
+| `test_tmpl_68_nttp_auto_param.cpp` | **`template<auto V>`** 类型由实参反推 | [temp.param]/6 的 deduced non-type parameter：`K<4>`(int) 与 `K<4L>`(long) 是**两个实例**。★ 顺带修掉一个**静默撞键**：实例名/缓存键曾用 `TemplateArg::toString()`（对两者都产 `"4"`）⇒ 第二个静默复用第一个。现走 `losslessArgumentsKey`，形态只在 `auto` 位写入 |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -538,12 +546,16 @@ mycompiler/
 │   ├── test_tmpl_51_*.cpp          # CTAD 类模板实参推导 + 推导指引
 │   ├── test_tmpl_52..56_*.cpp      # 引用折叠 / NTTP 特化模式 / 模板模板参数 /
 │   │                               #   auto 带壳形态 / 成员模板
-│   ├── test_tmpl_57..59_*.cpp      # 模板模板实参的逐位签名匹配（+ 两条负向）
-│   └── unit/                       # 单元测试（ctest 驱动，159 个用例）
+│   ├── test_tmpl_57..60_*.cpp      # 模板模板实参的逐位签名匹配（+ 三条负向）
+│   ├── test_tmpl_61..63_*.cpp      # NTTP 类型域：整型家族 / 字面量进制后缀 / 字符字面量
+│   ├── test_tmpl_64..67_*.cpp      # 值位整型转换正例（回归 B17）+ 三条窄化负例
+│   ├── test_tmpl_68_*.cpp          # template<auto V>：形态即类型，各自成实例
+│   └── unit/                       # 单元测试（ctest 驱动）
 │       ├── test_template_deduction.cpp  # 推导 / 替换 / 偏特化匹配 / NTTP
 │       ├── test_decltype_sfinae.cpp     # Decltype.* / Sfinae.* / PartialOrder.* / SfinaeProtocol.*
 │       ├── test_codegen_frame.cpp       # CodegenFrame.*：帧大小 ≥ 最深局部偏移（不变量）
-│       └── test_ast_visitor.cpp         # AstVisitorDispatch.*：分派路由 + kind≡类型不变量
+│       ├── test_ast_visitor.cpp         # AstVisitorDispatch.*：分派路由 + kind≡类型不变量
+│       └── test_nttp_type_domain.cpp    # NttpTypeDomain.*：可表示性边界 + auto 位键的单射性
 ├── docs/learn/                     # 分主题学习文档（01..29，与测试一一对应）
 ├── docs/REFACTOR-ast-visitor.md    # AST 分派重构（五批次）：动机 / 边界 / 验证方法
 ├── docs/NOTES-阅读笔记.md          # 通读源码时的理解要点（按模块整理）
@@ -743,6 +755,14 @@ MyClass::foo(int)   → _ZN7MyClass3fooEi (类方法)
       （文档 docs/learn/33）
 - [x] **成员模板**：`A::add(T)` 按调用点推导，规则与函数模板逐字相同（[temp.mem]）
       （文档 docs/learn/34）
+- [x] **NTTP 的类型域**：形参从"只认 `int`"扩到整型家族（`unsigned long` / `short` /
+      `char` / 多关键字写法）+ 字符字面量实参（`D<'a'>`）+ `template<auto V>`；
+      实参侧补齐进制与后缀（`4L` / `0u` / `0x10` / `0b101` / `010` / `1'000`）；
+      **值位判据由"形态精确相等"改为可表示性**（[temp.arg.nontype]/1 → [expr.const]/10
+      → [dcl.init]/7，修掉 [BUGS.md B17](docs/BUGS.md) 的拒收合法程序 +
+      一个 `auto` 位的**静默撞键**）（文档 docs/learn/35）
+- [ ] **NTTP 的任意常量表达式** `Buf<2+2>` / `Buf<k>` —— 仍是 Parse Error，
+      属 ROADMAP 主线 D（下游接口已全部就绪）
 
 ---
 

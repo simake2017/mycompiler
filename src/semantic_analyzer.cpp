@@ -1089,7 +1089,14 @@ static bool typeCompatible(const TypePtr& expected, const TypePtr& got) {
     if (e->isConst()) e = e->innerType;
     if (g->isConst()) g = g->innerType;
     if (e->equals(g)) return true;
-    return e->isDouble() && g->isInt();
+    // ── 算术类型的隐式转换（[conv]）──
+    //   整型 ↔ 整型：整型转换（[conv.integral]/1，含 bool ←→ 整型、char ←→ int）
+    //   浮点 ← 整型：浮点-整型转换（[conv.fpint]/1）
+    // ★ 此前只放行 double ← int 一条，char/unsigned 等一进来 `unsigned x = 1;`
+    //   就会报 Type mismatch —— 判据要按【家族】写，不能按单个 kind 枚举。
+    if (e->isInteger() && g->isInteger()) return true;
+    if (e->isDouble()  && g->isInteger()) return true;
+    return false;
 }
 
 SemanticAnalyzer::SemanticAnalyzer() {
@@ -2820,7 +2827,8 @@ void SemanticAnalyzer::visit(IfStmt& stmt) {
     std::cout << std::format("  [if] condition type: {}\n",
         condType ? condType->toString() : "?");
 
-    if (condType && !condType->isBool() && !condType->isInt()) {
+    // any 整型（含 bool/char/…）都可作条件（[stmt.select]/1 的"上下文转换为 bool"）
+    if (condType && !condType->isInteger()) {
         error("If condition must be bool or int", stmt.location);
     }
 
@@ -2940,6 +2948,8 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
     switch (expr->kind) {
         case NodeKind::IntLiteral:
             type = inferIntLiteral(static_cast<IntLiteralExpr&>(*expr)); break;
+        case NodeKind::CharLiteral:
+            type = inferCharLiteral(static_cast<CharLiteralExpr&>(*expr)); break;
         case NodeKind::BoolLiteral:
             type = inferBoolLiteral(static_cast<BoolLiteralExpr&>(*expr)); break;
         case NodeKind::StringLiteral:
@@ -2998,9 +3008,21 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
 // │ 三处教学简化见上方注释（整数字面量恒 int；字符串字面量给指针；nullptr 给 void*）。
 // └────────────────────────────────────────────────────────────────────────────
 TypePtr SemanticAnalyzer::inferIntLiteral(IntLiteralExpr& expr) {
-    std::cout << std::format("{}[infer] IntLiteral({}) → int\n",
+    // 形态优先：`4L` 是 long、`4u` 是 unsigned int（[lex.icon]/2 的表）；
+    // 未标注形态时按 int（既有路径不变，日志也一字不变）。
+    TypePtr t = expr.literalType ? expr.literalType : Type::makeInt();
+    std::cout << std::format("{}[infer] IntLiteral({}) → {}\n",
+        inferIndent(), expr.value, t->toString());
+    return t;
+}
+
+TypePtr SemanticAnalyzer::inferCharLiteral(CharLiteralExpr& expr) {
+    // [lex.ccon]/1：普通字符字面量的类型是 char（不是 int）—— 值域 0..255 之内。
+    // 这条"类型是 char"的性质要一路带到 CodeGen（按 1 字节存取）与推导/重载
+    // （`f('a')` 与 `f(97)` 是不同类型）。
+    std::cout << std::format("{}[infer] CharLiteral({}) → char\n",
         inferIndent(), expr.value);
-    return Type::makeInt();
+    return Type::makeChar();
 }
 
 TypePtr SemanticAnalyzer::inferBoolLiteral(BoolLiteralExpr& expr) {
@@ -3127,7 +3149,12 @@ TypePtr SemanticAnalyzer::inferBinary(BinaryExpr& expr) {
         TypePtr resultType;
         if (leftType->isDouble() || rightType->isDouble()) {
             resultType = Type::makeDouble();
-        } else if (leftType->isInt() && rightType->isInt()) {
+        } else if (leftType->isInteger() && rightType->isInteger()) {
+            // ★ 整型提升（[conv.prom]/1）：比 int 窄的（bool/char/short）先提升到 int，
+            //   两个操作数同为整型时结果一律按 int 取。本项目不做完整的
+            //   usual arithmetic conversions（`unsigned + int` 该取 unsigned）——
+            //   那是 [expr.arith.conv] 的整张表，属后续项，此处保持"整型 ⇒ int"的
+            //   教学口径，与既有行为一致。
             resultType = Type::makeInt();
         } else {
             resultType = Type::makeInt(); // 默认
@@ -3766,8 +3793,10 @@ void SemanticAnalyzer::checkTemplateArguments(
     SourceLocation loc) {
 
     const auto& params = blueprint->templateParams;
-    const auto& args   = templateIdType->templateArgs;
     const std::string& tname = templateIdType->name;
+    // ★ 取【非 const】引用：下面的 ②③ 循环除校验外还做形态归一（③-c），
+    //   归一结果要写回 templateIdType —— 调用方随后按它建缓存键与生成符号。
+    auto& args = templateIdType->templateArgs;
 
     // ── ① 个数（[temp.arg.explicit]/1 + [temp.param]/12）──
     // 实参可以【少于】形参，差额由默认实参补齐；但不能多于形参，且每位缺失的形参都必须
@@ -3792,9 +3821,20 @@ void SemanticAnalyzer::checkTemplateArguments(
 
     // ── ②③ 逐位形态与值类型（只校验【用户实际给出】的那些位）──
     // 第 i >= args.size() 位留空是合法的，只要它有默认实参（由上面的个数检查把关）。
+    // ★ 本循环除校验外还【归一实参形态】（见 ③-c）：`Buf<4L>` 填 `template<int N>`
+    //   在归一后与 `Buf<4>` 是同一个实参元组 —— clang 也认它们是同一实例
+    //   （实测 `template struct C<4>; template struct C<4L>;` 报 duplicate）。
+    //   故 args 取【非 const】引用；`args` 来自 templateIdType（shared_ptr 指向的对象
+    //   由调用方共享），归一结果对调用方可见。
     for (size_t i = 0; i < std::min(params.size(), args.size()); i++) {
         const TemplateParam& p = *params[i];
-        const TemplateArg&   a = args[i];
+        TemplateArg&         a = args[i];
+
+        // `template<auto V>` 的形参：类型由【实参】反推（[temp.param]/6 的 deduced
+        //   non-type parameter）。形态自检、值域检查都不适用 —— 实参是什么形态，
+        //   V 就是什么类型。
+        const bool isAutoParam = p.kind == TemplateParamKind::NonType
+                              && p.nonType && p.nonType->isAuto();
 
         // 该位"期望什么"的可读描述（供两向报错复用）
         const std::string want =
@@ -3802,8 +3842,10 @@ void SemanticAnalyzer::checkTemplateArguments(
                 ? "a type argument"
                 : (p.kind == TemplateParamKind::Template
                        ? "a template argument"
-                       : std::format("a non-type argument of type '{}'",
-                                     p.nonType ? p.nonType->toString() : "?"));
+                       : (isAutoParam
+                              ? std::string("a non-type argument (parameter is 'auto')")
+                              : std::format("a non-type argument of type '{}'",
+                                            p.nonType ? p.nonType->toString() : "?")));
 
         // ②-a 类型形参 收到 值实参：Box<4> 而 T 是类型形参
         if (p.kind == TemplateParamKind::Type && a.isValue()) {
@@ -3817,25 +3859,73 @@ void SemanticAnalyzer::checkTemplateArguments(
                 "template argument {} for '{}' ('{}') must be {}, but '{}' is a type",
                 i + 1, tname, p.name, want, a.toString()), loc);
         }
-        // ③ NTTP 的值类型必须受支持（本项目支持 int / bool）
-        //    对照 clang：[temp.param]/6 允许整型（含 bool）/枚举/指针/左值引用/字面量类类型等
-        if (p.kind == TemplateParamKind::NonType
-            && p.nonType && !p.nonType->isInt() && !p.nonType->isBool()) {
+        // ③ NTTP 的形参类型必须受支持。对照 clang：[temp.param]/6 允许整型（含 bool）/
+        //    枚举/指针/左值引用/字面量类类型等 —— 本项目只取整型家族 + auto。
+        if (p.kind == TemplateParamKind::NonType && p.nonType
+            && !p.nonType->isInteger() && !p.nonType->isAuto()) {
             error(std::format(
                 "non-type template parameter '{}' of '{}' has unsupported type '{}' "
-                "(only 'int' and 'bool' are supported)",
+                "(only integral types and 'auto' are supported)",
                 p.name, tname, p.nonType->toString()), loc);
         }
-        // ③-b 值实参的【形态】须与形参类型相容（[temp.arg.nontype]/1：实参应是
-        //     形参类型的【转换后常量表达式】）。`Flag<1>`（bool 形参收 int 字面量）
-        //     与 `Buf<true>`（int 形参收 bool）都不合法。
-        //     本项目做"形态精确匹配"，不做隐式转换 —— 与实参推导的严格性一致。
-        if (p.kind == TemplateParamKind::NonType && a.isValue()
-            && a.valueType && p.nonType && !a.valueType->equals(p.nonType)) {
-            error(std::format(
-                "non-type template argument for '{}' ('{}') has type '{}', "
-                "but the parameter type is '{}'",
-                tname, p.name, a.valueType->toString(), p.nonType->toString()), loc);
+        // ③-b 值实参：整型转换总是允许，窄化只在【值可表示】时允许。
+        //     [temp.arg.nontype]/1：实参须是形参类型的【转换后常量表达式】
+        //     （converted constant expression，[expr.const]/10）—— 该定义直接引用
+        //     [dcl.init]/7 的窄化规则，但常量表达式豁免"值恰好装得下"的那部分。
+        //     ⇒ 判据是【能不能无损表示】，不是【形态是否字面相等】。
+        //
+        //     ★ 这里曾是一个【拒收合法程序】的 bug（BUGS.md B17）：旧版要求
+        //       `a.valueType->equals(p.nonType)`（形态精确相等），于是 clang 认的
+        //       `Flag<1>`（bool ← int 1）、`A<4L>`（int ← long 4）、`A<true>`
+        //       （int ← bool）三样全被拒。实测（clang++-18 -std=c++20）三者皆合法。
+        //
+        //     反例（clang 同样拒绝，文案 "cannot be narrowed to type 'B'"，本项目
+        //     用等价的可表示性判据）：`F<2>`（2 → bool）、`B<-1>`（→ unsigned）、
+        //     `D<300>`（→ char）。
+        if (p.kind == TemplateParamKind::NonType && a.isValue()) {
+            if (isAutoParam) {
+                // auto 形参：形态就是实参自己的形态（推导结果），无相容性可言。
+                // 形如 int64_t 的值一律只留在这一个槽位 —— 值本身已在 a.value 里。
+                if (!a.valueType) {
+                    error(std::format(
+                        "cannot deduce the type of non-type template parameter '{}' "
+                        "of '{}' from an untyped value argument", p.name, tname), loc);
+                }
+                std::cout << std::format(
+                    "  [sema:targ]   ⤷ auto 形参推导（[temp.param]/6）：'{}' := {} "
+                    "（类型由实参反推）\n",
+                    p.name, a.valueType->toString());
+            }
+            else if (!a.valueType) {
+                error(std::format(
+                    "non-type template argument for '{}' ('{}') has no type information",
+                    tname, p.name), loc);
+            }
+            else if (!a.valueType->isInteger()) {
+                error(std::format(
+                    "non-type template argument for '{}' ('{}') has type '{}', "
+                    "which is not an integral type (the parameter type is '{}')",
+                    tname, p.name, a.valueType->toString(), p.nonType->toString()), loc);
+            }
+            else if (p.nonType && !p.nonType->canRepresentValue(a.value)) {
+                // clang 原文：non-type template argument evaluates to N, which cannot be
+                // narrowed to type 'T' [-Wc++11-narrowing]（本项目按错误处理，不降级为警告）
+                error(std::format(
+                    "non-type template argument evaluates to {}, which cannot be "
+                    "narrowed to type '{}'",
+                    a.value, p.nonType->toString()), loc);
+            }
+            else if (!a.valueType->equals(p.nonType)) {
+                // ③-c 形态【归一】：把实参形态改写成形参类型。
+                //   ★ 这一步不是"修饰"而是语义必需 —— `Buf<4>` 与 `Buf<4L>`
+                //     在 `template<int N>` 下是【同一个】实例，归一后二者
+                //     的可读串/缓存键/mangling 全都一致，不会各建一份。
+                std::cout << std::format(
+                    "  [sema:targ]   ⤷ 值位整型转换（[temp.arg.nontype]/1）："
+                    "'{}'({}) ⇒ '{}'（转换后常量表达式）\n",
+                    a.value, a.valueType->toString(), p.nonType->toString());
+                a.valueType = p.nonType;
+            }
         }
 
         // ②-c 模板模板形参 [temp.arg.template]/2：实参模板的形参表要逐位对上内层表。
@@ -4076,31 +4166,17 @@ SemanticAnalyzer::selectClassTemplate(
 // │       ╚═══════════════════════════════════════════════╝
 // │ 输出  ClassType（已注册进 m_classTypes，布局/vtable/mangled 全齐，后续 findField、
 // │       new、成员调用都按普通类走 —— 模板痕迹到此抹平）。
-// │ 缓存键  模板名 + 实参可读串（"Box<int>" / "Buf<4>"），TemplateArg::toString 按 kind
-// │       分派 ⇒ Box<4> 与 Box<int> 天然不同键；时序：实例类【当场】走完
-// │       processClassDecl → registerFunction → analyzeFunctionBody。
+// │ 缓存键  模板名 + 实参【无损】串（"Box<int>" / "Buf<4>" / "K<4:long>"），
+// │       由 NameMangler::losslessArgumentsKey 统一构造（与实例名撞名守卫同源）
+// │       ⇒ Box<4> 与 Box<int> 天然不同键，K<4> 与 K<4L>（auto 形参）也分得开；
+// │       时序：实例类【当场】走完 processClassDecl → registerFunction → analyzeFunctionBody。
 // └────────────────────────────────────────────────────────────────────────────
 TypePtr SemanticAnalyzer::getOrInstantiateClass(
     TypePtr templateIdType, SourceLocation loc) {
 
-    // ── 缓存键：模板名 + 实参可读串，如 "Box<int>" / "Buf<4>" —— TemplateArg::toString
-    //    按 kind 分派（类型实参给类型名、值实参给数字），故 Box<4> 与 Box<int> 天然是
-    //    不同键，不会互相顶掉缓存。
-    std::string key = templateIdType->name + "<";
-    for (size_t i = 0; i < templateIdType->templateArgs.size(); i++) {
-        if (i > 0) key += ",";
-        key += templateIdType->templateArgs[i].toString();
-    }
-    key += ">";
-
-    auto cached = m_classInstanceCache.find(key);
-    if (cached != m_classInstanceCache.end()) {
-        std::cout << std::format(
-            "  [instantiate:class] cache hit: {} (skip re-instantiation)\n", key);
-        return cached->second;
-    }
-
     // ── 查主模板（类模板注册表 O(1)；重名取先注册者，emplace 不覆盖）──
+    // ★ 必须在算缓存键【之前】：键的构成要看形参表（auto 位的形态要进键），
+    //   理由见 NameMangler::losslessArgumentsKey。注册表查询是 O(1)，提前无代价。
     TemplateDeclPtr primary;
     if (auto it = m_classTemplates.find(templateIdType->name);
         it != m_classTemplates.end()) {
@@ -4108,6 +4184,21 @@ TypePtr SemanticAnalyzer::getOrInstantiateClass(
     }
     if (!primary) {
         error(std::format("'{}' is not a class template", templateIdType->name), loc);
+    }
+
+    // ── 缓存键：模板名 + 实参无损串，如 "Box<int>" / "Buf<4>" / "K<4:long>" ──
+    // ★ 键必须【单射】—— 这是本函数与 TemplateInstantiator 共用的同一份构造
+    //   （NameMangler::losslessArgumentsKey），不是就地拼一遍。
+    //   踩坑史：`template<auto V>` 下 `K<4>`(V=int) 与 `K<4L>`(V=long) 曾拼出同一个
+    //   "K<4>"，后者直接命中前者的缓存 —— 两个不同实例被静默合并。
+    const std::string key = NameMangler::losslessArgumentsKey(
+        templateIdType->name, templateIdType->templateArgs, primary->templateParams);
+
+    auto cached = m_classInstanceCache.find(key);
+    if (cached != m_classInstanceCache.end()) {
+        std::cout << std::format(
+            "  [instantiate:class] cache hit: {} (skip re-instantiation)\n", key);
+        return cached->second;
     }
 
     // ── 实参校验（[temp.arg]）：个数 + 每位形态（类型 vs 值）都要对上 ──

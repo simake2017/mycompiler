@@ -39,8 +39,25 @@ std::string NameMangler::encodeType(TypePtr type,
     switch (type->kind) {
         case TypeKind::Void:   return "v";
         case TypeKind::Bool:   return "b";
-        case TypeKind::Int:    return "i";
         case TypeKind::Double: return "d";
+        // ── 整型家族（Itanium ABI §5.1.2 <builtin-type>）──
+        // ★ 无符号版各有独立编码，最易漏：把 `unsigned int` 编成 "i" 会让
+        //   `Buf<4u>` 与 `Buf<4>` 生成同一个汇编符号（一个是 unsigned 形参、
+        //   一个是 int 形参，本就是不同模板，撞名即静默错链）。
+        // demo: char ⇒ c │ signed char ⇒ a │ unsigned char ⇒ h │ short ⇒ s
+        //       unsigned short ⇒ t │ int ⇒ i │ unsigned int ⇒ j │ long ⇒ l
+        //       unsigned long ⇒ m │ long long ⇒ x │ unsigned long long ⇒ y
+        case TypeKind::Char:  return "c";
+        case TypeKind::SChar: return "a";
+        case TypeKind::UChar: return "h";
+        case TypeKind::Short: return "s";
+        case TypeKind::UShort: return "t";
+        case TypeKind::Int:   return "i";
+        case TypeKind::UInt:  return "j";
+        case TypeKind::Long:  return "l";
+        case TypeKind::ULong: return "m";
+        case TypeKind::LongLong:  return "x";
+        case TypeKind::ULongLong: return "y";
         case TypeKind::Pointer:
             return "P" + encodeType(type->pointeeType, typeParams);
         case TypeKind::LValueReference:
@@ -82,6 +99,41 @@ std::string NameMangler::encodeType(TypePtr type,
 // 格式: _Z + 模板名长度 + 模板名 + I + 参数编码... + E
 // demo: MyPtr<int> ⇒ _Z5MyPtrIiE │ twice<int> ⇒ _Z5twiceIiE（类/函数模板实例共用）
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 单实参在「无损键 / 实例名清洗」里的渲染
+// ─────────────────────────────────────────────────────────────────────────────
+// 与 TemplateArg::toString() 的唯一区别：当该位形参声明为 `auto` 时补上实参带来的
+// 形态（`4:int` / `4:long` / `1:bool`）。见 losslessArgumentsKey 的说明。
+// ★ 键与实例名必须出自同一份渲染 —— 只改一处会让"缓存键分开了、汇编符号还撞着"，
+//   或者反过来。故两者共用本函数，是唯一来源。
+static std::string renderArgLossless(const TemplateArg& a, const TemplateParamPtr& p) {
+    std::string s = a.toString();
+    if (p && p->kind == TemplateParamKind::NonType && p->nonType && p->nonType->isAuto()
+        && a.isValue() && a.valueType) {
+        s += ":" + a.valueType->toString();
+    }
+    return s;
+}
+
+static const TemplateParamPtr& paramAt(const std::vector<TemplateParamPtr>& params, size_t i) {
+    static const TemplateParamPtr kNone;
+    return i < params.size() ? params[i] : kNone;
+}
+
+std::string NameMangler::losslessArgumentsKey(
+    const std::string& templateName,
+    const std::vector<TemplateArg>& args,
+    const std::vector<TemplateParamPtr>& params) {
+
+    std::string key = templateName + "<";
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i > 0) key += ",";
+        key += renderArgLossless(args[i], paramAt(params, i));
+    }
+    key += ">";
+    return key;
+}
+
 std::string NameMangler::mangleTemplateInstance(
     const std::string& templateName,
     const std::vector<TemplateArg>& args) {
@@ -236,6 +288,9 @@ std::string sanitizeSymbolChars(const std::string& raw) {
             case '&': out += 'R'; break;              // Reference Box<int&>  → Box_intR
             case '-': out += 'N'; break;              // Negative  Buf<-3>    → Buf_N3
             case '+': out += 'A'; break;              // 目前进不来（实参只认整数字面量）
+            // ★ auto 形参位的「值:形态」分隔符（K<4:long>）。':' 不是合法的汇编符号
+            //   字符，漏了这条会让 .s 里出现 `K_4:long:` 这样的行，as 直接报语句错。
+            case ':': out += 'C'; break;              // Colon     K<4:long>  → K_4Clong
             case ',': case '<': case '>':
                 out += '_'; break;
             default:  out += c;   break;
@@ -318,9 +373,13 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     // 非法字符；NTTP 值实参走同一套清洗（Buf<4> ⇒ Buf_4），天然区分不同实例。
     // ★ 这里只是「人读的实例名」，真正的符号编码在 NameMangler。
     //   清洗规则见 sanitizeSymbolChars（与成员模板实例共用同一份，避免两处漂移）。
+    // ★ 逐位渲染与缓存键同源（renderArgLossless）—— auto 位的形态在这里也必须出现，
+    //   否则 `K<4>`(int) 与 `K<4L>`(long) 会洗出同一个汇编符号前缀 `K_4`，
+    //   撞名守卫会当场拦下（比静默合并好，但正确做法是让两者各得其所）。
     std::string instanceName = templateDecl->classTemplate->name;
-    for (auto& arg : args) {
-        instanceName += "_" + sanitizeSymbolChars(arg.toString());
+    for (size_t i = 0; i < args.size(); i++) {
+        instanceName += "_" + sanitizeSymbolChars(
+            renderArgLossless(args[i], paramAt(params, i)));
     }
 
     // ── 2a. ★ 撞名守卫 ──
@@ -329,12 +388,10 @@ ClassDeclPtr TemplateInstantiator::instantiate(
     // 并说清谁跟谁撞了。无损键与 Sema 的 m_classInstanceCache 同构，键相同即"本来就
     // 是同一条实例"，放行（单元测试会重放同一条）。
     {
-        std::string lossless = templateDecl->classTemplate->name + "<";
-        for (size_t i = 0; i < args.size(); i++) {
-            if (i > 0) lossless += ",";
-            lossless += args[i].toString();
-        }
-        lossless += ">";
+        // ★ 键必须单射（见 NameMangler::losslessArgumentsKey）—— 此前这里就地拼
+        //   `toString()`，与 Sema 的缓存键是同一份逻辑写了两遍；现在两处共用一个原语。
+        const std::string lossless = NameMangler::losslessArgumentsKey(
+            templateDecl->classTemplate->name, args, params);
 
         auto [it, inserted] = m_instanceNameOwner.emplace(instanceName, lossless);
         if (!inserted && it->second != lossless) {
@@ -976,7 +1033,16 @@ ExprPtr TemplateInstantiator::cloneExpr(
     switch (expr->kind) {
         case NodeKind::IntLiteral: {
             auto& e = static_cast<IntLiteralExpr&>(*expr);
-            auto cloned = std::make_shared<IntLiteralExpr>(e.value);
+            // 形态（literalType）一并克隆 —— 它是类型信息，丢了会让 `4L` 在实例里
+            // 退回 int（模板体里 `long x = 4L;` 的语义随之改变）。
+            auto cloned = std::make_shared<IntLiteralExpr>(e.value, e.literalType);
+            cloned->location = e.location;
+            return cloned;
+        }
+
+        case NodeKind::CharLiteral: {
+            auto& e = static_cast<CharLiteralExpr&>(*expr);
+            auto cloned = std::make_shared<CharLiteralExpr>(e.value);
             cloned->location = e.location;
             return cloned;
         }

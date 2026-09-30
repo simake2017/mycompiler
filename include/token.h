@@ -34,7 +34,8 @@ enum class TokenType : uint8_t {
     Eof,
 
     // ── 字面量 ──
-    IntLiteral,       // 42
+    IntLiteral,       // 42 / 0x2A / 4L / 4u
+    CharLiteral,      // 'a'   —— text 存【翻译后】的字符（同 StringLiteral 的做法）
     StringLiteral,    // "hello"
 
     // ── 标识符 ──
@@ -43,6 +44,7 @@ enum class TokenType : uint8_t {
     // ── 关键字 ──
     KwAuto,           // auto
     KwBool,           // bool
+    KwChar,           // char        —— 整型家族（[basic.fundamental]/2）
     KwClass,          // class
     KwConst,          // const
     KwDecltype,       // decltype
@@ -55,6 +57,7 @@ enum class TokenType : uint8_t {
     KwFor,            // for
     KwIf,             // if
     KwInt,            // int
+    KwLong,           // long        —— long / long long
     KwNamespace,      // namespace
     KwNew,            // new
     KwNullptr,        // nullptr
@@ -63,6 +66,8 @@ enum class TokenType : uint8_t {
     KwPrivate,        // private
     KwProtected,      // protected
     KwReturn,         // return
+    KwShort,          // short
+    KwSigned,         // signed
     KwStatic,         // static —— 类内 static 成员函数（[class.static]/2）
     KwStruct,         // struct
     KwTemplate,       // template
@@ -70,6 +75,7 @@ enum class TokenType : uint8_t {
     KwTrue,           // true
     KwTypedef,        // typedef
     KwTypename,       // typename
+    KwUnsigned,       // unsigned
     KwUsing,          // using
     KwVirtual,        // virtual
     KwVoid,           // void
@@ -127,6 +133,7 @@ enum class TokenType : uint8_t {
 inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"auto",      TokenType::KwAuto},
     {"bool",      TokenType::KwBool},
+    {"char",      TokenType::KwChar},
     {"class",     TokenType::KwClass},
     {"const",     TokenType::KwConst},
     {"decltype",  TokenType::KwDecltype},
@@ -139,6 +146,7 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"for",       TokenType::KwFor},
     {"if",        TokenType::KwIf},
     {"int",       TokenType::KwInt},
+    {"long",      TokenType::KwLong},
     {"namespace", TokenType::KwNamespace},
     {"new",       TokenType::KwNew},
     {"nullptr",   TokenType::KwNullptr},
@@ -147,6 +155,8 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"private",   TokenType::KwPrivate},
     {"protected", TokenType::KwProtected},
     {"return",    TokenType::KwReturn},
+    {"short",     TokenType::KwShort},
+    {"signed",    TokenType::KwSigned},
     {"static",    TokenType::KwStatic},
     {"struct",    TokenType::KwStruct},
     {"template",  TokenType::KwTemplate},
@@ -154,6 +164,7 @@ inline const std::unordered_map<std::string_view, TokenType> kKeywordMap = {
     {"true",      TokenType::KwTrue},
     {"typedef",   TokenType::KwTypedef},
     {"typename",  TokenType::KwTypename},
+    {"unsigned",  TokenType::KwUnsigned},
     {"using",     TokenType::KwUsing},
     {"virtual",   TokenType::KwVirtual},
     {"void",      TokenType::KwVoid},
@@ -197,16 +208,25 @@ struct Token {
     bool is(TokenType t) const { return type == t; }
     bool isNot(TokenType t) const { return type != t; }
 
-    // 判断是否为类型关键字（int, double, bool, void, auto, const, decltype）
+    // 判断是否为类型关键字（内置标量 + const + decltype）
     // Parser 识别声明（"类型 + 名字"）时用：
-    //   Token{KwInt}   ⇒ true      Token{KwConst}    ⇒ true      Token{KwDecltype} ⇒ true
-    //   Token{KwClass} ⇒ false     （class 引入的是类定义而非内置类型名，故不在此列）
+    //   Token{KwInt}      ⇒ true   Token{KwConst}    ⇒ true   Token{KwDecltype} ⇒ true
+    //   Token{KwUnsigned} ⇒ true   Token{KwLong}     ⇒ true   Token{KwClass}    ⇒ false
+    //   （class 引入的是类定义而非内置类型名，故不在此列）
     // ★ KwConst 必须在此列：const 是【类型说明符】的开头（[dcl.type]：
     //   type-specifier-seq 可为 `const` + 类型），`const int x = 1;` 是一条正经的声明。
+    // ★ 整型家族的每个关键字都必须在列（[dcl.type.simple] 的 type-specifier）：
+    //   漏了 KwUnsigned ⇒ `unsigned x = 1;` 在【语句层】不可解析 —— 这正是
+    //   docs/learn/22 的 ⑤ 号 bug（isTypeKeyword 缺 KwConst）的同族复发点。
     //   ⚠ 顶层声明走的是"试探性 parseType + 回滚"、不看本函数 —— 同一语义在两条
     //   路径上判定，改这里（或改那条前瞻）时必须两边一起核对。
     bool isTypeKeyword() const {
         return type == TokenType::KwInt
+            || type == TokenType::KwChar
+            || type == TokenType::KwShort
+            || type == TokenType::KwLong
+            || type == TokenType::KwSigned
+            || type == TokenType::KwUnsigned
             || type == TokenType::KwDouble
             || type == TokenType::KwBool
             || type == TokenType::KwVoid

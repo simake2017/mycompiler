@@ -31,6 +31,7 @@ namespace minicc {
 // 只声明不定义 —— 引用参数足够。这份清单必须与 ast.h 的 NodeKind 保持一致。
 // 表达式
 struct IntLiteralExpr;
+struct CharLiteralExpr;
 struct BoolLiteralExpr;
 struct StringLiteralExpr;
 struct NullptrLiteralExpr;
@@ -71,6 +72,7 @@ public:
 
     // ── 表达式（14）──────────────────────────────────────────────────────
     virtual void visit(IntLiteralExpr&) {}
+    virtual void visit(CharLiteralExpr&) {}
     virtual void visit(BoolLiteralExpr&) {}
     virtual void visit(StringLiteralExpr&) {}
     virtual void visit(NullptrLiteralExpr&) {}

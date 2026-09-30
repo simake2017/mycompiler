@@ -178,6 +178,7 @@ private:
     void emitExpr(const ExprPtr& expr);
     // 整数字面量 → movq $v, %rax
     void visit(IntLiteralExpr& expr) override;
+    void visit(CharLiteralExpr& expr) override;
     // 布尔字面量 → movq $0/1, %rax
     void visit(BoolLiteralExpr& expr) override;
     // 字符串字面量 → leaq str_N(%rip), %rax（RIP 相对寻址）

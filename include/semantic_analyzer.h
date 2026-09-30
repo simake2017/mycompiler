@@ -529,8 +529,10 @@ private:
     // ── 表达式类型推导 ──
     // 总入口：按节点动态类型分派到 inferXxx，结果写回 expr->resolvedType
     TypePtr inferType(ExprPtr expr);
-    // 整数字面量 → int
+    // 整数字面量 → 形态（[lex.icon]/2 的表：42→int、4L→long、4u→unsigned int）
     TypePtr inferIntLiteral(IntLiteralExpr& expr);
+    // 字符字面量 → char（[lex.ccon]：字符字面量的类型是 char）
+    TypePtr inferCharLiteral(CharLiteralExpr& expr);
     // 布尔字面量 → bool
     TypePtr inferBoolLiteral(BoolLiteralExpr& expr);
     // 字符串字面量 → 指针类型（简化的 char* 表示）
