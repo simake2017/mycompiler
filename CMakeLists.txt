@@ -82,6 +82,7 @@ add_executable(unit_tests
     tests/unit/test_layout_lookup.cpp
     tests/unit/test_ttp_signature.cpp
     tests/unit/test_nttp_type_domain.cpp
+    tests/unit/test_declaratorless_decl.cpp
     src/preprocessor.cpp
     src/sfinae.cpp
     src/lexer.cpp

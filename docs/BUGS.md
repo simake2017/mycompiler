@@ -28,6 +28,7 @@
 | [B13](#b13-两个次基类各有一个同名字段时显示名塌陷且第二条偏移算成-0) | 两条记录压成同名 ⇒ 第二条偏移算成 0；歧义不报错 | 扁平化循环 + `computeClassLayout` | 中（非法程序被静默接受 + 布局打印错） | ✅ 已修 |
 | [B14](#b14-派生类同名字段的隐藏方向做反了) | `d.x` 静默指向 `A::x` 而非 `D::x`（隐藏方向反了） | `include/type.h` `findField` | **大**（合法程序静默取错成员） | ✅ 已修 |
 | [B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) | 祖辈带来的前缀被当成"本类直接基类" ⇒ 偏移算错 | 扁平化循环 + `computeClassLayout` | 中（同 B13 的性质，根因更本质） | ✅ 已修 |
+| [B16](#b16-无声明符的声明被拒收aint-int-报-parse-error) | 无声明符的声明（`A<int*,int**>;` / `int;`）被拒收 | `src/parser.cpp` `parseStatement` + `isDeclaratorlessDecl` | 小-中（拒收合法程序，且报错点离根因远） | ✅ 已修 |
 | [B17](#b17-值位实参要求形态精确相等拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
@@ -855,6 +856,142 @@ struct X : P, B { int tag; };
 —— 断言两条同名记录**偏移必须不同**、且各自的 `viaBase` 必须是**本类的直接基类**。
 **负向已验证**：把派发改回 `sourceClass` + 按名字查内部偏移（**忠实复刻旧代码**）⇒
 该单测报 `Expected: (hits[0]->offset) != (hits[1]->offset), actual: 24 vs 24` —— 正是旧 bug 的形态。
+
+---
+
+## B16. 无声明符的声明被拒收（`A<int*, int**>;` 报 Parse Error）
+
+**复现**
+
+```cpp
+template<class a, class b> struct A { };
+template<class T>          struct A<T, T*> { };   // 偏特化
+
+int add(int a, int b) { return a + b; }
+
+int main() {
+    A<int*, int**>;                 // ← 无声明符的声明
+    auto result = add(1, 2);
+    return 0;
+}
+```
+
+minicc：`[Parse Error] 12:7 at 'int': Unexpected token 'int' in expression`（rc=1）
+clang++-18：接受，只给 `warning: declaration does not declare anything [-Wmissing-declarations]`
+
+**四形态对照**（前两行是 bug，后两行是"本来就该拒"的对照组）
+
+| 语句 | clang++-18 `-std=c++20` | minicc | 备注 |
+|---|---|---|---|
+| `A<int*, int**>;` | ✅ 仅 warning | ❌ Parse Error，**报错点在实参中间** | 走前瞻分支 |
+| `int;` | ✅ 仅 warning | ❌ `Expected variable name` | 走类型关键字分支 |
+| `int*;` | ❌ `declaration of 'int *' has no name` | ❌ 同上 | ✅ 两边一致：`*` 后不能省名字 |
+| `S;`（S 为类名） | ✅ 仅 warning（**判为声明**） | ✅ **但判为表达式语句** | 分类不同、当前都无副作用 |
+
+**性质**：**错误拒绝合法程序** —— 与 [B9](#b9-struct-的默认继承级别被当成-private-处理) 同类。
+
+**根因**：[dcl.dcl]/1 的 simple-declaration 里 `init-declarator-list` 是**可选**的 ——
+`decl-specifier-seq ;` 本身合法，语义是"什么都不声明"（clang 的 `-Wmissing-declarations`
+正是为它准备的）。minicc 的两条声明路径都**默认"类型后面必有名字"**：
+
+1. **类型关键字开头**：`src/parser.cpp:1928` → `parseVarDeclStmt` →
+   `src/parser.cpp:2025` 的 `expect(Identifier, "Expected variable name")` 撞死在 `;` 上。
+2. **标识符开头**：`src/parser.cpp:1982` 的前瞻跑完"跳类型名 + `<...>` 深度配对 + `*`/`&`"
+   之后停在 `;`，`check(Identifier)` 不成立 ⇒ 回滚到 `src/parser.cpp:1990` 走表达式分支
+   ⇒ `parseExprOrAssignStmt` 把 `A` 当标识符表达式，再撞死在第 2 个实参的 `int` 上。
+
+★ 第 2 条的**诊断质量**尤其差：报错位置指向实参中间的 `int`，用户完全看不出
+真正的问题是"这条声明没有声明符"。根因在语句层，症状在表达式层 —— 中间隔着一次回滚。
+
+**为何不影响偏特化结论**（本轮排查的起点是"`A<int*, int**>` 走哪个裁决"）：
+本 bug 只卡在**无声明符**这一种写法上。改成 `A<int*, int**> x;` 后链路完全正常，
+`selectClassTemplate` 三路走 ②（`A<T, T*>`，合一推出 `T := int*`），与 clang 的
+`static_assert(A<int*,int**>::tag == 1)` 一致 —— **偏特化匹配本身是好的，卡的是 Parser。**
+
+**影响面**：小（纯语法缺口，不会产出错误代码）。但两处：一是合法程序被拒，
+二是**报错点离根因太远**，属于"诊断指向派生现象而非根因"的老毛病。
+
+**修法**：新增 `EmptyStmt` 节点（`NodeKind::Empty`，对应 clang 的 `NullStmt`），
+把「空语句 `;`」与「无声明符的声明」收在同一个节点上 —— 两者语义同为"不做任何事"。
+空语句是**纯叶子**（只有位置、无子节点、无类型），于是 Sema 根本无从 `resolveType`，
+"不实例化任何模板"由**结构**保证，而不是靠约定。
+
+**修复** ✅
+
+| 改动点 | 文件 | 内容 |
+|---|---|---|
+| 新节点 | `include/ast.h` | `NodeKind::Empty` + `struct EmptyStmt : Statement` |
+| 访问者 | `include/ast_visitor.h` | `visit(EmptyStmt&)`（语句 8 → 9，总节点 32 → 33） |
+| 路径 ① | `src/parser.cpp` `parseStatement` 开头 | 裸 `;` ⇒ `EmptyStmt`（[stmt]/1） |
+| 路径 ② | `src/parser.cpp` 类型关键字分支 | 类型后跟 `;` 且**声明符为空** ⇒ `EmptyStmt` |
+| 路径 ③ | `src/parser.cpp` 标识符前瞻分支 | 前瞻吃到了**类型 id 语法**且停在 `;` ⇒ 回滚 `parseType` ⇒ `EmptyStmt` |
+| 判据 | `src/parser.cpp` `isDeclaratorlessDecl` | 剥掉最外层 `const` 后仍是指针/引用 ⇒ 声明符非空 ⇒ **不放行** |
+
+★ 判据 `isDeclaratorlessDecl` 是这条修复的**难点所在**：minicc 的 `parseType`
+把 ptr-operator 一并吃进类型（`int*` ⇒ `Pointer(Int)`），所以"声明符是否为空的
+要在**类型上反推** —— 剥掉最外层 `const`（它属 decl-specifier）后若仍是
+指针/引用，说明吃进了 ptr-operator。逐例与 clang 核对：
+
+| 写法 | 类型 | 剥 const 后 | clang | minicc 修复后 |
+|---|---|---|---|---|
+| `int;` | `Int` | `Int` | ✅ 仅 warning | ✅ |
+| `const int;` | `Const(Int)` | `Int` | ✅ 仅 warning | ✅ |
+| `unsigned int;` | `UInt` | `UInt` | ✅ 仅 warning | ✅ |
+| `A<int*,int**>;` | `Class("A")` | 同左 | ✅ 仅 warning | ✅ ★ 正主 |
+| `Box<int>::type;` | 成员类型 | 同左 | ✅ 仅 warning | ✅ |
+| `int*;` | `Pointer(Int)` | `Pointer` | ❌ `no name` | ❌ （不回归） |
+| `int* const;` | `Const(Pointer(Int))` | `Pointer` | ❌ `expected unqualified-id` | ❌ |
+| `int&;` | `LValueRef` | `LValueRef` | ❌ | ❌ |
+
+★ **路径 ③ 的判据必须带 `sawTypeIdSyntax`**：`<...>` 与 `::` 在表达式里不可能出现，
+故一旦见到就坐实了"这是类型"。裸 `S;` **不走这条路** —— 它也可能是【同名对象】的
+表达式语句，Token 前瞻分不出来，需要查符号表（留待 Sema）。这与 `[stmt.ambig]` 是
+同族问题：**能当声明就当声明**，而"能不能当"要靠名字查找。
+
+**下游三处必须同步补**（漏一处就是静默丢语句或运行期崩溃）：
+
+| 位置 | 漏了会怎样 |
+|---|---|
+| `src/template_instantiation.cpp` `cloneStmt` | 落到 `default: return nullptr` ⇒ 实例化方法体里混进空指针节点 |
+| `src/main.cpp` `AstDumper::visit` | `--dump-ast` 对该节点无输出 |
+| `tests/unit/test_ast_visitor.cpp` `auditStmt` | 该测试的 `default:` 分支报"未覆盖的语句 kind" |
+
+**回归用例**：
+
+- `tests/unit/test_declaratorless_decl.cpp`（`DeclaratorlessDecl.*` 8 例）——
+  含三条**不变量**断言，而非具体实现细节：
+  ① `DoesNotInstantiateAnyTemplate`：裸声明**零实例化**（日志里既无 `[spec:select]`
+     也无 `A_intP_intPP`），且同文件的变量声明版**必须实例化**作对照；
+  ② `EmptyStmtSurvivesInstantiationClone`：实例化方法体里**不得出现空指针节点**、
+     空语句**条数守恒**；
+  ③ `PointerDeclaratorIsStillRejected`：三条 ptr-operator 形态**必须继续报错**。
+- `tests/lang/test_basics_02_declaratorless.cpp`（集成级）——
+  偏特化体里埋 `typename T::nope boom;` 作**实例化探针**（★ 必须是**依赖名**：
+  非依赖名在两阶段查找的第一阶段就被查了，clang 定义期即报错，探针失效）。
+  裸语句 ⇒ 两边都编过；改成变量声明 ⇒ 两边都报错（clang: `type 'int *' cannot
+  be used prior to '::'`；minicc: `no type named 'nope' in 'int*'`）。
+
+**负向验证**（四条改动逐个突变，全部变红）：
+
+| 突变 | 单测 | 集成 |
+|---|---|---|
+| M1 拆掉 `!isPointer() && !isReference()` 守卫 | `PointerDeclaratorIsStillRejected` ✗ | — |
+| M2 拆掉类型关键字分支的 `;` 放行 | `TypeKeywordWithout…` ✗ | 编译失败 ✗ |
+| M3 拆掉标识符前瞻分支 | `TemplateId…` / `QualifiedTypeId…` / `DoesNotInstantiate…` ✗ | 编译失败 ✗ |
+| M4 拆掉 `cloneStmt` 的 `case NodeKind::Empty` | `EmptyStmtSurvivesInstantiationClone` ✗ | 编译失败 ✗ |
+
+**残留（本轮未覆盖，与本 bug 同族）**
+
+- `S;`（类名 / 任何裸标识符开头的无声明符声明）：minicc 仍按**表达式语句**处理，
+  clang 按**声明**。当前两者都无副作用，但分类不同 —— 要正确定性需要 Parser
+  有符号表，或引入"声明/表达式待定"的中间节点。与 `[stmt.ambig]` 的完整裁决
+  （`a < b > c;`）是同一件事，见 docs/ROADMAP 主线 C。
+- `T;`（模板形参作为裸类型名）同理：定义期无法判定 `T` 是类型还是值。
+
+**影响面**：小-中（原先拒收合法程序；修复后 110 个既有集成用例**零漂移**，
+仅新增用例使基线数量 110 → 111、单测 249 → 257）。
+
+**状态**：✅ 已修
 
 ---
 

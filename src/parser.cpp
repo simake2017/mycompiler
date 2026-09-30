@@ -1927,16 +1927,48 @@ std::vector<Parameter> Parser::parseParameterList() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 无声明符的声明判据 —— [dcl.dcl]/1，bug B16
+// ─────────────────────────────────────────────────────────────────────────────
+// simple-declaration := decl-specifier-seq init-declarator-list? ';'
+//                                     ↑ 可选！故 `decl-specifier-seq ';'` 合法，
+//   语义是"什么都不声明"。clang 对此只给 `-Wmissing-declarations` 警告。
+//
+// ★ 难点：minicc 的 parseType 把 ptr-operator 也吃进类型（`int*` ⇒ Pointer(Int)），
+//   所以"声明符是否为空"要在【类型上反推】：
+//     剥掉最外层 const 后若仍是指针/引用 ⇒ 吃进了 ptr-operator ⇒ 声明符非空 ⇒ 非法。
+//   （const 本身属 decl-specifier，`const int;` 合法，故要先剥它。）
+//   逐例核对 clang++-18 -std=c++20：
+//     `int;`          → Int                  ⇒ 合法 ✅（clang 仅 warning）
+//     `const int;`    → Const(Int)  剥后 Int ⇒ 合法 ✅
+//     `unsigned int;` → UInt                 ⇒ 合法 ✅
+//     `A<int*,int**>;`→ Class("A")           ⇒ 合法 ✅ ★ B16 的正主
+//     `int*;`         → Pointer(Int)         ⇒ 非法 ❌（clang: expected unqualified-id）
+//     `int* const;`   → Const(Pointer(Int))  ⇒ 非法 ❌（剥后是 Pointer）
+//     `A<int*>&;`     → LValueRef(...)       ⇒ 非法 ❌
+//   非法的一律交回 parseVarDeclStmt 报"缺变量名"，与修复前行为一致（不回归）。
+static bool isDeclaratorlessDecl(const TypePtr& type) {
+    TypePtr t = type;
+    while (t && t->isConst()) t = t->innerType;   // const 属 decl-specifier，不是 ptr-operator
+    return t && !t->isPointer() && !t->isReference();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 语句解析（对应 clang：ParseStatement，同样按首 Token 分派）
 // ─────────────────────────────────────────────────────────────────────────────
 // 文法：stmt := compound-stmt | if-stmt | while-stmt | return-stmt
-//             | delete-stmt | var-decl-stmt | expr-or-assign-stmt
+//             | delete-stmt | empty-stmt | var-decl-stmt | expr-or-assign-stmt
 //
 // 分派表：
 //   '{' / 'if' / 'while' / 'return' / 'delete'  → 各自的解析函数
+//   ';'                                          → EmptyStmt（空语句，[stmt]/1）
 //   类型关键字（int/double/bool/void/auto）      → parseType → parseVarDeclStmt
+//                                                  （类型后直接是 ';' ⇒ EmptyStmt，见下）
 //   标识符（含 typename 前缀）+ 前瞻指向声明符    → 类名型变量声明（试探法，见下）
 //   其余                                         → parseExprOrAssignStmt
+//
+// ★ 无声明符的声明（[dcl.dcl]/1，bug B16）：`decl-specifier-seq ';'` 里
+//   init-declarator-list 是【可选】的，故 `int;` / `A<int*,int**>;` 合法，只是
+//   "什么都不声明"。两条声明路径都得放行 —— 见下方各自的分支。
 // demo: [int][x][=][42][;] ⇒ VarDeclStmt{ name="x", type=int, init=IntLiteral(42) }
 StmtPtr Parser::parseStatement() {
     if (check(TokenType::LBrace))    return parseBlockStmt();
@@ -1945,9 +1977,25 @@ StmtPtr Parser::parseStatement() {
     if (check(TokenType::KwReturn))  return parseReturnStmt();
     if (check(TokenType::KwDelete))  return parseDeleteStmt();
 
+    // ── 空语句 `;`（[stmt]/1 的 null statement）──
+    // `while (1) ;` / `;;` 里的裸分号。只消费掉，不产生任何动作。
+    // 对照 clang：ParseStatement 的 tok::semi 分支 → ActOnNullStmt。
+    if (check(TokenType::Semicolon)) {
+        advance();
+        return std::make_shared<EmptyStmt>();
+    }
+
     // 变量声明：以类型关键字开头
     if (current().isTypeKeyword()) {
         TypePtr type = parseType();
+        // ★ B16：无声明符的声明 `int;` / `const int;`（[dcl.dcl]/1）。
+        //   类型之后直接是 ';' ⇒ init-declarator-list 为空 ⇒ 合法，什么都不声明。
+        //   但 `int*;` / `int* const;` 必须继续报错（ptr-operator 必须有 declarator-id，
+        //   clang 报 `expected unqualified-id`）—— 判据见 isDeclaratorlessDecl。
+        if (check(TokenType::Semicolon) && isDeclaratorlessDecl(type)) {
+            advance();
+            return std::make_shared<EmptyStmt>();
+        }
         return parseVarDeclStmt(type);
     }
 
@@ -1959,6 +2007,11 @@ StmtPtr Parser::parseStatement() {
     if (check(TokenType::KwTypename) || check(TokenType::Identifier)) {
         // 向前看：如果是 标识符 标识符 ; 或 标识符 标识符 = → 变量声明
         size_t savedPos = m_pos;
+        // ★ B16：本轮回溯只看"类型 id 语法"吃了没有（`<...>` 模板实参表 / `::` 限定名）。
+        //   这两种构造在【表达式】里不可能出现，故一旦见到就坐实了"这是类型"。
+        //   用途见下方"无声明符的声明"分支：裸 `S;`（无后缀）不能靠 Token 前瞻定性
+        //   —— 它也可能是【同名对象】的表达式语句，得查符号表才知道（留待 Sema）。
+        bool sawTypeIdSyntax = false;
         // `typename T::type v;`：typename 只是消歧前缀，跳过它再看名字
         if (check(TokenType::KwTypename)) advance();
         advance();  // 跳过首个标识符（类型名本身）—— 纯前瞻，只要推进游标
@@ -1970,6 +2023,7 @@ StmtPtr Parser::parseStatement() {
         // 对照 clang：isDeclarationSpecifier → TryAnnotateTypeToken 会把
         // 模板 id 注解为类型 Token，教学版用"跳过 + 回滚"的试探法等价实现。
         if (check(TokenType::Less)) {
+            sawTypeIdSyntax = true;
             int depth = 1;
             advance();  // 消费 '<'
             while (!isAtEnd() && depth > 0) {
@@ -1985,6 +2039,7 @@ StmtPtr Parser::parseStatement() {
         //   `Cls<...>::member` 整体注解成一个类型 Token（ParseCXXScopeSpecifier
         //   之后的 nested-name-specifier 处理），教学版同样用"跳过后回滚"近似。
         while (check(TokenType::ColonColon)) {
+            sawTypeIdSyntax = true;
             advance();  // 消费 '::'
             if (!check(TokenType::Identifier)) break;
             advance();  // 成员名
@@ -2005,6 +2060,24 @@ StmtPtr Parser::parseStatement() {
             m_pos = savedPos;
             TypePtr type = parseType();
             return parseVarDeclStmt(type);
+        }
+
+        // ★ B16：无声明符的声明 —— `A<int*, int**>;` / `Box<int>::type;`
+        //   前瞻整段类型 id 之后停在 ';' 上。修复前这里一路回滚走表达式分支，
+        //   把 `A` 当标识符表达式、撞死在第 2 个实参的 `int` 上 ——
+        //   报错位置指向实参中间，离根因（少了声明符）很远。
+        //   只有 sawTypeIdSyntax 为真才认：`<...>` / `::` 在表达式里不可能出现，
+        //   故可无歧义地判为声明。裸 `S;`（类名无后缀）不走这条 ——
+        //   它也可能是同名对象的表达式语句，Token 前瞻分不出来，得查符号表。
+        if (sawTypeIdSyntax && check(TokenType::Semicolon)) {
+            m_pos = savedPos;
+            TypePtr type = parseType();
+            if (check(TokenType::Semicolon) && isDeclaratorlessDecl(type)) {
+                advance();
+                return std::make_shared<EmptyStmt>();
+            }
+            // 形态不符（如 `A<int*>&;`）⇒ 回滚保持旧行为，仍按表达式语句报错
+            m_pos = savedPos;
         }
 
         // 不是变量声明，恢复位置，当作表达式语句

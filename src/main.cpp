@@ -328,6 +328,12 @@ public:
         dumpExpr(s.pointerExpr, childPrefix(), true);
     }
 
+    // 空语句：`;` 与无声明符的声明（`A<int*,int**>;`）共用。
+    // 无子节点、无类型，故是纯叶子 —— 对应 clang 的 NullStmt。
+    void visit(EmptyStmt&) override {
+        printNode(m_prefix, m_isLast, "EmptyStmt");
+    }
+
     // ── 顶层声明（10）────────────────────────────────────────────────────
     // 普通函数与构造/析构函数共用一份头部渲染：三者都打成 "FunctionDecl: ..."
     //（构造/析构是 FunctionDecl 的派生类，故共用同一渲染分支）。

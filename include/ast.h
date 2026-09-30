@@ -59,7 +59,7 @@ enum class NodeKind : uint8_t {
     IntLiteral, CharLiteral, BoolLiteral, StringLiteral, NullptrLiteral,
     Var, Binary, Unary, Call, Member, New, This, Delete, DynamicCast, Index,
     // 语句
-    ExprStmt, VarDecl, Return, If, While, Block, Assign, DeleteStmt,
+    ExprStmt, VarDecl, Return, If, While, Block, Assign, DeleteStmt, Empty,
     // 声明
     Function, Class, Template, GlobalVar, Enum, Namespace, TypeAlias,
     Constructor, Destructor, DeductionGuide,
@@ -361,6 +361,24 @@ struct DeleteExpr : Expression {
 //   （★ C++ 里赋值本身是表达式，本项目简化成语句。）
 struct Statement : ASTNode {
     explicit Statement(NodeKind k) : ASTNode(k) {}
+};
+
+// ─── 空语句 ───────────────────────────────────────────────────────────────────
+// 对应 [stmt]/1 的 null statement（`;`），clang: NullStmt。
+// 两个来源，语义同为"不做任何事"，故共用同一节点：
+//   ① 裸分号            `;`                     —— [stmt]/1
+//   ② 无声明符的声明    `A<int*, int**>;` / `int;` —— [dcl.dcl]/1 的 simple-declaration
+//      里 init-declarator-list 是【可选】的，故 `decl-specifier-seq ';'` 合法，
+//      只是"什么都不声明"（clang 的 `-Wmissing-declarations` 正为它而设）。
+// ★ 二者都【不实例化任何模板】—— clang 对 `A<int*,int**>;` 不会实例化偏特化体
+//   （用 `typename T::nope boom;` 探针验证过：裸语句不报错，写成变量声明才报）。
+//   本节点不携带类型，Sema 因此根本不会去 resolveType ⇒ 天然对齐 clang。
+// demo: `;` ⇒ EmptyStmt；`A<int*,int**>;` ⇒ EmptyStmt
+// 对照 clang：NullStmt —— 同样只有位置、没有子节点。
+struct EmptyStmt : Statement {
+    explicit EmptyStmt() : Statement(NodeKind::Empty) {}
+
+    void accept(AstVisitor& v) override { v.visit(*this); }
 };
 
 // ─── 表达式语句 ───────────────────────────────────────────────────────────────

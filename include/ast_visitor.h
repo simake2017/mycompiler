@@ -9,7 +9,7 @@
 //   重载决议在【编译期】完成 —— *this 的静态类型就是节点自己，故绑定精确重载、无需 cast。
 //
 // 【为什么本文件只有前置声明】visit 参数是【引用】，只要求类型被声明、不要求被定义，故只
-//   前置声明 32 个节点即可把 AstVisitor 定义完整，依赖单向无环：
+//   前置声明 33 个节点即可把 AstVisitor 定义完整，依赖单向无环：
 //     ast.h ──include──▶ ast_visitor.h（节点实现 accept 需要访问者完整）｜反向 ──✗──▶ ast.h
 //
 // ★ 陷阱：accept 的【函数体】必须写在类内 inline —— 类里声明、类外定义的虚函数是该类的
@@ -54,6 +54,7 @@ struct IfStmt;
 struct WhileStmt;
 struct BlockStmt;
 struct DeleteStmt;
+struct EmptyStmt;
 // 声明
 struct FunctionDecl;
 struct ConstructorDecl;
@@ -87,7 +88,7 @@ public:
     virtual void visit(ThisExpr&) {}
     virtual void visit(DeleteExpr&) {}
 
-    // ── 语句（8）────────────────────────────────────────────────────────
+    // ── 语句（9）────────────────────────────────────────────────────────
     virtual void visit(ExprStmt&) {}
     virtual void visit(VarDeclStmt&) {}
     virtual void visit(AssignStmt&) {}
@@ -96,6 +97,7 @@ public:
     virtual void visit(WhileStmt&) {}
     virtual void visit(BlockStmt&) {}
     virtual void visit(DeleteStmt&) {}
+    virtual void visit(EmptyStmt&) {}
 
     // ── 声明（10）───────────────────────────────────────────────────────
     virtual void visit(FunctionDecl&) {}

@@ -149,6 +149,12 @@ int auditStmt(const StmtPtr& s) {
             n += auditExpr(x->pointerExpr);
             break;
         }
+        case NodeKind::Empty: {
+            // 空语句是叶子（`;` / 无声明符的声明），无子节点可下钻。
+            auto x = std::dynamic_pointer_cast<EmptyStmt>(s);
+            EXPECT_NE(x, nullptr);
+            break;
+        }
         default:
             ADD_FAILURE() << "未覆盖的语句 kind";
             break;

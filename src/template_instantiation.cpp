@@ -1314,6 +1314,15 @@ StmtPtr TemplateInstantiator::cloneStmt(
         //   释放内存的语句实例化后凭空消失（不报错、内存泄漏）。
         // demo: "~Box() { delete data; }" 配 {T := int} ⇒ "~Box_int() { delete data; }"
         //       （data 是 int*，codegen 发 callq 析构 + callq free）
+        // ── 空语句 ──
+        // 无子节点、无类型 ⇒ 替换无事可做，但【必须显式列一条】：落到 default
+        // 会返回 nullptr，函数体里带 `;` 的方法被实例化时就会静默丢语句。
+        case NodeKind::Empty: {
+            auto cloned = std::make_shared<EmptyStmt>();
+            cloned->location = stmt->location;
+            return cloned;
+        }
+
         case NodeKind::DeleteStmt: {
             auto& s = static_cast<DeleteStmt&>(*stmt);
             auto cloned = std::make_shared<DeleteStmt>(
