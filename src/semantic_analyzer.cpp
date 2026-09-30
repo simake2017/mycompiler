@@ -984,7 +984,7 @@ TypePtr SemanticAnalyzer::resolveType(TypePtr type) {
                     }
                 }
                 // 模板 id 尚未实例化 ⇒ 当场实例化，拿到具体的类类型
-                return getOrInstantiateClass(tid, SourceLocation{});
+                return getOrInstantiateClass(tid, SourceLocation{}); //murongding** 只有模板类型的 在这里进行实例化
             }
         } else if (m_classTemplates.count(type->name) ||
                    m_aliasTemplates.count(type->name)) {

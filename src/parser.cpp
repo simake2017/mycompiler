@@ -1450,7 +1450,7 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
             expect(TokenType::Greater,
                    "Expected '>' to close member template parameter list");
 
-            auto method = parseMethodDecl(decl->name, access);
+            auto method = parseMethodDecl(decl->name, access); // wangyang 这里主要都是内部模板方法了，
             method->isVirtual = isVirtual;
             method->isStatic  = isStatic;
             memTmpl->funcTemplate = method;   // templateName() 由此取到函数名

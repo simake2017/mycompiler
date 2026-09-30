@@ -22,7 +22,7 @@ namespace minicc {
 std::string TemplateArg::toString() const {
     if (kind == TemplateArgKind::Type)     return type ? type->toString() : "?";
     if (kind == TemplateArgKind::Template) return templateName;   // 模板名本身就是可读形态
-    return std::to_string(value);
+    return std::to_string(value); // 对于none type类型，这里直接透传了
 }
 
 // 逐位相等（声明与说明见 include/type.h）——

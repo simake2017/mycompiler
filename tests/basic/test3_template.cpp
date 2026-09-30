@@ -145,7 +145,23 @@ int add(int a, int b) {
     return a + b;
 }
 
+// template<class a, class b = void> // 这种就是 模板有默认值
+// struct A {
+// };
+
+template<class a, class b> // 这里说明了 模板需要有2个类型，没有默认值
+struct A {
+};
+
+template<class T>
+struct A<T, T*> {
+};
+
 int main() {
+
+    // A<int>;
+
     auto result = add(1, 2);
     return 0;
 }
+
