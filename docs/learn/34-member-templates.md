@@ -214,6 +214,48 @@ for (auto& mt : templateDecl->classTemplate->memberTemplates) {   // ★ 本次�
 注意 `cloneMethod` 是**深拷贝**：这一步必须是"复制 + 替换"，不能就地改写蓝图节点
 （否则第二个实例会串到第一个的绑定上 —— 既有测试看不出，因为那时只有一份实例）。
 
+### 3.4 static / virtual 的识别位置：写在前还是在后（BUGS.md B19）
+
+`template-head` 必须在声明最前（[temp.pre]），故说明符只能写在**形参表之后**：
+
+```cpp
+template <class U> static U f(U x);   // ✅ 合法
+static template <class U> U f(U x);   // ❌ clang：expected member name or ';' after declaration specifiers
+```
+
+而类体循环里那两处 `match(KwStatic)` / `check(KwVirtual)` 位于成员模板分支**之前**，
+只能认到**非法**的那种顺序 —— 标准写法反而一路落进 `parseMethodDecl`，
+报 `[Parse Error] … at 'static': Expected type name`（**拒收合法程序**）。
+修法：在吃完形参表之后、`parseMethodDecl` 之前**再认一次**，且两种顺序**处置相反**：
+
+| 说明符 | 标准 | 处置 | 文案 |
+|---|---|---|---|
+| `static` | 合法（[class.static]/2：无隐式 this） | 收下，`method->isStatic = true` | — |
+| `virtual` | **非法**（[temp.mem]/2 末句：member function templates shall not be virtual） | 当场 `error` | 与 clang 逐字同：`'virtual' cannot be specified on member function templates` |
+
+★ 为什么 virtual 必须拒：虚函数要求"每个动态类型在 vtable 里占一条固定条目"，
+而模板实例是**按需产生**的 —— 声明处根本不知道要有几条、更不知道 `U` 有哪些取值。
+
+★ 本项目里 `static` 的可观测差别很窄：带对象调用 `o.f(3)` 与普通成员模板走同一条路
+（两边一致地按成员调用传参），真正体现"无 this"的是**不带对象**的 `O::f(3)` ——
+那是另一种未实现的语法（见 §5 边界表）。
+
+### 3.5 这条分支只做成员【函数】模板
+
+进入成员模板分支的条件仅仅是"行首是 `template`"，吃完形参表后**不再前瞻**，
+直接 `parseMethodDecl`（`type IDENT '(' …`）。故类体里其余几种 `template<...>` 形态
+一律在此撞死：
+
+| 写法 | minicc | clang |
+|---|---|---|
+| `template<class U> struct I{ U v; };` 成员类模板 | `[Parse Error] … at 'struct': Expected type name` | ✅ |
+| `template<class U> using X = U;` 成员别名模板 | `… at 'using': Expected type name` | ✅ |
+| `template<class U> U gv;` 静态数据成员模板 | `… : Expected type name` | ✅ |
+
+是**响亮地拒收**而非静默算错（本项目取舍），补它们要连带做嵌套类模板实例化、
+类外定义等一串 —— 对照 clang 的做法（`ParseTemplateDeclarationOrSpecialization`
+先解析完整声明再由结果反推 Decl 种类）见 §6。
+
 ---
 
 ## 4. 可复现实验
@@ -267,7 +309,8 @@ clang++-18 -std=c++20 tests/tmpl/test_tmpl_69_member_template_in_class_template.
 | 成员模板偏特化 | `template <class T> T S::id<T*>(T*)` | 函数模板偏特化本身未实现 |
 | 变参成员模板 / 参数包 | `template <class... Ts>` | 参数包未实现 |
 | 模板模板参数的成员模板 | 上述两者叠加 | docs/learn/33 §5 已记 |
-| 静态成员模板的 this 省略 | `static` + 成员模板叠加 | 未验证 |
+| 静态成员模板的"不带对象调用" `O::f(3)` | 这才是"省略 this"真正显形的地方 | 限定名调用语法未实现（声明本身已支持，`o.f(3)` 可用 —— 见 §3.4 / B19） |
+| 成员**类**模板 / 成员别名模板 / 静态数据成员模板 | `template<class U> struct I{…}` 等 | 本分支只做成员**函数**模板，其余落进 `parseMethodDecl` 报 `Expected type name`（§3.5） |
 
 ★ 这张表原本漏了一行：**"成员模板住在类模板里"**（§1.5）—— 它不是"没做"，
 而是"以为做了、其实是坏的"（[B18](../BUGS.md)），故当时没被列进来。

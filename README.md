@@ -409,6 +409,8 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_67_error_nttp_char_narrowing.cpp` | 错误：值实参窄化到 `char` | `D<300>`：300 ∉ [-128,127]。诊断必须点名**形参声明的那一个**类型（`char` ≠ `signed char` ≠ `unsigned char`） |
 | `test_tmpl_68_nttp_auto_param.cpp` | **`template<auto V>`** 类型由实参反推 | [temp.param]/6 的 deduced non-type parameter：`K<4>`(int) 与 `K<4L>`(long) 是**两个实例**。★ 顺带修掉一个**静默撞键**：实例名/缓存键曾用 `TemplateArg::toString()`（对两者都产 `"4"`）⇒ 第二个静默复用第一个。现走 `losslessArgumentsKey`，形态只在 `auto` 位写入 |
 | `test_tmpl_69_member_template_in_class_template.cpp` | **类模板里的成员模板**（★ 回归 [B18](docs/BUGS.md)） | 两层模板形参、**绑定时机不同**：外层 `T` 由类实例化绑定（`Box<int>` ⇒ `int`），内层 `U` 由调用点推导绑定（`b.pick('a')` ⇒ `char`）。故"类实例化"必须把成员模板**复制一份、只替换外层形参、保留内层形参**挂到实例类名下。三种错法各有症状：忘了搬 ⇒ `No member 'pick' in class 'Box_int'`；就地改蓝图 ⇒ 第二个实例串到第一个的绑定（静默算错）；把内层也替换掉 ⇒ 调用点无可推导 |
+| `test_tmpl_70_member_template_static.cpp` | 成员模板的 `static` 写在**形参表之后**（★ 回归 [B19](docs/BUGS.md)） | [temp.pre]：`template-head` 必须在声明最前 ⇒ 说明符只能写在后面（`template<class U> static U f(U)`）。此前识别写在成员模板分支**之前**，只认得到"`static` 在 `template` 前"的**非法**顺序 ⇒ 标准写法反被拒（`Expected type name`），判据与语言正好相反。同批：类模板 × 静态成员模板的交叉点 |
+| `test_tmpl_71_error_virtual_member_template.cpp` | 错误：成员函数模板不能是 `virtual` | [temp.mem]/2 末句：member function templates shall not be virtual —— 虚表要求每个动态类型一条固定条目，而模板实例是**按需产生**的，声明处根本不知道要有几条。文案与 clang 逐字相同 |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -451,6 +453,7 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 35. test_tmpl_56_member_templates.cpp ← ★ 成员模板：规则与函数模板逐字相同
 36. test_tmpl_57_ttp_signature_match.cpp ← ★ 模板位的签名匹配：位数 + 逐位 kind（口径来自 clang 探针）
 37. test_tmpl_69_member_template_in_class_template.cpp ← ★ 两层形参：外层随类实例化、内层随调用推导
+38. test_tmpl_70_member_template_static.cpp ← ★ 说明符写在形参表【之后】：位置即语义（B19）
 ```
 
 ---

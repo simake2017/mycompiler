@@ -300,6 +300,29 @@ tests/unit/test_member_template_in_class_template.cpp（`MemberTemplateInClassTe
 全量 249 → **262** 单测（ctest 257 → 262）/ 111 集成测试；既有用例**逐字节零漂移**
 （反证此前**没有任何用例覆盖这个组合**），已重刷基线。
 
+✅ **static/virtual 的识别位置（bug 修复，docs/BUGS.md B19）** ——
+**症状**：`template<class U> static U f(U x)`（标准写法）报
+`[Parse Error] … at 'static': Expected type name`（rc=1）而 clang rc=0；
+**反过来** `static template<class U> U f(U x)`（非法写法）却被解析放行。
+**性质**：同一处判据**两个方向都反了** —— 拒收合法程序 + 接受非法程序。
+**根因**：`static`/`virtual` 的识别写在类体循环里成员模板分支**之前**（1641 起，
+原注释还专门交代了"位置必须在成员模板之前"），只认得到"说明符在 `template` 前"的顺序；
+而 [temp.pre] 规定 template-head 必须在最前 ⇒ 标准写法在吃完形参表后**不再前瞻**、
+直落 parseMethodDecl ⇒ `parseType` 撞死在 `static` 上。
+★ 原注释的理由（"变量必须先声明"）说的是**变量声明顺序**，实现却把它与**语法位置**
+绑在一起 —— "先声明"与"先出现"是两件事。
+**修法**：吃完形参表、进 parseMethodDecl **之前**再认一次，两种说明符**处置相反**：
+`static` 收下（[class.static]/2），`virtual` **当场报错**（[temp.mem]/2 末句：
+member function templates shall not be virtual；文案与 clang 逐字相同）。
+—— 本轮没有顺手把 virtual 也"支持"掉，是**判据**决定的，不是工作量决定的。
+**同批加代码位置标注**：成员模板分支写明"**本项目只做成员函数模板**"——
+成员类模板 / 成员别名模板 / 静态数据成员模板一律在此响亮拒收（`Expected type name`），
+对照 clang 的做法（先解析完整声明再由结果反推 Decl 种类）与现状见 docs/learn/34 §3.5。
+测试 tests/tmpl/test_tmpl_70（普通类 + 类模板交叉点 + 非 static 对照，rc=0）+
+test_tmpl_71（rc=1，文案逐字同 clang，位置也对上）；**突变验证 3 条**（删 static 识别 /
+删 virtual 报错 / 写回 isStatic）逐条实跑变红。既有 112 个集成用例**逐字节零漂移**；
+基线 112 → 114。文档 docs/learn/34 新增 §3.4（处置表）与 §3.5（只做函数模板）。
+
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、

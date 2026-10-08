@@ -1203,6 +1203,85 @@ for (auto& mt : templateDecl->classTemplate->memberTemplates) {
 
 ---
 
+## B19. static / virtual 的识别位置写反：标准写法被拒、非法写法被收
+
+**复现**（两种顺序，判据正好与语言相反）
+
+```cpp
+struct O {
+    template <class U> static U f(U x) { return x; }   // ① 标准写法（[temp.pre]：template-head 在最前）
+    static template <class U> U g(U x) { return x; }   // ② 非法写法
+};
+```
+
+| | 写法 ①（合法） | 写法 ②（非法） |
+|---|---|---|
+| minicc（修前） | `[Parse Error] … at 'static': Expected type name`（rc=1） | 解析放行（`isStatic` 已被吃掉），一路走到调用点 |
+| clang++-18 `-std=c++20` | rc=0 | `error: expected member name or ';' after declaration specifiers` |
+
+**性质**：同一处判据的**两个方向都反了** —— 拒收合法程序（①）+ 接受非法程序（②）。
+① 与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、[B17](#b17-值位实参要求形态精确相等拒收合法程序)、
+[B18](#b18-类模板里的成员模板在实例类里丢失) 同类；② 属"静默接受"那一类。
+
+**根因**：`static` / `virtual` 的识别写在类体循环里**成员模板分支之前**
+（src/parser.cpp 的 1641 起，注释还专门交代了"位置必须在成员模板之前"）——
+于是它只能认到**说明符写在 `template` 之前**的顺序。而
+[temp.pre] 规定 `template-head` 必须在声明最前，说明符只能写在**形参表之后**：
+标准写法在 1666 的分支进门时 `static` 还没出现，吃完 `template <…>` 后代码
+**不再前瞻**，直接 `parseMethodDecl`（`parseFunctionDecl` 的第一步是 `parseType()`）
+⇒ 撞在 `static` 上 ⇒ `Expected type name`。
+
+★ 原注释的理由（"`isStatic`/`isVirtual` 必须先于任何使用它们的成员分支声明"）
+说的是**变量声明顺序**，但实现把它与**语法位置**绑在了一起 ——
+"先声明"与"先出现"是两件事。对照 clang：`ParseTemplateDeclarationOrSpecialization`
+先把整条声明解析完（decl-specifier-seq 天然含 static/virtual），再按结果定 Decl 种类
+—— **判据来自声明本身，而不是位置**。
+
+**修法**：在形参表解析完、`parseMethodDecl` 之前**再认一次**，且两种说明符**处置相反**：
+
+```cpp
+bool mtIsStatic = isStatic;                     // 前缀位置已吃过 ⇒ 兼容既有写法
+if (match(TokenType::KwStatic)) mtIsStatic = true;
+if (check(TokenType::KwVirtual) || isVirtual) {
+    // 文案与 clang 逐字相同
+    error("'virtual' cannot be specified on member function templates");
+}
+```
+
+| 说明符 | 标准 | 本实现 | 依据 |
+|---|---|---|---|
+| `static` | 合法 | 收下（`method->isStatic = true`） | [class.static]/2：无隐式 this |
+| `virtual` | **非法** | 当场报错 | [temp.mem]/2 末句：member function templates shall not be virtual |
+
+★ virtual 必须拒的理由：虚函数要求"每个动态类型在 vtable 里占一条固定条目"，
+而模板实例是**按需产生**的 —— 声明处根本不知道要有几条、更不知道 `U` 有哪些取值。
+（本轮**没有**顺手把 `virtual` 也一起"支持"掉，是判据决定的，不是工作量决定的。）
+
+**影响面**：小。① 原先拒收合法程序；② 原先静默接受非法程序。
+修复后既有 **112 个集成用例逐字节零漂移**（含 B18 的用例）。
+
+**修复记录**：`src/parser.cpp` 成员模板分支（形参表之后新增 static/virtual 识别）；
+同批在该分支补了"**本项目只做成员函数模板**"的代码位置标注（成员类模板 /
+成员别名模板 / 静态数据成员模板一律响亮拒收，文案与现状见 docs/learn/34 §3.5）。
+
+**回归用例**：
+· 集成 `tests/tmpl/test_tmpl_70_member_template_static.cpp`
+  （普通类 + 类模板（B18 × B19 交叉点）+ 非 static 对照，三者都返回 0）
+· 集成 `tests/tmpl/test_tmpl_71_error_virtual_member_template.cpp`
+  （rc=1，文案与 clang 逐字相同，报错位置也对上：`27:5`）
+
+**突变负向验证**（逐个拆掉后实跑）：
+
+| 突变 | 红掉的用例 |
+|---|---|
+| 删掉 `if (match(KwStatic)) mtIsStatic = true;` | `test_tmpl_70` 退回 `[Parse Error] … at 'static'`（rc=1） |
+| 删掉 virtual 的 error 分支 | `test_tmpl_71` 不再报错（rc≠1），文案断言失效 |
+| 把 `mtIsStatic` 写回 `isStatic` | `test_tmpl_70` 的静态分支失效（同第一条） |
+
+**状态**：✅ 已修
+
+---
+
 ## 小结 字符串兼任 ID 与路径
 
 三条 bug 的最小复现各不相同，根因却是同一句话：**把"显示名"当成了"索引"。**

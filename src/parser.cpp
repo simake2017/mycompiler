@@ -1653,6 +1653,22 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
         // ── 成员模板（[temp.mem]）──
         //   struct S { template <class T> T id(T x) { return x; } };
         // 形态：'template' '<' 形参表 '>' 后跟一个普通成员函数声明。
+        // ★★ 本项目【只做成员函数模板】这一种形态 —— 这条分支进入的条件仅仅是
+        //    "行首是 template"，吃完形参表后**不再前瞻**，直接按成员函数解析
+        //    （见下面 parseMethodDecl 那行）。类体里的 `template<...>` 还能跟别的东西：
+        //      template<class U> struct I{...};  成员类模板
+        //      template<class U> using X = U;    成员别名模板
+        //      template<class U> U gv;           静态数据成员模板
+        //    这三者一律落进 parseMethodDecl ⇒ parseType 当场撞死，报
+        //      [Parse Error] … at 'struct'/'using'/…: Expected type name
+        //    —— 是【响亮地拒收】，不是静默算错（本项目取舍：宁可报错，别算错）。
+        // 对照 clang：ParseCXXMemberSpecification 遇 kw_template 走
+        //   ParseTemplateDeclarationOrSpecialization（ParseTemplate.cpp），先照常解析
+        //   一条完整声明（decl-specifier-seq + 声明符），再按解析结果反推 Decl 种类
+        //   （CXXMethodDecl / CXXRecordDecl / VarDecl / TypeAliasDecl…）
+        //   —— 判据来自【声明本身】，而不是"位置"。
+        //   补齐那三种形态要连带做嵌套类模板的实例化、类外定义等一串，
+        //   见 docs/learn/34 §5 边界表。
         // ★ 产物与自由函数模板**同构**（funcTemplate 非空的 TemplateDecl），
         //   只是挂在类的 memberTemplates 上、实例化出的函数带 ownerClassName。
         //   这一点是刻意的：调用点的推导逻辑（TemplateDeducer）完全复用，
@@ -1698,9 +1714,27 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
             expect(TokenType::Greater,
                    "Expected '>' to close member template parameter list");
 
-            auto method = parseMethodDecl(decl->name, access); // wangyang 这里主要都是内部模板方法了，
-            method->isVirtual = isVirtual;
-            method->isStatic  = isStatic;
+            // ── 存储类 / 虚函数说明符：★ 位置在【形参表之后】──
+            // 标准写法是 `template <class U> static U f(U)` —— template-head 必须在最前，
+            // 故 static/virtual 出现在这里。而本函数开头（成员循环 1641 起）那两处
+            // match 只能认到"说明符写在 template 之前"的顺序，标准写法直接落进
+            // parseMethodDecl ⇒ [Parse Error] … at 'static': Expected type name
+            // （实测 clang rc=0 —— **拒收合法程序**，docs/BUGS.md B19）。
+            // 对照 clang：ParseTemplateDeclarationOrSpecialization 先解析完整声明
+            //   （decl-specifier-seq 天然含 static/virtual），再按结果定 Decl 种类。
+            bool mtIsStatic = isStatic;          // 前缀位置已吃过 ⇒ 兼容既有写法
+            if (match(TokenType::KwStatic)) mtIsStatic = true;
+            if (check(TokenType::KwVirtual) || isVirtual) {
+                // 成员【函数】模板不能是虚函数（[temp.mem]/2 末句：模板不能被 virtual 化
+                // —— 虚表要求每个实例一张条目，而实例是按需产生的）。
+                // 文案与 clang 逐字相同（实测：'virtual' cannot be specified on
+                // member function templates）。
+                error("'virtual' cannot be specified on member function templates");
+            }
+
+            auto method = parseMethodDecl(decl->name, access);
+            method->isStatic  = mtIsStatic;
+            method->isVirtual = false;           // 上面已把 virtual 拒掉
             memTmpl->funcTemplate = method;   // templateName() 由此取到函数名
             memTmpl->isMemberTemplate = true;
             decl->memberTemplates.push_back(memTmpl);
