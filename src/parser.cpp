@@ -2155,7 +2155,7 @@ StmtPtr Parser::parseVarDeclStmt(TypePtr type) {
     ExprPtr init = nullptr;
     std::vector<ExprPtr> ctorArgs;
     if (match(TokenType::Assign)) {
-        init = parseExpression(); //wangyang**** 这里就是变量 statement的初始声明表达式
+        init = parseExpression();
     }
     else if (check(TokenType::LParen)) {
         // ── 直接初始化 `Type name(args...);`（[dcl.init]/16）──

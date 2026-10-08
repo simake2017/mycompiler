@@ -728,7 +728,7 @@ ExprPtr SemanticAnalyzer::foldStaticConst(ExprPtr expr) {
     if (!me->isTypeAccess) return expr;
 
     // object 是模板 id（VarExpr{name, explicitTemplateArgs}）
-    if (me->object->kind != NodeKind::Var) return expr; //wangyang object 是var 表达式
+    if (me->object->kind != NodeKind::Var) return expr;
     auto ve = std::static_pointer_cast<VarExpr>(me->object);
 
     // ── 解析出类实例名：带实参 Box<int> ⇒ 先实例化拿 Box_int；不带实参直接当类名 ──
@@ -739,7 +739,9 @@ ExprPtr SemanticAnalyzer::foldStaticConst(ExprPtr expr) {
             tid->templateArgs.push_back(
                 ta.isType() ? TemplateArg::ofType(resolveType(ta.type)) : ta);
         }
-        TypePtr inst = resolveType(tid); // wangyang**** 就是在这里解析相应的类型  tests/tmpl/test_tmpl_35_void_t_detect.cpp:74
+        // 就是在这里把带实参的模板 id 解析成实例类型（用例
+        // tests/tmpl/test_tmpl_35_void_t_detect.cpp:74）
+        TypePtr inst = resolveType(tid);
         if (!inst) return expr;
         clsName = inst->name;
     }
@@ -4213,7 +4215,7 @@ TypePtr SemanticAnalyzer::getOrInstantiateClass(
     // ★ 补全必须在【选择特化之前】做：偏特化/全特化的匹配都是对完整实参表做的
     //   （Box<int*, int> 的全特化要有 2 位才能匹配上）。
     std::vector<TemplateArg> fullArgs = templateIdType->templateArgs;
-    if (fullArgs.size() < primary->templateParams.size()) { //wangyang 这里属于将模板参数缺失的参数也带进来
+    if (fullArgs.size() < primary->templateParams.size()) {
         for (size_t i = fullArgs.size(); i < primary->templateParams.size(); i++) {
             const TemplateParam& p = *primary->templateParams[i];
 

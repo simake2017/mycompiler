@@ -149,6 +149,9 @@ clang 同此分法：`RecursiveASTVisitor` 只服务遍历，类型计算走 `dy
 用 RTTI 作 oracle 钉住）、忘记下钻则静默漏访问）—— 全量 154 → 159。
 顺带把散落的 69 处 `// wangyang` 个人阅读笔记提炼进 `docs/NOTES-阅读笔记.md`
 （源码只留正式注释）；并提取了 Pass 2/Pass 3 重复的命名空间递归走查为 `forEachFunctionDecl`。
+★ 该轮漏了 5 处，已于 B19 那轮补齐（`parser.cpp:2158`、`semantic_analyzer.cpp:731/744/4218`
+共 4 处，另 1 处随 B19 的代码改动一并消失）—— 补遗与"★★ 兑现点"两条实测要点记在
+`docs/NOTES-阅读笔记.md` §六；**源码里现已无 `// wangyang`**。
 文档 docs/REFACTOR-ast-visitor.md（重构全过程）+ docs/learn/29-ast-dispatch-two-idioms.md（判据与 clang 对照）。
 ✅ **语言基础补齐 + 模板三项收尾已完成**（一/二/三梯队，本轮）：
 ① `struct X : Base` 默认 **public** 继承（[class.derived]/2；此前按 private 拒收，是**拒收合法程序**的 bug，B9）；
