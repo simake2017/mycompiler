@@ -29,11 +29,13 @@
 | [B14](#b14-派生类同名字段的隐藏方向做反了) | `d.x` 静默指向 `A::x` 而非 `D::x`（隐藏方向反了） | `include/type.h` `findField` | **大**（合法程序静默取错成员） | ✅ 已修 |
 | [B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) | 祖辈带来的前缀被当成"本类直接基类" ⇒ 偏移算错 | 扁平化循环 + `computeClassLayout` | 中（同 B13 的性质，根因更本质） | ✅ 已修 |
 | [B16](#b16-无声明符的声明被拒收aint-int-报-parse-error) | 无声明符的声明（`A<int*,int**>;` / `int;`）被拒收 | `src/parser.cpp` `parseStatement` + `isDeclaratorlessDecl` | 小-中（拒收合法程序，且报错点离根因远） | ✅ 已修 |
-| [B17](#b17-值位实参要求形态精确相等拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
+| [B17](#b17-值位实参要求形态精确相等-拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
 | [B18](#b18-类模板里的成员模板在实例类里丢失) | 类模板里的成员模板没被带进实例类 ⇒ 实例上调成员模板全线失败 | `src/template_instantiation.cpp` instantiateClassTemplate | 中（合法程序不可用；同批牵出 static/virtual 位置） | ✅ 已修 |
 | [B19](#b19-static--virtual-的识别位置写反标准写法被拒非法写法被收) | `template<class U> static U f(U)` 被拒、`static template<…>` 反被收 | `src/parser.cpp` 成员模板分支 | 小（两个方向都反了） | ✅ 已修 |
 | [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号 | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另暴露一条静默算错，缺陷 c 未修） | ✅ 缺陷 a/b 已修 |
 | [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'` | `src/semantic_analyzer.cpp` inferVar（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ⬜ 未修 |
+| [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) | 成员重载只按"名字 + 个数"选 ⇒ 同名同个数在汇编期撞符号 `C_f_1` | `src/semantic_analyzer.cpp` findMethodInClass:4558 + memberMethodSymbolName:1445 | 中（拒收合法程序，报错点落在 as 的符号上） | ⬜ 未修 |
+| [B23](#b23-浮点字面量缺失--运算按整数发射) | 无浮点字面量（`1.5` 切成 `1` `.` `5`）；`double` 运算发 `idivq` ⇒ 1/2 得 0 | `src/lexer.cpp`（[lex.fcon]）+ `src/codegen.cpp`（零 SSE 指令） | 中（a 响亮失败但文案误导；b **静默算错**） | ⬜ 未修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -171,7 +173,7 @@ int main() { return f(1) + f(1, 2); }   // clang=3，修复前 minicc=2
 
 **与 clang 的残留差异**：clang 会把参数表里**重复的类型**压成替换表引用
 （`_Z1fIiEiT_S0_i`：第二个 `T` 编成 `S0_`），本实现一律展开成 `T_`。
-符号仍唯一（模板实参段已区分实例），此差异单列为 [B8](#b8-mangling-没有替换表-符号与-clang-不逐字符等同)。
+符号仍唯一（模板实参段已区分实例），此差异单列为 [B8](#b8-mangling-没有替换表--符号与-clang-不逐字符等同)。
 
 **现役案发现场**：`demos/tmpl/04_partial_order.cpp` 的「⚠ 已知边界」注释。
 
@@ -1130,7 +1132,7 @@ clang++-18 `-std=c++20`：正常，rc=7。
 一路正常。所以缺的不是"成员模板"这个特性，而是**"类本身也是模板"时多出来的那一跳**。
 
 **性质**：**错误拒绝合法程序**（与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、
-[B17](#b17-值位实参要求形态精确相等拒收合法程序) 同类）。★ 症状停在**语义期**，
+[B17](#b17-值位实参要求形态精确相等-拒收合法程序) 同类）。★ 症状停在**语义期**，
 而解析期一切正常 —— 日志里明明白白印着
 `[parse:member] ★ 'pick' 是成员模板（1 个模板形参，[temp.mem]）`，
 "解析对了"不等于"这条特性通了"。
@@ -1224,7 +1226,7 @@ struct O {
 | clang++-18 `-std=c++20` | rc=0 | `error: expected member name or ';' after declaration specifiers` |
 
 **性质**：同一处判据的**两个方向都反了** —— 拒收合法程序（①）+ 接受非法程序（②）。
-① 与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、[B17](#b17-值位实参要求形态精确相等拒收合法程序)、
+① 与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、[B17](#b17-值位实参要求形态精确相等-拒收合法程序)、
 [B18](#b18-类模板里的成员模板在实例类里丢失) 同类；② 属"静默接受"那一类。
 
 **根因**：`static` / `virtual` 的识别写在类体循环里**成员模板分支之前**
@@ -1414,7 +1416,7 @@ public:
 | clang++-18 `-std=c++20` | rc=0（`-Xclang -ast-dump` 见下） | rc=0 |
 
 **性质**：**拒收合法程序**。与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、
-[B12](#b12-继承来的成员方法查不到)、[B17](#b17-值位实参要求形态精确相等拒收合法程序)、
+[B12](#b12-继承来的成员方法查不到)、[B17](#b17-值位实参要求形态精确相等-拒收合法程序)、
 [B18](#b18-类模板里的成员模板在实例类里丢失) 同类。（② 能过是**侥幸**：inferCall 有一条
 限定名分支认 `类名_方法名` 的 mangled 符号，与"成员访问"无关。）
 
@@ -1451,6 +1453,99 @@ inferVar 只认裸字段名（外加"当前类"的类作用域回退），查 `"
 （正是 logdiff 教训：基线会把 rc=1 也固化成"契约"）。修完再补正例。
 
 **状态**：⬜ 未修
+
+---
+
+## B22. 同名同个数的成员重载：Sema 静默取第一个、汇编期撞符号
+
+**复现**（一个类里两个同名、同个数、不同类型的成员方法）
+
+```cpp
+struct S { public: int v; };
+struct C { public: int f(int x) { return 1; } int f(S s) { return 2; } };
+int main() { C c; S s; s.v = 0; return c.f(1) + c.f(s) - 3; }   // clang: rc=0
+```
+
+| 情形 | 源码 | minicc | clang++-18 `-std=c++20` |
+|---|---|---|---|
+| 同名、**个数不同** | `f(int)` + `f(int,int)` | ✅ rc=0 | ✅ rc=0 |
+| 同名、**个数相同**、类型不同 | `f(int)` + `f(S)` | ❌ ``minicc_o4.s:43: Error: symbol `C_f_1' is already defined`` ⇒ `[ERROR] 汇编失败 (as 退出码 256)` | ✅ rc=0 |
+| 同上，声明顺序对调 | `f(S)` + `f(int)` | ❌ 同上（与顺序无关） | ✅ rc=0 |
+
+**性质**：**拒收合法程序**，且**报错点离根因很远** —— as 只甩一个符号名，不说
+"这个类里有两个同名同个数的 `f`"。
+
+**根因**：**"名字 + 参数个数"被当成了身份**，两处各用一次（正是 B10 那类"同一判据写在两条通路上"）。
+
+| # | 位置 | 判据 | 后果 |
+|---|---|---|---|
+| ① | `findMethodInClass`（`src/semantic_analyzer.cpp:4558`） | `name` 相同 ∧ `parameters.size()` 相同 ⇒ `return method`（**在循环内**） | 同分者**声明序第一个赢**，全程不比较类型 |
+| ② | `memberMethodSymbolName`（`src/semantic_analyzer.cpp:1445`） | `sym = owner_name`，后缀**只编码 paramCount**（`earlierSameNameCount` 只决定"要不要加后缀"，不进后缀内容） | 同名同个数 ⇒ **生成同一个符号** `C_f_1` |
+
+调用点（inferCall:3439）传的就是 `argTypes.size()`。于是 ② 保证"两个都定义必然撞名"，
+① 保证"若只有一处定义则会静默选错" —— **前者让后者至今没机会暴露**。
+
+**标准视角**：`[class.member.lookup]` 只产出**候选声明集**（不筛类型）；筛类型是
+`[overload.resolve]` 的事：候选集 → **可行集**（[overload.best.viable]：个数 + 隐式转换序列）
+→ 最优（[overload.icp] 排序）。本项目四条通路的判据粗细度：
+
+| 通路 | 判据 | 粗细 |
+|---|---|---|
+| 函数模板 | 推导 + 偏序（[temp.func.order]） | 最细 |
+| 自由函数（含 ADL） | 候选合并 + 精确匹配裁决 | 中 |
+| **成员方法** | **名字 + 个数** | 粗（本条） |
+| vtable 槽认领 | **只有裸名** | 最粗（[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) 缺陷 c，**已是静默算错**） |
+
+**要修的话**（两件事缺一不可）：① 候选集改成"同名全部"，按参数类型做可行/最优；
+② 符号名带上**参数签名**（clang：`_ZN1C1fEi` / `_ZN1C1fE1S`）—— 不加的话，同名同个数的
+重载永远在汇编期撞名。
+
+**影响面**：中（合法程序不可用；症状落在汇编期）。**回归用例**：暂不加（同
+[B21](#b21-限定名-sv-访问成员数据被拒收)，不把失败固化成契约）。
+
+**状态**：⬜ 未修
+
+---
+
+## B23. 浮点：字面量缺失 + 运算按整数发射
+
+**复现**
+
+```cpp
+int main() { double d = 1.5; return 0; }                            // 缺陷 a
+int main() { double a = 1; double b = 2; double c = a / b;
+             if (c > 0) { return 1; } return 0; }                   // 缺陷 b
+```
+
+| | minicc | clang++-18 `-std=c++20` |
+|---|---|---|
+| a. `double d = 1.5;` | `[ERROR] [Parse Error] 1:27 at '5': Expected member name: expected Identifier, got '5'`（rc=1） | rc=0 |
+| a'. `double d = 15e2;` | `[ERROR] [Parse Error] 1:27 at 'e2': Expected ';' after variable declaration`（rc=1） | rc=0 |
+| b. `a`=1、`b`=2（都 `double`），判 `a / b > 0` | **rc=0**（`1/2` 按整数算 ⇒ 0，判假） | rc=**1**（0.5 > 0） |
+
+**性质**：**两个不同层的缺陷**。a 是**未实现的词法形态**（响亮失败，但报错文案指向
+`.` **后面那个数字**，完全看不出"本实现没有浮点字面量"）；b 是**静默算错**
+（编译通过、运行给出错的结果 —— 与 [B14](#b14-派生类同名字段的隐藏方向做反了) /
+[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) 缺陷 c 同类）。
+
+**根因**：
+
+- **a**：Lexer 只有整数那条路（[lex.icon]：进制前缀 / 后缀 / 数字分隔符，见 docs/learn/35），
+  [lex.fcon] 的小数点 / 指数 / 后缀一概没有 ⇒ `1.5` 被切成 `1` `.` `5`，
+  而 `.` 在 `parsePostfixExpr` 里是**成员访问** ⇒ `Expected member name`。
+- **b**：`src/codegen.cpp` 里搜不到任何 SSE 指令（`movsd`/`addsd`/`xmm` 计数为 **0**），
+  也搜不到 `isDouble` —— `double` 在 CodeGen 眼里就是一个**8 字节标量**，
+  `a / b` 照发 `idivq`（实测 `.s` 第 27 行）⇒ `1/2 = 0`。
+
+**边界（实测）**：`float` 类型根本没有（`unknown type name 'float'`）；但 `double`
+**类型**是通的 —— `double g(double x) { return x + 1; }` + `double d = 1;`（int → double
+走 [conv.fpint]）编译运行 rc=0。**缺的是字面量与运算**，不是类型。
+
+**要修的话**：a 在 Lexer 认小数点/指数/`f` 后缀，Parser 给出 `double`（要不要连 `float`
+一起补需先定 CodeGen 的浮点宽度分派）；b 要引入 SSE 寄存器与指令（`movsd`/`addsd`/`divsd`、
+调用约定里 xmm0 传参）—— 是**一条独立主线**，不是顺手项。
+
+**状态**：⬜ 未修（a、b 都未修）
 
 ---
 
