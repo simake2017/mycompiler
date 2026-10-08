@@ -1688,7 +1688,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             size_t primaryIdx = 0;
             bool anyPoly = false;
             for (size_t i = 0; i < classType->classLayout.bases.size(); ++i) {
-                if (classType->classLayout.bases[i].hasVTable) {
+                if (classType->classLayout.bases[i].hasVTable) { // 第一个有虚函数的类是主基类
                     primaryIdx = i;
                     anyPoly = true;
                     break;
@@ -1704,7 +1704,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                     if (m->isVirtual) { selfPoly = true; break; }
                 }
             }
-            bool noPrimary = (!anyPoly && selfPoly);
+            bool noPrimary = (!anyPoly && selfPoly); // mrd 标识 没有主基类，但是存在 多态
 
             for (size_t i = 0; i < classType->classLayout.bases.size(); ++i)
                 classType->classLayout.bases[i].isPrimary = (!noPrimary && i == primaryIdx);
@@ -1714,7 +1714,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             // ★ 不能用"全非多态 ⇒ place=0"的写法：那会让第二个基类被 alignTo(0,8)=0 放到
             //   offset 0，与首个基类字段重叠（x@0 与 y@0 互踩）。
             uint32_t place = noPrimary ? 8u : 0u;
-            if (!noPrimary) {
+            if (!noPrimary) { // false 存在主基类或者存在 虚函数
                 auto pIt = m_classTypes.find(
                     classType->classLayout.bases[primaryIdx].baseClassName);
                 if (pIt != m_classTypes.end())
@@ -2992,36 +2992,62 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
     if (!expr) return nullptr;
 
     // 一次 switch（跳表）分派。static_cast 安全：节点 kind 由构造函数设定，恒等于自身类型。
+    // 各分支上方的 `数据事例` 行 = 「输入表达式 ⇒ 该表达式在日志里的定型行」，
+    // 全部出自 demos/core/03_infer_branches.cpp 的编译输出（文件头有复现命令）。
     TypePtr type = nullptr;
     switch (expr->kind) {
+        // ① 数据事例：42 ⇒ [infer] IntLiteral(42) → int
         case NodeKind::IntLiteral:
             type = inferIntLiteral(static_cast<IntLiteralExpr&>(*expr)); break;
+        // ② 数据事例：'A' ⇒ [infer] CharLiteral(65) → char
+        //    （括号里是 ASCII 码 —— 词法期已把 'A' 折成 65；多字符 'ab' 折成 24930）
         case NodeKind::CharLiteral:
             type = inferCharLiteral(static_cast<CharLiteralExpr&>(*expr)); break;
+        // ③ 数据事例：true ⇒ [infer] BoolLiteral(true) → bool
         case NodeKind::BoolLiteral:
             type = inferBoolLiteral(static_cast<BoolLiteralExpr&>(*expr)); break;
+        // ④ 数据事例："hi" ⇒ [infer] StringLiteral → char*
         case NodeKind::StringLiteral:
             type = inferStringLiteral(static_cast<StringLiteralExpr&>(*expr)); break;
+        // ⑤ 数据事例：nullptr ⇒ [infer] nullptr → void*
+        //    （int* ln = nullptr; 时接着走 [poly] ln : void* → int*）
         case NodeKind::NullptrLiteral:
             type = inferNullptrLiteral(static_cast<NullptrLiteralExpr&>(*expr)); break;
+        // ⑥ 数据事例：x ⇒ [resolve] 'x' → int    (kind=Variable, stack@-48)
         case NodeKind::Var:
             type = inferVar(static_cast<VarExpr&>(*expr)); break;
+        // ⑦ 数据事例：x + y ⇒ [infer] int op int → int
+        //              x < y ⇒ [infer] int op int → bool    (comparison)
         case NodeKind::Binary:
             type = inferBinary(static_cast<BinaryExpr&>(*expr)); break;
+        // ⑧ 数据事例：!cmp ⇒ [infer] !bool → bool        -x    ⇒ [infer] -int → int
+        //              &x   ⇒ [infer] &int → int*（取地址）  *addr ⇒ [infer] *int* → int（解引用）
         case NodeKind::Unary:
             type = inferUnary(static_cast<UnaryExpr&>(*expr)); break;
+        // ⑨ 数据事例：add(x, y) ⇒ [call] add(2 args) → int    [普通查找：形参类型精确匹配]
+        //              dr.kind() ⇒ [call] Derived.kind(0 args) → int    [class-scoped member call]
+        //              twice(x)  ⇒ [call] twice → _Z5twiceIiET_T_ (template resolved) → int
         case NodeKind::Call:
             type = inferCall(static_cast<CallExpr&>(*expr)); break;
+        // ⑩ 数据事例：dr.d      ⇒ [member] Derived.d → int    (offset=16, size=4)
+        //              pb->b     ⇒ [member] Base.b → int    (offset=8, size=4)   ← 箭头先解指针
+        //              dr.value() ⇒ [member] Derived.value() → int    (method via 'Base')
         case NodeKind::Member:
             type = inferMember(static_cast<MemberExpr&>(*expr)); break;
+        // ⑪ 数据事例：new Base() ⇒ [new] Base → Base*    (size=16 bytes, args=0)
         case NodeKind::New:
             type = inferNew(static_cast<NewExpr&>(*expr)); break;
+        // ⑫ 数据事例：this->b（Base::self 体内）⇒ [this] → Base*，随后 [member] Base.b → int
         case NodeKind::This:
             type = inferThis(static_cast<ThisExpr&>(*expr)); break;
+        // ⑬ 数据事例：dynamic_cast<Derived*>(pb) ⇒ [dynamic_cast] Base* → Derived*    (runtime RTTI check)
         case NodeKind::DynamicCast:
             type = inferDynamicCast(static_cast<DynamicCastExpr&>(*expr)); break;
+        // ⑭ 数据事例：v[0] ⇒ [index] IntVec[int] → int    (sugar for IntVec.at(i))
         case NodeKind::Index:
             type = inferIndex(static_cast<IndexExpr&>(*expr)); break;
+        // ⑮ 数据事例：delete nb ⇒ 先 [resolve] 'nb' → Base*，再 [delete] delete Base*；
+        //    前 14 支都满足"返回值 = 该节点的类型"（inferXxx 直传），只有本支不是。
         case NodeKind::Delete: {
             // delete 是 void 表达式：先看操作数成不成立，自身类型恒为 void
             auto& del = static_cast<DeleteExpr&>(*expr);
@@ -4559,6 +4585,21 @@ FuncDeclPtr SemanticAnalyzer::findMethodInHierarchy(const std::string& className
     return nullptr;
 }
 
+// ┌─ DEMO ─────────────────────────────────────────────────────────────────────
+// │ 源码  dr.d;    pb->b;    dr.value();
+// │ 日志  [resolve] 'dr' → Derived    (kind=Variable, stack@-112)
+// │       [member] Derived.d → int    (offset=16, size=4)              ← ① 字段
+// │       [resolve] 'pb' → Base*    (kind=Variable, stack@-152)
+// │       [member] Base.b → int    (offset=8, size=4)                 ← -> 先解指针再查字段
+// │       [resolve] 'dr' → Derived    (kind=Variable, stack@-112)
+// │       [member] Derived.value() → int    (method via 'Base')       ← ② 方法（沿基类链，B12）
+// │       [member] Box_int.pick —— 成员模板（待实参推导，[temp.mem]）  ← ③ 名字存在，选择推迟
+// │ 输出  字段 / 方法的类型。字段那一路是"编译期看符号"兑现成偏移量的入口：
+// │       offset 由 computeClassLayout 定，CodeGen 直接拿它寻址（不再查名字）。
+// │ 报错  Member 'x' is ambiguous in class 'D': found in 2 base-class subobjects (…)  ← 先于取第一条
+// │       No member 'x' in class 'Y'
+// │       Cannot access member 'x' on non-class type 'int*'（引用会先被看穿，见下）
+// └────────────────────────────────────────────────────────────────────────────
 TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
     m_inferDepth++;
     TypePtr objType = inferType(expr.object);

@@ -1685,7 +1685,7 @@ ClassDeclPtr Parser::parseClassDecl(std::vector<TemplateArg>* outSpecPattern) {
 
             auto memTmpl = std::make_shared<TemplateDecl>();
             // 形参作用域建帧：使下面 parseMethodDecl 里的裸 T 认得出是模板形参
-            TemplateParamFrame memFrame(this, memTmpl.get());
+            TemplateParamFrame memFrame(this, memTmpl.get()); //mrd 这里就是嵌套 frame
 
             if (!check(TokenType::Greater)) {
                 do {

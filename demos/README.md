@@ -26,6 +26,7 @@
 |---|---|---|---|
 | `core/01_control_flow` | if / while 降级成什么形状 | 控制流 → 基本块 + 回边 | 生成的 `.s` 里的 `while_begin_N` / `jmp` 回边 |
 | `core/02_preprocessor` | 宏替换与条件编译 | 预处理是纯文本阶段 | `-E` 看展开结果；`[pp]` 日志看宏调用点 |
+| `core/03_infer_branches` | 表达式定型 15 条分支各喂一个数据 | [expr] 语法制导翻译（综合属性） | `[infer]` / `[resolve]` / `[member]` / `[index]` 逐支对应 |
 | `oop/01_vtable` | 同一调用点、运行期决定函数体 | [class.virtual] + Itanium vtable | `.s` 里的 `movq (%rax),%rax` 三部曲 |
 | `oop/02_dynamic_cast` | 运行期沿继承链找目标类型 | [expr.dynamic.cast] | `callq __minicc_dynamic_cast` |
 | `oop/03_multiple_inheritance` | 一个对象、多个基类子对象与指针调整 | Itanium ABI §2.4（thunk） | `.s` 里的 `thunk` 与 offset-to-top |
