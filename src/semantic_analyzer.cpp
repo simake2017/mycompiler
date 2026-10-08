@@ -1101,6 +1101,52 @@ static bool typeCompatible(const TypePtr& expected, const TypePtr& got) {
     return false;
 }
 
+// ── 候选集 → 最优（[overload.best.viable] 的粗粒度版，判据【单点】）────────────
+// 谁在用：成员方法调用（findMethodInClass）与构造函数选定（processVarDeclStmt）——
+//   这两处此前**各写一遍**"按参数个数选第一个"，于是 B22 的两个症状各来一次
+//   （方法撞符号 + 构造函数静默选错）。现在共用本函数。
+// 三级择优：① 逐位**精确**（Type::equals）② 逐位**可隐式转换**（typeCompatible）
+//   ③ 退回首个（兜底：实参类型未知或无一相容时，维持旧行为并说明原因）。
+// 为什么不做 [overload.icp] 的转换等级排序：本项目不做用户定义转换，而内建转换之间
+//   "哪个更优"要比较转换等级（整型提升 vs 整型转换）—— 那是主线 D 的活。
+// 对照 clang：Sema::BuildOverloadCandidateSet 收候选 → 逐个算隐式转换序列 → 比等级。
+static FuncDeclPtr pickBestByArgs(const std::vector<FuncDeclPtr>& candidates,
+                                  const std::vector<TypePtr>& argTypes,
+                                  const std::string& what) {
+    if (candidates.empty()) return nullptr;
+    if (candidates.size() == 1) return candidates.front();   // 无重载 ⇒ 短路（零开销）
+
+    // ① 精确匹配（逐位 Type::equals；引用/const 的剥离交给 equals 自己）
+    for (auto& m : candidates) {
+        bool ok = m->parameters.size() == argTypes.size();
+        for (size_t i = 0; i < m->parameters.size() && ok; ++i) {
+            ok = m->parameters[i].type && argTypes[i]
+              && m->parameters[i].type->equals(argTypes[i]);
+        }
+        if (ok) {
+            std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 精确匹配 '{}'\n",
+                what, argTypes.size(), candidates.size(), m->mangledName);
+            return m;
+        }
+    }
+    // ② 可隐式转换（[conv]：整型家族互转、浮点 ← 整型）
+    for (auto& m : candidates) {
+        bool ok = m->parameters.size() == argTypes.size();
+        for (size_t i = 0; i < m->parameters.size() && ok; ++i) {
+            ok = typeCompatible(m->parameters[i].type, argTypes[i]);
+        }
+        if (ok) {
+            std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 按隐式转换选 '{}'\n",
+                what, argTypes.size(), candidates.size(), m->mangledName);
+            return m;
+        }
+    }
+    // ③ 兜底：声明序首个（与旧实现一致），并说明为什么没得选
+    std::cout << std::format("  [overload] {}({} args): {} 个候选，无一与实参相容 ⇒ 退回首个 '{}'\n",
+        what, argTypes.size(), candidates.size(), candidates.front()->mangledName);
+    return candidates.front();
+}
+
 SemanticAnalyzer::SemanticAnalyzer() {
     // 把自己挂成实例化引擎的三个求值器（decltype / 成员类型 / 别名模板）。
     // 这是"依赖倒置"的落地点：TemplateInstantiator 需要求值能力，但求值住在 Sema 里，
@@ -1462,14 +1508,49 @@ void SemanticAnalyzer::processTypeAliasDecl(TypeAliasDeclPtr decl) {
 // │ 输入  owner="A", name="f", paramCount=1, earlier=0
 // │ 输出  "A_f_1"              （旧实现两处各写"类名_方法名" ⇒ 槽里是 A_f、定义是 A_f_1 ⇒ ✗）
 // └────────────────────────────────────────────────────────────────────────────
+// 形参类型链：逐位类型的可读名拼起来（"int" / "S_int" / "int_S"），零参为 ""。
+// ★ 它是"凭什么把两个同名的东西区分开"的**共同材料**：符号名、vtable 槽位身份都用它，
+//   所以必须出自同一处（sanitizeSymbolChars 也是全项目唯一那个实例名清洗器）。
+// ⚠ 仍是用【给人看的字符串】当机器用的键 —— 本项目类型的 toString() 不是单射
+//   （docs/learn/23 的 cv 位置修正就是为此）；这里靠 sanitizeSymbolChars 把 `*`/`&`/`<`/`>`
+//   映射成不同字母才没撞键。真按 Itanium mangling 做才是正解，教学版从简。
+static std::string paramTypeChain(const std::vector<Parameter>& params) {
+    std::string chain;
+    for (auto& p : params) {
+        if (!chain.empty()) chain += "_";
+        chain += sanitizeSymbolChars(p.type ? p.type->toString() : "?");
+    }
+    return chain;
+}
+
+// 同类中"同名且同个数"的方法有几个（含自身）。
+// ★ 用它当【是否需要类型后缀】的开关：只要不是同签名个数并存，符号名就维持旧样式，
+//   既有产物逐字节不变（logdiff 零漂移的前提）。
+// ⚠ 口径是"总数"而非"排在前面的个数" —— 后缀一旦加上，**每个**兄弟都要加，
+//   否则 `f(int)` 叫 C_f_1、`f(S)` 叫 C_f，两个都得能找回来才叫分得开。
+static size_t countSameNameSameArity(const std::vector<FuncDeclPtr>& methods,
+                                     const std::string& name, size_t arity) {
+    size_t n = 0;
+    for (auto& m : methods) {
+        if (m->name == name && m->parameters.size() == arity) ++n;
+    }
+    return n;
+}
+
 static std::string memberMethodSymbolName(const std::string& owner,
                                           const std::string& methodName,
-                                          size_t paramCount,
-                                          size_t earlierSameNameCount) {
+                                          const std::vector<Parameter>& params,
+                                          size_t earlierSameNameCount,
+                                          bool needsTypeDisambiguation) {
     if (methodName.starts_with("~")) return owner + "_dtor";
     std::string sym = owner + "_" + methodName;
-    if (earlierSameNameCount > 0 || paramCount > 0) {
-        sym += "_" + std::to_string(paramCount);
+    if (earlierSameNameCount > 0 || !params.empty()) {
+        sym += "_" + std::to_string(params.size());
+    }
+    // 名字 + 个数还不够（`f(int)` vs `f(S)`）⇒ 再挂一条形参类型链（BUGS.md B22）。
+    if (needsTypeDisambiguation) {
+        std::string chain = paramTypeChain(params);
+        sym += "_" + (chain.empty() ? std::string("void") : chain);
     }
     return sym;
 }
@@ -1900,9 +1981,15 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
         for (size_t mj = 0; mj < mi; ++mj) {
             if (decl->methods[mj]->name == method->name) ++earlierSameNameCount;
         }
+        bool needsTypeTag = countSameNameSameArity(decl->methods, method->name,
+                                                   method->parameters.size()) > 1;
         std::string selfSymbol = memberMethodSymbolName(decl->name, method->name,
-                                                        method->parameters.size(),
-                                                        earlierSameNameCount);
+                                                        method->parameters, earlierSameNameCount,
+                                                        needsTypeTag);
+        // ★ 槽位身份 = 裸名 + 形参类型链（BUGS.md B20 缺陷 c）。
+        //   只比裸名 ⇒ `virtual int f(); int f(int);` 里后者认领前者的槽并被误标 virtual，
+        //   编译期全绿、运行静默算错。对照 [class.virtual]/2：覆写判据本就含形参类型。
+        std::string selfSignature = paramTypeChain(method->parameters);
 
         // Override 检测：即使没有 virtual 关键字，也检查是否覆写基类虚函数
         // （C++ 标准：覆写虚函数不需要重新声明 virtual）
@@ -1914,7 +2001,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
             std::string entryFuncName = entry.baseFunctionName.empty()
                 ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
                 : entry.baseFunctionName;
-            if (entryFuncName == methodNameInVTable) {
+            if (entryFuncName == methodNameInVTable && entry.signature == selfSignature) {
                 entry.mangledName = selfSymbol;   // 覆写 ⇒ 槽位改指本类的实现（索引不变，[class.virtual]/1）
                 entry.baseFunctionName = methodNameInVTable;
                 entry.isOverridden = true;
@@ -1933,7 +2020,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 std::string entryFuncName = entry.baseFunctionName.empty()
                     ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
                     : entry.baseFunctionName;
-                if (entryFuncName == methodNameInVTable) {
+                if (entryFuncName == methodNameInVTable && entry.signature == selfSignature) {
                     entry.mangledName = selfSymbol;   // 次表里的覆写：同样改指本类实现（thunk 负责 this 调整）
                     entry.baseFunctionName = methodNameInVTable;
                     entry.isOverridden = true;
@@ -1962,6 +2049,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 VTableEntry entry;
                 entry.mangledName = selfSymbol;   // 本类新引入的虚函数：新占一个槽位
                 entry.baseFunctionName = methodNameInVTable;
+                entry.signature = selfSignature;  // 槽位身份的另一半：形参类型链
                 entry.index = static_cast<uint32_t>(
                     classType->classLayout.vtableEntries.size());
                 classType->classLayout.vtableEntries.push_back(entry); // 也就是说classLayout 只会放 主基类和自己的虚函数
@@ -2269,9 +2357,17 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
                 }
             }
         }
-        // ★ 定名与 vtable 条目共用同一份判据（BUGS.md B20），不许在这里另写一遍。
+        // ★ 同一类里"同名且同个数"有多个 ⇒ 名字+个数不足以区分，再挂形参类型链。
+        //   开关取自 m_classDecls（= 权威方法表），与 vtable 条目点的 decl->methods 同源。
+        bool needsTypeTag = false;
+        if (auto clsIt = m_classDecls.find(decl->ownerClassName); clsIt != m_classDecls.end()) {
+            needsTypeTag = countSameNameSameArity(clsIt->second->methods, decl->name,
+                                                  decl->parameters.size()) > 1;
+        }
+        // ★ 定名与 vtable 条目共用同一份判据（BUGS.md B20 / B22），不许在这里另写一遍。
         decl->mangledName = memberMethodSymbolName(decl->ownerClassName, decl->name,
-                                                   decl->parameters.size(), sameNameCount);
+                                                   decl->parameters, sameNameCount,
+                                                   needsTypeTag);
     }
 
     // 注册到符号表
@@ -2831,21 +2927,28 @@ void SemanticAnalyzer::visit(VarDeclStmt& decl) {
         //   而"该调哪个重载"是语义信息 ⇒ 由 Sema 选定并回填 decl.ctorSymbol。
         // 用例  MyPtr<int> m(7); ⇒ 日志 "[ctor] ★ m : MyPtr_int(1 个实参) ⇒ 选定构造函数符号
         //       MyPtr_int_MyPtr_int_1"；CodeGen 按 Name_Name 硬拼只会拼出个不存在的符号。
-        // 简化点：按【参数个数】选（教学版不做完整的重载决议，与 Sema 既有口径一致）。
+        // 选定口径与成员方法调用**同源**（pickBestByArgs）：先推实参类型，再收候选、
+        //   按类型择优。此前这里只数个数 ⇒ `D(int)` / `D(S)` 里 `D d2(s);` 会静默撞上
+        //   声明序里的第一个构造函数（B22 第三处现场：编译全绿，运行结果错）。
         // 对照 clang：Sema::BuildCXXConstructExpr 跑完整重载决议，CodeGen 只发它选中的符号。
         m_inferDepth++;
-        for (auto& a : decl.ctorArgs) inferType(a);
+        std::vector<TypePtr> ctorArgTypes;
+        ctorArgTypes.reserve(decl.ctorArgs.size());
+        for (auto& a : decl.ctorArgs) ctorArgTypes.push_back(inferType(a));
         m_inferDepth--;
 
         if (type->isClass()) {
             auto cit = m_classDecls.find(type->name);
             if (cit != m_classDecls.end()) {
+                std::vector<FuncDeclPtr> ctors;
                 for (auto& method : cit->second->methods) {
                     if (method->kind != NodeKind::Constructor) continue;
-                    auto ctor = std::static_pointer_cast<ConstructorDecl>(method);
-                    if (ctor->parameters.size() != decl.ctorArgs.size()) continue;
-                    decl.ctorSymbol = ctor->mangledName;
-                    break;
+                    if (method->parameters.size() != decl.ctorArgs.size()) continue;
+                    ctors.push_back(method);
+                }
+                if (auto best = pickBestByArgs(ctors, ctorArgTypes,
+                        std::format("ctor {}({} args)", type->toString(), ctorArgTypes.size()))) {
+                    decl.ctorSymbol = best->mangledName;
                 }
             }
         }
@@ -3457,7 +3560,8 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
                 auto classIt = m_classDecls.find(clsName);
                 if (classIt != m_classDecls.end()) {
                     if (auto method = findMethodInClass(clsName, funcName,
-                                                        static_cast<int>(argTypes.size()))) {
+                                                        static_cast<int>(argTypes.size()),
+                                                        &argTypes)) {
                         // ★ 回填符号：CodeGen 硬拼 `类名_方法名` 拼不出带参方法的
                         //   真符号 —— Sema 给带参成员方法名加了"参数个数"后缀
                         //   （IntVec_at_1 / IntVec_set_2），硬拼得到的是 IntVec_at。
@@ -4577,16 +4681,25 @@ bool SemanticAnalyzer::isAtLeastAsSpecialized(TemplateDeclPtr a, TemplateDeclPtr
 // 对照 clang：两条通路最终都落到 LookupResult（DeclContext::lookup 沿 base 链）+ 重载决议。
 FuncDeclPtr SemanticAnalyzer::findMethodInClass(const std::string& className,
                                                 const std::string& methodName,
-                                                int arity) const {
+                                                int arity,
+                                                const std::vector<TypePtr>* argTypes) const {
     auto it = m_classDecls.find(className);
     if (it == m_classDecls.end()) return nullptr;
+
+    // ★ 收【候选集】而不是"第一个命中就返回" —— 同名同个数的重载必须都收进来，
+    //   再由 pickBestByArgs 按实参类型择优（BUGS.md B22）。
+    //   这也正是 [class.member.lookup] 与 [overload.best.viable] 的分工：
+    //   查找产出候选声明集（不筛类型），重载决议才筛。
+    std::vector<FuncDeclPtr> candidates;
     for (auto& method : it->second->methods) {
         if (method->name != methodName) continue;
         // arity < 0 ⇒ 不看参数个数（`d.g` 这种没有实参可数，无法据此筛选）
         if (arity >= 0 && method->parameters.size() != static_cast<size_t>(arity)) continue;
-        return method;
+        candidates.push_back(method);
     }
-    return nullptr;
+    if (!argTypes) return candidates.empty() ? nullptr : candidates.front();
+    return pickBestByArgs(candidates, *argTypes,
+                          std::format("member {}.{}", className, methodName));
 }
 
 FuncDeclPtr SemanticAnalyzer::findMethodInHierarchy(const std::string& className,

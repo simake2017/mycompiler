@@ -32,10 +32,11 @@
 | [B17](#b17-值位实参要求形态精确相等-拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
 | [B18](#b18-类模板里的成员模板在实例类里丢失) | 类模板里的成员模板没被带进实例类 ⇒ 实例上调成员模板全线失败 | `src/template_instantiation.cpp` instantiateClassTemplate | 中（合法程序不可用；同批牵出 static/virtual 位置） | ✅ 已修 |
 | [B19](#b19-static--virtual-的识别位置写反标准写法被拒非法写法被收) | `template<class U> static U f(U)` 被拒、`static template<…>` 反被收 | `src/parser.cpp` 成员模板分支 | 小（两个方向都反了） | ✅ 已修 |
-| [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号 | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另暴露一条静默算错，缺陷 c 未修） | ✅ 缺陷 a/b 已修 |
+| [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号；槽位身份只比裸名 ⇒ 静默算错（缺陷 c） | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另有一条静默算错） | ✅ 缺陷 a/b/c 已修 |
 | [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'` | `src/semantic_analyzer.cpp` inferVar（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ⬜ 未修 |
-| [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) | 成员重载只按"名字 + 个数"选 ⇒ 同名同个数在汇编期撞符号 `C_f_1` | `src/semantic_analyzer.cpp` findMethodInClass:4558 + memberMethodSymbolName:1445 | 中（拒收合法程序，报错点落在 as 的符号上） | ⬜ 未修 |
+| [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) | 成员重载只按"名字 + 个数"选 ⇒ 同名同个数在汇编期撞符号 `C_f_1`；构造函数同病（静默选错） | `src/semantic_analyzer.cpp` 四处落点：符号定名 / 槽位身份 / 调用点选择 / 构造函数选定 | 中（拒收合法程序，报错点落在 as 的符号上） | ✅ 已修 |
 | [B23](#b23-浮点字面量缺失--运算按整数发射) | 无浮点字面量（`1.5` 切成 `1` `.` `5`）；`double` 运算发 `idivq` ⇒ 1/2 得 0 | `src/lexer.cpp`（[lex.fcon]）+ `src/codegen.cpp`（零 SSE 指令） | 中（a 响亮失败但文案误导；b **静默算错**） | ⬜ 未修 |
+| B24（下） | 成员方法**名字隐藏**：`Derived::f()` 声明后，基类 `f(int)` 整族应被隐藏，minicc 仍能查到 | `src/semantic_analyzer.cpp` findMethodInHierarchy（按裸名判"本地有没有"） | 小（接受非法程序） | ⬜ 未修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -1362,11 +1363,18 @@ int main() { D d; B* pb = &d; return pb->f() - 1; }
 `struct X { virtual int f(); virtual int f(int); }` 里 f() 得到 `X_f_0`，而定义点是
 `X_f` —— 又是一个只在链接期炸的错配。故 vtable 侧按 `decl->methods` 的**下标顺序**数。
 
-**顺带发现（缺陷 c，未修）**：槽位匹配只比**裸名**、不比形参表 ⇒
+**顺带发现（缺陷 c，已修）**：槽位匹配只比**裸名**、不比形参表 ⇒
 `class C { virtual int f(); int f(int); };` 里 `f(int)` 会认领 `f()` 的槽，且被
 **误标成 virtual**。实测 `C c; return c.f() + c.f(2) - 3;`：clang rc=0，
-minicc 编译 rc=0 但**运行返回 255**（静默算错）。判据应是（裸名 + 形参个数），
-与符号名规则同源。**本轮不修**：它改的是"覆写判据"本身，影响面比命名大，单独一轮。
+minicc 编译 rc=0 但**运行返回 255**（静默算错）。
+
+**缺陷 c 的修法**：槽位身份补上**形参类型链**（`VTableEntry::signature`，与符号名共用
+`paramTypeChain`）。判据从"裸名"变成"裸名 + 形参类型" —— 即 `[class.virtual]/2` 的覆写判据
+（裸名只是查找入口，不是身份的全体）。同轮的 [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号)
+把同一条判据推进到了另外三处（符号定名 / 调用点选择 / 构造函数选定），详见该条。
+**这个缺陷证明了"对称不变量"不够用**：认错槽位后"谁在槽里、谁被直接调"整体互换，
+`|槽位| + |直接调用| == |定义|` 这类计数照样配平 —— 有判别力的那条是
+"经基类指针的虚调用必须退化成 `callq *%rax` 的**间接**调用"（详见 B22 的回归用例 ⑤）。
 
 ### 影响面与验证
 
@@ -1392,7 +1400,7 @@ minicc 编译 rc=0 但**运行返回 255**（静默算错）。判据应是（�
 | 三个 vtable 落点改回 `decl->name + "_" + methodNameInVTable` | `VTableSymbols.ParameterizedVirtualSlotMatchesDefinition`、`...SecondaryInheritedSlotKeepsUpstreamSymbol` |
 | 次表条目改回 `baseName + "_" + 裸名` | 只有 `...SecondaryInheritedSlotKeepsUpstreamSymbol` 红（外科级定位） |
 
-**状态**：✅ 缺陷 a、b 已修；⚠ 缺陷 c 未修（见上）
+**状态**：✅ 缺陷 a、b、c 均已修（c 与 [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) 同轮完成）
 
 ---
 
@@ -1493,17 +1501,63 @@ int main() { C c; S s; s.v = 0; return c.f(1) + c.f(s) - 3; }   // clang: rc=0
 |---|---|---|
 | 函数模板 | 推导 + 偏序（[temp.func.order]） | 最细 |
 | 自由函数（含 ADL） | 候选合并 + 精确匹配裁决 | 中 |
-| **成员方法** | **名字 + 个数** | 粗（本条） |
-| vtable 槽认领 | **只有裸名** | 最粗（[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) 缺陷 c，**已是静默算错**） |
+| **成员方法** | **名字 + 个数** | 粗（本条，已修） |
+| vtable 槽认领 | **只有裸名** | 最粗（[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) 缺陷 c，**已是静默算错**，已修） |
 
-**要修的话**（两件事缺一不可）：① 候选集改成"同名全部"，按参数类型做可行/最优；
-② 符号名带上**参数签名**（clang：`_ZN1C1fEi` / `_ZN1C1fE1S`）—— 不加的话，同名同个数的
-重载永远在汇编期撞名。
+### 修复：一条判据，四处落点
 
-**影响面**：中（合法程序不可用；症状落在汇编期）。**回归用例**：暂不加（同
-[B21](#b21-限定名-sv-访问成员数据被拒收)，不把失败固化成契约）。
+"身份 = 名字 + 形参类型"这条判据在这份实现里有**四个落点**，本轮把它们全部收口：
 
-**状态**：⬜ 未修
+| # | 落点 | 修前 | 修后 |
+|---|---|---|---|
+| ① | 汇编符号名 `memberMethodSymbolName`（src/semantic_analyzer.cpp:1445） | 后缀只编码 `paramCount` | 同签名个数有兄弟时再挂 `paramTypeChain`（`C_f_1_int` / `C_f_1_S`），**无兄弟则一字不改** |
+| ② | vtable 槽位身份 `processClassDecl` | `entryFuncName == methodNameInVTable`（裸名） | 再与 `entry.signature`（形参类型链）比对 —— B20 缺陷 c |
+| ③ | 调用点选择 `findMethodInClass` | 循环内首个命中即 `return` | 收**候选集** → `pickBestByArgs` 三级择优（精确 → 可隐式转换 → 退回首个），并回填 `resolvedCalleeSymbol` |
+| ④ | 构造函数选定 `processVarDeclStmt` | **只数个数**，且把刚推出来的实参类型**扔掉** | 同走 `pickBestByArgs`（`[ctor] … ⇒ 选定构造函数符号 …`） |
+
+★ ③④ 共用的 `pickBestByArgs(candidates, argTypes, what)` 是一个**本地静态函数** ——
+这正是本项目反复交学费的那条：同一判据写在两条通路上，早晚分叉（[B10](#b10-带参成员方法的调用点符号与定义点不一致)、
+[B12](#b12-继承来的成员方法调用报-no-member)、B13~B15、[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号)）。
+
+★ 符号名为什么**只在必要时**才挂类型链：挂了就动了全部既有产物（logdiff 基线）。
+实测"有兄弟才挂"策略下，**既有 116 个集成用例逐字节零漂移**。
+
+★ 对照 clang：`_ZN1C1fEi` / `_ZN1C1fE1S` —— 形参类型**无条件**进 mangling，
+且声明是 `Decl*` 句柄（查找/匹配/发射天然同一个东西）。minicc 没有句柄，
+只能用"字符串做键"，所以必须靠**收口到同一个函数**来达到同等效果。
+
+### 影响面与验证
+
+| 项 | 结果 |
+|---|---|
+| 既有集成用例漂移 | **0**（116 个逐字节不变；新增 2 个是全新文件） |
+| 单测 | 266 → 272（新增 `MemberIdentity.*` 6 例） |
+| 集成 | 116 → 118（新增 `tests/lang/test_basics_04_member_overload_same_arity.cpp`、`tests/mi/test_mi_13_virtual_overload_slots.cpp`） |
+| 有意日志漂移 | 无 |
+
+**回归用例**：
+
+- 集成 `tests/lang/test_basics_04_member_overload_same_arity.cpp`
+  （`f(int)`/`f(S)`、三元混排 `g(int,int)`/`g(int,S)`/`g(S,int)`、构造函数 `D(int)`/`D(S)`；运行 rc=0）
+- 集成 `tests/mi/test_mi_13_virtual_overload_slots.cpp`
+  （`virtual int f()` + 非虚 `int f(int)` 共存、派生覆写后槽数不变、经基类指针虚调用派发正确）
+- 单测 `tests/unit/test_member_identity.cpp`（`MemberIdentity.*` 6 例，断言**不变量**而非具体拼法）
+
+**突变负向验证**（逐个拆掉后实跑，`--gtest_filter='MemberIdentity.*'`）：
+
+| 突变 | 红掉的用例 |
+|---|---|
+| ① 符号定名回退（`needsTypeTag = false`） | 4 / 6 红（`SameNameSameArityGetDistinctSymbols`、`LoneMethodNameUnchanged`…）集成侧：`test_basics_04` 编译 rc=1 |
+| ② 槽位匹配回退到裸名（删 `entry.signature == selfSignature`） | 2 / 6 红（`NonVirtualOverloadDoesNotOccupyVTableSlot`、`VirtualCallOnPointerStaysVirtual`）集成侧：`test_mi_13` 编译 rc=0 但**运行 rc=4** |
+| ④ 构造函数选定回退到按个数（`ctors.front()`） | 2 / 6 红 |
+
+★ **② 的教训（值得单独记）**：第一版单测只断言了"槽里只有一个符号"和"派生类槽数不变"，
+**突变验证时全绿** —— 因为认错槽位后"谁在槽里、谁被直接调"会**整体互换**，计数照样配平。
+真正有判别力的是**不对称**的那条：经基类指针的虚调用必须是 `callq *%rax` 间接调用
+（认错 ⇒ CodeGen 按 `resolvedCalleeSymbol` 精确比对落空 ⇒ 退化成直接调用 ⇒ 运行期不派发）。
+**"守恒式"不变量（两边加起来对得上）挡不住互换型缺陷**，要挑守恒式盯不住的方向再钉一条。
+
+**状态**：✅ 已修（①②③④ 四处落点 + B20 缺陷 c）
 
 ---
 
@@ -1577,3 +1631,38 @@ clang 那边这两种东西从设计上就是分开的：成员是 `FieldDecl*`�
    新情形出现时最容易漏 —— 先枚举出**全部**情形再写分支。
 2. **判据只许有一处**（B12，承 B10）：同一句"成员叫什么/是不是它"写在两条通路上，
    就会各自演化。本轮的收口是 `findMethodInClass` / `findMethodInHierarchy` 两个原语。
+
+---
+
+## B24. 成员方法的**名字隐藏**：派生类一声明同名方法，基类整族应被隐藏
+
+**来源**：本轮写 `tests/mi/test_mi_13_virtual_overload_slots.cpp` 时被 clang oracle 当场抓住 ——
+用例里原本有一句 `d.f(2)`（`d` 是 `Derived`，`f(int)` 只在 `Base` 里），clang 直接拒收：
+
+```text
+error: too many arguments to function call, expected 0, have 1; did you mean 'Base::f'?
+```
+
+而 minicc 编译 rc=0、运行也"看着对"（调到了 `Base::f(int)`）。
+
+**标准视角**（[class.member.lookup]/3）：派生类作用域里**只要出现过某个名字**，
+基类中**所有**同名声明就被隐藏（`using` 声明可以把它们重新拉进来）。
+"隐藏"是按**名字**发生的，不是按签名 —— 所以 `Derived::f()` 一个无参函数，
+就足以让 `Base::f(int)`、`Base::f(S)` 全部不可见。
+
+**根因**：`findMethodInHierarchy` 的遍历是"本类找不到**这个名字**才往基类走"，
+而"找得到"的判据是**裸名**（`findMethodInClass(clsName, name, -1)`）。
+于是它把被隐藏的那一族也捞了出来 —— 又是"身份比裸名宽"的老毛病，
+只是这次宽的方向是**该藏没藏**（B20 缺陷 c / B22 是**该分没分**）。
+
+**修法（未做）**：隐藏判据要按名字的**作用域**判，而不是按签名 ——
+先查派生类里这个名字有没有**任何**声明（`decl->methods` 里 `name` 相等即算），
+有 ⇒ 基类整族不参与候选；没有 ⇒ 才往基类走。
+注意这与 B22 的"候选集 + 择优"是**两个正交的筛选**：
+隐藏先砍掉一整族（按名字），重载决议再从中择优（按类型）。
+
+**影响面**：小（接受非法程序；不产生错误代码，但把 clang 会拒收的程序放行了）。
+**回归用例**：本轮**不加**（不把失败固化成契约，同 B21/B22 的处理）。
+`tests/mi/test_mi_13_*.cpp` 的文件头已记下这条边界与"为什么用例绕开了它"。
+
+**状态**：⬜ 未修（已定位到 `findMethodInHierarchy`）

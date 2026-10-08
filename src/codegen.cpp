@@ -1754,11 +1754,19 @@ void CodeGen::visit(CallExpr& expr) {
                 auto it = m_classTypes->find(objType->name);
                 if (it != m_classTypes->end()) {
                     auto& layout = it->second->classLayout;
-                    // 在该类的 vtable 条目里找同名方法（子串匹配，教学简化；
-                    // 完备实现应精确比较 mangled 签名）；命中 → 虚调用，
-                    // entry.index 就是语义阶段定好的 vtable 下标
+                    // 在该类的 vtable 条目里找**本次调用真正瞄准的方法**；命中 → 虚调用，
+                    // entry.index 就是语义阶段定好的 vtable 下标。
+                    // ★ 判据必须与 Sema 同源（BUGS.md B22）：此前按 `entry.mangledName`
+                    //   子串包含裸名来认，于是 `virtual int f(); int f(int);` 里
+                    //   `c.f(2)` 被 `C_f` 的子串骗成虚调用 —— 经槽 0 调到无参的 f()，
+                    //   实测返回 255（静默算错）。Sema 早已把选中的方法符号回填进
+                    //   resolvedCalleeSymbol（承 B10 的机制），按它精确比对即可。
+                    //   回填为空时退回旧的名字启发式（教学简化，保持既有行为）。
                     for (auto& entry : layout.vtableEntries) {
-                        if (entry.mangledName.find(mem->memberName) != std::string::npos) {
+                        bool hit = !mem->resolvedCalleeSymbol.empty()
+                            ? entry.mangledName == mem->resolvedCalleeSymbol
+                            : entry.mangledName.find(mem->memberName) != std::string::npos;
+                        if (hit) {
                             // 这是虚函数调用！
                             // ★ 喂入 this：emitVirtualCall 约定"入口时对象
                             //   地址在 rdi"，此处先求值对象表达式（"." 取

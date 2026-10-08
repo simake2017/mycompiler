@@ -80,6 +80,7 @@ add_executable(unit_tests
     tests/unit/test_ast_visitor.cpp
     tests/unit/test_symbol_consistency.cpp
     tests/unit/test_vtable_symbols.cpp
+    tests/unit/test_member_identity.cpp
     tests/unit/test_layout_lookup.cpp
     tests/unit/test_ttp_signature.cpp
     tests/unit/test_nttp_type_domain.cpp

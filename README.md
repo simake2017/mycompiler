@@ -413,6 +413,8 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_71_error_virtual_member_template.cpp` | 错误：成员函数模板不能是 `virtual` | [temp.mem]/2 末句：member function templates shall not be virtual —— 虚表要求每个动态类型一条固定条目，而模板实例是**按需产生**的，声明处根本不知道要有几条。文案与 clang 逐字相同 |
 | `tests/lang/test_basics_03_virtual_with_params.cpp` | **带参虚函数**的 vtable 槽符号（★ 回归 [B20](docs/BUGS.md) 缺陷 a） | 槽里的 `.quad <sym>` 与函数定义的 `.globl <sym>` 必须**逐字相同**（链接器只认裸字符串）。定义点按"带形参 ⇒ 追加 `_<形参个数>`"命名，槽位一度硬拼 `类名_方法名` ⇒ `undefined reference to 'A_f'`。无参虚函数两侧恰好一致，所以此前测试全绿 |
 | `tests/mi/test_mi_12_secondary_inherited_slot.cpp` | **次基类未覆写的槽该指谁**（★ 回归 [B20](docs/BUGS.md) 缺陷 b） | 槽里该放谁的名字取决于**谁提供了实现**，不是**这是谁的表**：`Diamond : P, Q` 的 Q 次表槽必须透传 `X_f`（旧实现重造成 `Q_f` ⇒ 凭空捏造符号）。另一半：本类覆写次基类虚函数时仍走 thunk（this 调整 =-16） |
+| `tests/lang/test_basics_04_member_overload_same_arity.cpp` | **同名同个数的成员重载**（★ 回归 [B22](docs/BUGS.md)） | 身份 = 名字 + **形参类型**，不是名字 + 个数：`f(int)`/`f(S)` 前者靠"个数"分不开 ⇒ 汇编期撞符号 `C_f_1`。同一条判据有**四个落点**（符号定名 / vtable 槽位身份 / 成员调用选定 / 构造函数选定），必须共用 `pickBestByArgs` + `paramTypeChain` |
+| `tests/mi/test_mi_13_virtual_overload_slots.cpp` | **虚函数槽的身份不是裸名**（★ 回归 [B20](docs/BUGS.md) 缺陷 c） | `virtual int f(); int f(int);` 里非虚的后者会认领前者的槽并被误标 virtual ⇒ `c.f(2)` 走虚调用跳进 `f()`（clang rc=0、minicc 编译 rc=0 但**运行返回 255**）。判据 =（裸名 + 形参类型链），即 [class.virtual]/2 的覆写判据 |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -458,6 +460,8 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 38. test_tmpl_70_member_template_static.cpp ← ★ 说明符写在形参表【之后】：位置即语义（B19）
 39. tests/lang/test_basics_03_virtual_with_params.cpp ← ★ 虚函数带参数后，符号名的后缀规则必须两处同源（B20a）
 40. tests/mi/test_mi_12_secondary_inherited_slot.cpp ← ★ 次表槽放"谁实现的"，不是"谁的表"（B20b）
+41. tests/lang/test_basics_04_member_overload_same_arity.cpp ← ★ 身份 = 名字 + 形参类型，四个落点共用一条判据（B22）
+42. tests/mi/test_mi_13_virtual_overload_slots.cpp ← ★ 槽位身份不是裸名（B20c）；单测 MemberIdentity.* 6 例
 ```
 
 ---
