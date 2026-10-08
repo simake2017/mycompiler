@@ -1105,6 +1105,104 @@ else if (!a.valueType->equals(p.nonType)) {
 
 ---
 
+## B18. 类模板里的成员模板在实例类里丢失
+
+**复现**
+
+```cpp
+template <class T>
+struct Box {
+    template <class U>
+    U pick(U x) { return x; }
+};
+int main() { Box<int> b; return b.pick(7); }
+```
+
+minicc：`[Semantic Error] 3:34: No member 'pick' in class 'Box_int'`（rc=1）
+clang++-18 `-std=c++20`：正常，rc=7。
+
+**对照组**（把缺口钉死在同一处）：同样的成员模板放在**普通类**里（
+`struct Acc { template<class T> T add(T x); };`，见 tests/tmpl/test_tmpl_56）
+一路正常。所以缺的不是"成员模板"这个特性，而是**"类本身也是模板"时多出来的那一跳**。
+
+**性质**：**错误拒绝合法程序**（与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、
+[B17](#b17-值位实参要求形态精确相等拒收合法程序) 同类）。★ 症状停在**语义期**，
+而解析期一切正常 —— 日志里明明白白印着
+`[parse:member] ★ 'pick' 是成员模板（1 个模板形参，[temp.mem]）`，
+"解析对了"不等于"这条特性通了"。
+
+**根因**：两层模板形参的绑定时机不同，而"类实例化"这一步只搬了一半东西。
+
+| 层 | 谁绑定 | 何时绑定 |
+|---|---|---|
+| 外层 `T` | 类实例化（`Box<int>`） | 建实例类那一刻 |
+| 内层 `U` | 调用点实参推导（`b.pick(7)`） | 每次调用 |
+
+于是"类实例化"必须产出：把蓝图里的成员模板**复制一份、只替换外层形参、保留内层形参**，
+挂到实例类名下。旧版三个环节恰好都缺：
+
+1. `instantiateClassTemplate`（src/template_instantiation.cpp）克隆了字段（步骤 4）、
+   方法（步骤 5）、类内类型别名（步骤 5.5），**唯独没有 `memberTemplates`**；
+2. `src/semantic_analyzer.cpp:1822` 那张成员模板登记表挂在 `processClassDecl` 里
+   —— 而类模板蓝图在 Pass 1 只登记模板（`↳ class template 'Box' registered`），
+   **从不经过 `processClassDecl`** ⇒ 蓝图那张表从来没进过注册表；
+3. 调用点 `inferCall` 查的键是**对象的类名**（src/semantic_analyzer.cpp:3375
+   `m_classMemberTemplates.find(clsName)`）⇒ `"Box_int"` 查不到 ⇒ No member。
+
+**修法**：`instantiateClassTemplate` 新增步骤 **5.6 克隆成员模板**（
+`mt` 取自 `templateDecl->classTemplate` —— 本次**命中**的那份蓝图，主模板 / 偏特化 /
+全特化一视同仁）：
+
+```cpp
+for (auto& mt : templateDecl->classTemplate->memberTemplates) {
+    auto clonedMt = std::make_shared<TemplateDecl>();
+    clonedMt->templateParams = mt->templateParams;   // 内层形参 U 原样带过
+    clonedMt->typeParams     = mt->typeParams;
+    clonedMt->isMemberTemplate = true;
+    clonedMt->funcTemplate   = cloneMethod(mt->funcTemplate, subst, instanceName);
+    newClass->memberTemplates.push_back(clonedMt);
+}
+```
+
+★ 关键在 `subst` 里**只有外层形参**（`{T → int}`）：`substituteType` 的 Case 1
+对不在表中的名字走"原样保留"分支（src/template_instantiation.cpp 的注释早已写明
+"如外层模板的形参"，这次是它第一次真正派上用场）。
+实跑日志即证据：`[clone:method] 'convert' return type: T → int` 与
+`[clone:method] param 'x' : U → U` **同一行输出里两种命运**。
+
+对照 clang：`SemaTemplateInstantiateDecl.cpp` 的 `InstantiateDecl` 对 `TemplateDecl`
+走 `TransformTemplateDecl` —— 同样是"带着类的实参重建一遍、内层形参保持未绑定"。
+
+**三种错法各有各的症状**（本条的判据表）：
+
+| 做法 | 症状 | 严重性 |
+|---|---|---|
+| 忘了搬（旧版） | `No member 'pick' in class 'Box_int'` | 错误**拒绝合法程序** |
+| 搬了、但替换**就地改蓝图** | 第二个实例串到第一个的绑定（`Box<long>` 的 `convert` 也返回 `int`） | **静默算错** |
+| 把内层 `U` 也替换掉 | 调用点无可推导 ⇒ 每个调用都推不出来 | 错误拒绝 |
+
+**影响面**：小-中。原先拒收合法程序；修复后既有 **111 个集成用例逐字节零漂移**
+（只有新增用例进基线）—— 反过来证明**此前没有任何既有用例覆盖"类模板 × 成员模板"
+这个组合**：一个真缺口可以长时间藏在"特性各自都有测试"的缝里。
+
+**修复记录**：`src/template_instantiation.cpp` instantiateClassTemplate 步骤 5.6
+（+ 日志 `║ ── Member Template Substitution ──`，仅在该表非空时打印 ⇒ 既有用例零漂移）。
+
+**回归用例**：
+· 集成 `tests/tmpl/test_tmpl_69_member_template_in_class_template.cpp`
+  （外层 T 兑现 / 两实例不串味 / 内层 U 两实例两符号 / 偏特化蓝图同样生效）
+· 单测 `tests/unit/test_member_template_in_class_template.cpp`（`MemberTemplateInClassTemplate.*` 5 例）
+
+**突变负向验证**（把步骤 5.6 的循环整体停掉后实跑）：
+
+| 突变 | 红掉的用例 |
+|---|---|
+| `for (auto& mt : templateDecl->classTemplate->memberTemplates)` 换成空容器 | 本套件 **5/5 全红**（`InstanceCarriesMemberTemplates` / `OuterBoundInnerKept` / `InstancesDoNotShareBlueprintState` / `DistinctInnerArgsDistinctSymbols` / `EveryCallResolves`） |
+
+**状态**：✅ 已修
+
+---
+
 ## 小结 字符串兼任 ID 与路径
 
 三条 bug 的最小复现各不相同，根因却是同一句话：**把"显示名"当成了"索引"。**

@@ -81,6 +81,33 @@ clang 里那是未决名字，同样不合法。
 本项目的调用点查找简化为"先到先得 + 精确匹配"，故把成员模板放在后面查询，
 效果与标准的"非模板优先"一致。
 
+### 1.5 两层形参：成员模板住在【模板类】里时多一跳
+
+```cpp
+template <class T>                       // ← 外层形参：类模板的
+struct Box {
+    T seed;
+    template <class U>                   // ← 内层形参：成员模板自己的
+    T convert(U x) { return seed; }
+};
+```
+
+这个写法有**两层**模板形参，而它们的**绑定时机不同**：
+
+| 形参 | 谁绑定 | 何时绑定 | 绑定之后 |
+|---|---|---|---|
+| 外层 `T` | 类实例化 `Box<int>` | 用到 `Box<int>` 那一刻 | 实例类里再也没有 `T` |
+| 内层 `U` | 调用点实参推导 `b.convert('a')` | 每次调用 | 每个实参类型一份实例 |
+
+于是"类实例化"这一步必须额外产出一样东西：把蓝图里的成员模板**复制一份、
+只替换外层形参、保留内层形参**，挂到实例类名下。这一跳在 §1.1~§1.4 里**不存在**
+（那里类本身是普通类，没有"随类实例化被搬运"这回事）—— 它也正是
+[docs/BUGS.md B18](../BUGS.md) 的缺口所在：漏了这一跳，实例类手里就是一张空表。
+
+三种错法的症状各不相同（判据表见 B18）：**忘了搬** ⇒ 错误拒绝合法程序；
+**搬了但就地改蓝图** ⇒ 第二个实例串到第一个的绑定（静默算错）；
+**把内层 `U` 也替换掉** ⇒ 调用点无可推导。
+
 ---
 
 ## 2. 数据流（ASCII 图）
@@ -139,6 +166,7 @@ clang 里那是未决名字，同样不合法。
 | 9 | `src/semantic_analyzer.cpp` · 新增 `getOrInstantiateMemberFunction` | 与自由函数模板同构的实例化入口 |
 | 10 | `src/template_instantiation.cpp` · `instantiateFunction` | 加 `ownerClassName` 参数；成员路径换符号规则 |
 | 11 | `src/template_instantiation.cpp` · `sanitizeSymbolChars` | 从 `instantiate()` 内联代码中**抽出为公共函数** |
+| 12 | `src/template_instantiation.cpp` · `instantiateClassTemplate` | 步骤 **5.6**：类实例化时把蓝图的成员模板复制一份（只替换外层形参）挂到实例类名下（见 §3.3 / B18） |
 
 ### 3.1 声明提到分支之前：又一次"位置即语义"
 
@@ -157,6 +185,34 @@ clang 里那是未决名字，同样不合法。
 
 故抽成 `namespace minicc` 下的自由函数，头文件声明，两处共用。
 这与 `emitFunction` 的 `hasThis` 被复制成两份那次是同一类教训。
+
+### 3.3 类实例化时把成员模板搬过去（BUGS.md B18）
+
+`instantiateClassTemplate` 原先把蓝图拆成三份搬进实例类：字段（步骤 4）、
+方法（步骤 5）、类内类型别名（步骤 5.5）—— 加上第 12 项改动（步骤 **5.6**）才补齐：
+
+```cpp
+for (auto& mt : templateDecl->classTemplate->memberTemplates) {   // ★ 本次【命中】的蓝图
+    auto clonedMt = std::make_shared<TemplateDecl>();
+    clonedMt->templateParams   = mt->templateParams;   // 内层 U 原样带过
+    clonedMt->typeParams       = mt->typeParams;
+    clonedMt->isMemberTemplate = true;
+    clonedMt->funcTemplate     = cloneMethod(mt->funcTemplate, subst, instanceName);
+    newClass->memberTemplates.push_back(clonedMt);
+}
+```
+
+★ 替换表 `subst` 里**只有外层形参**（`{T → int}`），故内层 `U` 走到
+`substituteType` Case 1 的"不在表中则原样保留"分支 —— 实跑日志把这件事印在同一屏里：
+
+```text
+    [clone:method] 'convert' return type: T → [subst] ★ TemplateParam 'T' → 'int'
+    [clone:method]   param 'x' : U → U
+  ║   member template 'convert' <U> → 挂到实例类 'Box_int'（内层形参不替换）
+```
+
+注意 `cloneMethod` 是**深拷贝**：这一步必须是"复制 + 替换"，不能就地改写蓝图节点
+（否则第二个实例会串到第一个的绑定上 —— 既有测试看不出，因为那时只有一份实例）。
 
 ---
 
@@ -184,7 +240,19 @@ int main() { Acc a(10); int r1 = a.add(5); Acc b(100); int r2 = b.add(7); return
 EOF
 ./minicc /tmp/mt2.cpp -o /tmp/mt2 && /tmp/mt2; echo $?   # 期望 0
 
-# ④ 全量回归
+# ④ 成员模板住在【类模板】里（§1.5，B18 的回归）
+./minicc tests/tmpl/test_tmpl_69_member_template_in_class_template.cpp -o /tmp/t69 && /tmp/t69; echo $?
+clang++-18 -std=c++20 tests/tmpl/test_tmpl_69_member_template_in_class_template.cpp -o /tmp/t69c && /tmp/t69c; echo $?
+
+# ⑤ 看"只替换外层、保留内层"的一屏证据（同一行输出里两种命运）
+./minicc tests/tmpl/test_tmpl_69_member_template_in_class_template.cpp -o /tmp/t69 2>&1 \
+  | grep -E "Member Template Substitution|clone:method|member template '"
+# ⇒ ║ ── Member Template Substitution ──
+#    ║   member template 'convert' <U> → 挂到实例类 'Box_int'（内层形参不替换）
+#      [clone:method] 'convert' return type: T → int
+#      [clone:method]   param 'x' : U → U
+
+# ⑥ 全量回归
 ./build.sh && ctest --test-dir build-linux -j6 && ./logdiff.sh diff
 ```
 
@@ -201,6 +269,10 @@ EOF
 | 模板模板参数的成员模板 | 上述两者叠加 | docs/learn/33 §5 已记 |
 | 静态成员模板的 this 省略 | `static` + 成员模板叠加 | 未验证 |
 
+★ 这张表原本漏了一行：**"成员模板住在类模板里"**（§1.5）—— 它不是"没做"，
+而是"以为做了、其实是坏的"（[B18](../BUGS.md)），故当时没被列进来。
+教训：边界表要按**组合**（特性 × 特性）列，只按特性列会漏掉交叉点上的缝。
+
 ---
 
 ## 6. clang 源码对照表
@@ -213,6 +285,7 @@ EOF
 | `DeduceTemplateArguments`（对成员/自由**同一份**） | `TemplateDeducer::deduce`（**直接复用**） | 同为教学精简版 |
 | `Sema::BuildCXXMemberCallExpr` → `CXXMethodDecl*` | `MemberExpr::resolvedCalleeSymbol` | 存符号名而非 Decl 指针（CodeGen 只需要符号） |
 | `ItaniumMangle::mangleFunctionEncoding`（成员模板实例仍编成 `_ZN…`） | `sanitizeSymbolChars(类名_方法名) + 实参后缀` | 不走 Itanium —— 保持与普通成员调用约定一致 |
+| `SemaTemplateInstantiateDecl.cpp` · `InstantiateDecl` 对 `TemplateDecl` 走 `TransformTemplateDecl`（带着类的实参重建、内层形参保持未绑定） | `instantiateClassTemplate` 步骤 5.6（§3.3） | 只替换外层形参；不重建 Decl 层级，直接克隆 `TemplateDecl` |
 
 ---
 

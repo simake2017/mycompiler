@@ -408,6 +408,7 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_66_error_nttp_unsigned_negative.cpp` | 错误：负值给无符号形参 | `G<-1>`：常量表达式**不豁免**负值→无符号的窄化（运行期 [conv.integral] 取模是另一回事） |
 | `test_tmpl_67_error_nttp_char_narrowing.cpp` | 错误：值实参窄化到 `char` | `D<300>`：300 ∉ [-128,127]。诊断必须点名**形参声明的那一个**类型（`char` ≠ `signed char` ≠ `unsigned char`） |
 | `test_tmpl_68_nttp_auto_param.cpp` | **`template<auto V>`** 类型由实参反推 | [temp.param]/6 的 deduced non-type parameter：`K<4>`(int) 与 `K<4L>`(long) 是**两个实例**。★ 顺带修掉一个**静默撞键**：实例名/缓存键曾用 `TemplateArg::toString()`（对两者都产 `"4"`）⇒ 第二个静默复用第一个。现走 `losslessArgumentsKey`，形态只在 `auto` 位写入 |
+| `test_tmpl_69_member_template_in_class_template.cpp` | **类模板里的成员模板**（★ 回归 [B18](docs/BUGS.md)） | 两层模板形参、**绑定时机不同**：外层 `T` 由类实例化绑定（`Box<int>` ⇒ `int`），内层 `U` 由调用点推导绑定（`b.pick('a')` ⇒ `char`）。故"类实例化"必须把成员模板**复制一份、只替换外层形参、保留内层形参**挂到实例类名下。三种错法各有症状：忘了搬 ⇒ `No member 'pick' in class 'Box_int'`；就地改蓝图 ⇒ 第二个实例串到第一个的绑定（静默算错）；把内层也替换掉 ⇒ 调用点无可推导 |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -449,6 +450,7 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 34. test_tmpl_53_template_template_param.cpp ← ★ 模板模板参数：形参表里的第三种形态
 35. test_tmpl_56_member_templates.cpp ← ★ 成员模板：规则与函数模板逐字相同
 36. test_tmpl_57_ttp_signature_match.cpp ← ★ 模板位的签名匹配：位数 + 逐位 kind（口径来自 clang 探针）
+37. test_tmpl_69_member_template_in_class_template.cpp ← ★ 两层形参：外层随类实例化、内层随调用推导
 ```
 
 ---

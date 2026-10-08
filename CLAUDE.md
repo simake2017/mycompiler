@@ -275,6 +275,31 @@ mangling 12/12 与 clang **逐字符相同**（`b c a h s t i j l m x y`，含
 全量 239 → **249** 单测 / 110 集成测试；**有意日志漂移**只有
 `[parse:targ] … (形态 X)` 一处（10 个既有文件），已重刷基线。
 
+✅ **类模板里的成员模板（bug 修复，docs/BUGS.md B18）** ——
+**症状**：`template<class T> struct Box { template<class U> U pick(U x); };` 的
+`b.pick(7)` 报 `[Semantic Error] No member 'pick' in class 'Box_int'`（rc=1）。
+解析层完全正常（`[parse:member] ★ 'pick' 是成员模板` 照印），断在语义层。
+**根因**：这个写法有**两层模板形参、绑定时机不同** —— 外层 `T` 由类实例化绑定，
+内层 `U` 由调用点推导绑定；而"类实例化"这一步只搬了字段/方法/类内别名，
+**没搬 `memberTemplates`**；同时成员模板注册表挂在 `processClassDecl` 里
+（semantic_analyzer.cpp:1822），而**类模板蓝图从不经过 processClassDecl**
+（Pass 1 只打 `↳ class template 'Box' registered`）⇒ 蓝图那张表从没进过注册表
+⇒ 调用点查 `m_classMemberTemplates["Box_int"]` 落空。
+**修法**：`instantiateClassTemplate` 新增步骤 **5.6**：把本次**命中**的那份蓝图
+（主模板/偏特化/全特化一视同仁）的成员模板 `cloneMethod` 一份挂到实例类，
+**只替换外层形参**（`subst` 里只有 T ⇒ `substituteType` Case 1 对 U 走
+"不在表中则原样保留"，那条注释里早就写着"如外层模板的形参"，这是它第一次真正派上用场）。
+**三种错法三种症状**（本条的价值主要在判据表）：忘了搬 ⇒ 错误**拒收合法程序**；
+搬了但**就地改蓝图** ⇒ 第二个实例串到第一个的绑定（**静默算错**）；
+把内层 `U` 也替换掉 ⇒ 调用点无可推导。
+测试 tests/tmpl/test_tmpl_69（含偏特化蓝图一例）+ 单测
+tests/unit/test_member_template_in_class_template.cpp（`MemberTemplateInClassTemplate.*`
+5 例，断言守恒/分层/隔离/符号一致四条不变量；**突变验证：停掉 5.6 的循环 ⇒ 5/5 全红**）；
+文档 docs/learn/34 新增 §1.5 / §3.3（并补一句："边界表要按**组合**列，
+只按特性列会漏掉交叉点上的缝" —— 这张表当时就漏了"类模板×成员模板"）。
+全量 249 → **262** 单测（ctest 257 → 262）/ 111 集成测试；既有用例**逐字节零漂移**
+（反证此前**没有任何用例覆盖这个组合**），已重刷基线。
+
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、

@@ -506,6 +506,46 @@ ClassDeclPtr TemplateInstantiator::instantiate(
             sub ? sub->toString() : "?");
     }
 
+    // 5.6 克隆成员模板（[temp.mem]）—— 类模板体里的成员模板
+    // ★ 为什么必须克隆：成员模板的推导与实例化是在【对象的类】那张表上做的
+    //   （Sema::m_classMemberTemplates[类名]，见 semantic_analyzer.cpp 的 inferCall）。
+    //   而蓝图类根本不在 m_classDecls 里 —— `template<class T> struct Box {...}` 的
+    //   Pass 1 只登记模板（"class template 'Box' registered"），蓝图**从不经过**
+    //   processClassDecl，也就永远不会登记成员模板表。于是实例类 Box_int 手里
+    //   一张空表 ⇒ `Box<int> b; b.pick(7);` 报 "No member 'pick' in class 'Box_int'"
+    //   （docs/BUGS.md B18：解析层通、语义层断）。
+    // ★ 只替换【外层】形参：subst 里只有 T，成员模板自己的 U 不在表中 ⇒
+    //   substituteType 的 Case 1 走"不在表中则原样保留"分支。这正是成员模板
+    //   "内层形参留到调用点再推导"的前提 —— 若把 U 也替换掉就没有可推导的东西了。
+    // demo: `template<class T> struct Box { template<class U> T convert(U x); };`
+    //       Box<int> ⇒ 实例里的成员模板变成 `template<class U> int convert(U x)`
+    //       调用 b.convert(7) ⇒ U := int ⇒ 符号 Box_int_convert_int
+    // 对照 clang：主模板的成员模板在特化里被 TreeTransform 带着类的实参重建
+    //   （SemaTemplateInstantiateDecl.cpp 的 InstantiateDecl → TransformTemplateDecl），
+    //   内层形参保持未绑定。
+    if (!templateDecl->classTemplate->memberTemplates.empty()) {
+        std::cout << "  ║ ── Member Template Substitution ──\n";
+    }
+    for (auto& mt : templateDecl->classTemplate->memberTemplates) {
+        auto clonedMt = std::make_shared<TemplateDecl>();
+        clonedMt->location        = mt->location;
+        clonedMt->templateParams  = mt->templateParams;   // 内层形参 U 原样带过
+        clonedMt->typeParams      = mt->typeParams;
+        clonedMt->isMemberTemplate = true;
+        clonedMt->funcTemplate    = cloneMethod(mt->funcTemplate, subst, instanceName);
+
+        // 内层形参名列表（只为日志可读：说明"这一位没被替换，等调用点推导"）
+        std::string innerNames;
+        for (size_t i = 0; i < mt->templateParams.size(); i++) {
+            if (i > 0) innerNames += ", ";
+            innerNames += mt->templateParams[i]->name;
+        }
+        std::cout << std::format(
+            "  ║   member template '{}' <{}> → 挂到实例类 '{}'（内层形参不替换）\n",
+            mt->funcTemplate->name, innerNames, instanceName);
+        newClass->memberTemplates.push_back(clonedMt);
+    }
+
     // 6. 生成 mangled name
     std::string mangledName = NameMangler::mangleTemplateInstance(
         templateDecl->classTemplate->name, args);
