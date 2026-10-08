@@ -1180,23 +1180,43 @@ void SemanticAnalyzer::processDecl(DeclPtr decl) {
 
     // 一次 switch（跳表）分派。static_pointer_cast 安全的前提：节点 kind 由构造函数
     // 设定，恒等于自身类型（见 ast_visitor.h 的标签不变式）。
+    // 各支上方的 `数据事例` = 「源码 ⇒ Pass 1 的日志行」，全部出自
+    // demos/core/04_decl_kinds.cpp 的编译输出（文件头有复现命令）。
     switch (decl->kind) {
+        // ① 数据事例：`struct Box { int v; Box(); };`
+        //    ⇒ [register] class 'Box'
+        //       （随后跟着 field/method 逐条、══ Memory Layout ══ 与 vtable/RTTI 注入）
         case NodeKind::Class:
             processClassDecl(std::static_pointer_cast<ClassDecl>(decl)); break;
+        // ② 数据事例：`template<class T> struct Wrap { T x; };`
+        //    ⇒ [register] template <typename T> Wrap (class blueprint stored, not analyzed)
+        //    另一形态（带外壳的推导指引）：
+        //    `template<class T> Wrap(T) -> Wrap<T>;`
+        //    ⇒ [register] template <typename T> deduction guide for 'Wrap' (rule stored, …)
         case NodeKind::Template:
             processTemplateDecl(std::static_pointer_cast<TemplateDecl>(decl)); break;
+        // ③ 数据事例：`int g = 3;`（初始化式先折叠，再登记）
+        //    ⇒ [infer] IntLiteral(3) → int  ⇒ [register] global variable 'g' : int
         case NodeKind::GlobalVar:
             processGlobalVarDecl(std::static_pointer_cast<GlobalVarDecl>(decl)); break;
+        // ④ 数据事例：`enum Color { RED, GREEN };` ⇒ [register] enum 'Color' (2 items)
         case NodeKind::Enum:
             processEnumDecl(std::static_pointer_cast<EnumDecl>(decl)); break;
-        case NodeKind::Namespace:
-            processNamespaceDecl(std::static_pointer_cast<NamespaceDecl>(decl)); break;
+        // ⑤ 数据事例：`using Int = int;` ⇒ [register] type alias 'Int' = int
         case NodeKind::TypeAlias:
             processTypeAliasDecl(std::static_pointer_cast<TypeAliasDecl>(decl)); break;
+        // ⑥ 数据事例：`namespace N { struct S { int w; }; }`
+        //    ⇒ [namespace] enter namespace 'N' ⇒ [register] class 'N::S'（里面的类/函数随它递归）
+        case NodeKind::Namespace:
+            processNamespaceDecl(std::static_pointer_cast<NamespaceDecl>(decl)); break;
         // ── 非模板推导指引：`Box(int) -> Box<int>;` —— 顶层独立形态（不带 template<>
         //    外壳），单独接一支；带外壳的那种随 TemplateDecl 走 processTemplateDecl。
+        // ⑦ 数据事例：`Wrap(int) -> Wrap<int>;`
+        //    ⇒ [register] deduction guide for 'Wrap' (#2) registered
+        //       （#N 是全局序号：带外壳的那条先登记 ⇒ 它是 #1、本条 #2）
         case NodeKind::DeductionGuide:
             registerDeductionGuide(std::static_pointer_cast<DeductionGuideDecl>(decl)); break;
+        // default 数据事例：`int add(int a, int b) { return a + b; }` ⇒ **无日志**
         default:
             break;   // 函数声明等由 analyze 的三趟流程各自处理，不经过这里
     }
