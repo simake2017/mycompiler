@@ -33,6 +33,7 @@
 | [B18](#b18-类模板里的成员模板在实例类里丢失) | 类模板里的成员模板没被带进实例类 ⇒ 实例上调成员模板全线失败 | `src/template_instantiation.cpp` instantiateClassTemplate | 中（合法程序不可用；同批牵出 static/virtual 位置） | ✅ 已修 |
 | [B19](#b19-static--virtual-的识别位置写反标准写法被拒非法写法被收) | `template<class U> static U f(U)` 被拒、`static template<…>` 反被收 | `src/parser.cpp` 成员模板分支 | 小（两个方向都反了） | ✅ 已修 |
 | [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号 | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另暴露一条静默算错，缺陷 c 未修） | ✅ 缺陷 a/b 已修 |
+| [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'` | `src/semantic_analyzer.cpp` inferVar（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ⬜ 未修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -1390,6 +1391,66 @@ minicc 编译 rc=0 但**运行返回 255**（静默算错）。判据应是（�
 | 次表条目改回 `baseName + "_" + 裸名` | 只有 `...SecondaryInheritedSlotKeepsUpstreamSymbol` 红（外科级定位） |
 
 **状态**：✅ 缺陷 a、b 已修；⚠ 缺陷 c 未修（见上）
+
+---
+
+## B21. 限定名 `S::v` 访问成员数据被拒收
+
+**复现**（同一个类里两种限定名，一个通一个不通）
+
+```cpp
+struct S {
+public:
+    int v;
+    int f() { return 5; }
+    int g() { return S::v; }     // ① 限定名的【数据】成员
+    int h() { return S::f(); }   // ② 限定名的【函数】成员
+};
+```
+
+| | ① `S::v` | ② `S::f()` |
+|---|---|---|
+| minicc | `[ERROR] [Semantic Error] 5:22: Undefined variable 'S::v'`（rc=1） | rc=0 |
+| clang++-18 `-std=c++20` | rc=0（`-Xclang -ast-dump` 见下） | rc=0 |
+
+**性质**：**拒收合法程序**。与 [B9](#b9-struct-的默认继承级别被当成-private-处理)、
+[B12](#b12-继承来的成员方法查不到)、[B17](#b17-值位实参要求形态精确相等拒收合法程序)、
+[B18](#b18-类模板里的成员模板在实例类里丢失) 同类。（② 能过是**侥幸**：inferCall 有一条
+限定名分支认 `类名_方法名` 的 mangled 符号，与"成员访问"无关。）
+
+**clang 的落点（oracle）**：`S::v` 在成员函数体内是**隐式 this 的成员访问** ——
+[expr.prim.id.general]/3，AST 里就是一个正牌 MemberExpr：
+
+```text
+`-ReturnStmt
+    `-MemberExpr  'int' lvalue ->v        ← 注意是 ->v，base 是隐式 this
+        `-CXXThisExpr  'S *' implicit this
+```
+
+**根因**：`A::B` 在 Parser 就被**拼成一整个字符串**（parser.cpp:2679 的
+`while (::) name += "::" + ident`），此后全项目只按"名字串"查表。而三条限定名通路
+覆盖的分别是 **函数**（inferCall 的限定名分支）、**类内类型别名**（符号表 `Cls::alias`）、
+**嵌套类型名**（resolveType 的 nested-name 分支）—— **数据成员一条都没有**：
+inferVar 只认裸字段名（外加"当前类"的类作用域回退），查 `"S::v"` 这个字符串必然落空。
+
+★ 有意思的是**方向正好错开**：本项目唯一从 `NodeKind::Member` 分支过的限定名是
+`Cls<int>::value`（Parser 造 `isTypeAccess=true` 的 MemberExpr，供 `foldStaticConst`
+折叠静态常量）—— 而它在 clang 里是 **DeclRefExpr**，不是成员表达式。也就是说
+"clang 里是 MemberExpr 的形态我们收不到，我们造 MemberExpr 的形态 clang 不是"。
+
+**要修的话**：inferVar 里先把 `A::B` 按 `::` 切开，若限定者是**当前类**（或落在其基类链上）
+则退化为"字段查找 + 隐式 this"，与 `b`（裸名走 m_currentClassName 回退）汇成同一条路；
+`self()` 那条 `this->b` 已经能跑，收口点是现成的。
+判据要按 [expr.prim.id.general]/3 写：**限定者是不是一个类型** 决定这是不是隐式成员访问
+（命名空间限定名仍走符号表）。
+
+**影响面**：小（写法少见，且只是**多写**了一个限定者；去掉 `S::` 就恢复正常）。
+但属"拒收合法程序"，与 B12 同族 —— 记在这里是因为**推导分支表的边界**值得留痕。
+
+**回归用例**：暂**不加**钉住现状的用例 —— 那会把失败固化成契约
+（正是 logdiff 教训：基线会把 rc=1 也固化成"契约"）。修完再补正例。
+
+**状态**：⬜ 未修
 
 ---
 

@@ -3032,6 +3032,13 @@ TypePtr SemanticAnalyzer::inferType(ExprPtr expr) {
         // ⑩ 数据事例：dr.d      ⇒ [member] Derived.d → int    (offset=16, size=4)
         //              pb->b     ⇒ [member] Base.b → int    (offset=8, size=4)   ← 箭头先解指针
         //              dr.value() ⇒ [member] Derived.value() → int    (method via 'Base')
+        //    ★ 限定名一般【不走这一支】：`A::B` 在 Parser 就被拼成一整个名字串
+        //      （parser.cpp:2679 的 VarExpr("A::B")），由符号表按字符串查 —— 本支只认
+        //      "有对象"的访问（[expr.ref] 要求左边是 postfix-expression）。唯一例外是
+        //      `Cls<int>::value`：模板 id 那条由 Parser 造 isTypeAccess 的 MemberExpr
+        //      从这儿过（foldStaticConst 消费）—— 而它在 clang 里恰恰是 DeclRefExpr。
+        //      反过来，clang 里【真是】MemberExpr 的 `S::v`（隐式 this，见 BUGS.md B21）
+        //      本支收不到，现在被 inferVar 拒收。
         case NodeKind::Member:
             type = inferMember(static_cast<MemberExpr&>(*expr)); break;
         // ⑪ 数据事例：new Base() ⇒ [new] Base → Base*    (size=16 bytes, args=0)
