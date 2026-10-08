@@ -48,7 +48,21 @@ clang 摆放每个成员时从 `Context.getTypeInfoInChars(T)` 一次取回
 `addr(o) + offset(f) + offset(a)`。任何把子对象头 8 字节当指针解引用
 （movq）的代码生成都是错的。
 
-## 2. 踩坑史（三个连环 bug，全部实测复现后修复）
+### 1.5 槽位里放的是【符号名】，不是"函数本身"
+
+vtable 是**数据**：槽位在目标文件里就是一条重定位（`.quad <sym>`），链接器只认
+裸字符串。Itanium ABI 里这张表由每个 TU 各自发射，链接器再用一组规则
+（vague linkage / 主 vtable）去重 —— 所以"槽里的名字"与"函数定义的名字"
+必须是同一个字符串，这个是**硬约束**，与语言层的类型检查无关。
+
+对照 clang：`CodeGenModule::EmitVTable` 填槽时拿到的是刚发射过的函数
+（`GlobalDecl` 句柄），名字来自同一个 `MangleContext` ⇒ 结构上不可能错配。
+minicc 没有句柄、只能各自拼字符串 ⇒ 判据必须收口（见 docs/learn/13 §13.4.3）。
+
+**次表（secondary）的语义**因此要格外小心：次基类子对象在派生类里**换了位置**，
+但槽里该放谁的名字，取决于**谁提供了这个实现**，而不是**这是谁的表**。
+
+## 2. 踩坑史（四个连环 bug，全部实测复现后修复）
 
 ### Bug 1：primary 判定两处标准打架
 
@@ -92,6 +106,40 @@ clang：  0 tag    4 f(占4..15)    16 tail     size=20
    - 标量字段初始化按宽度选 movb/movl/movq（原来一律 movq，4 字节 int
      字段会踩坏相邻字段）
 
+### Bug 4：次表槽里被"重造"出来的假符号（BUGS.md B20 缺陷 b）
+
+- 收集次基类条目时，名字被按 `次基类名 + "_" + 裸名` **重造**了一遍
+  （原意："这条槽属于次基类 Q，那就该叫 Q_f"）
+- 但基类自己**没覆写**该虚函数时，槽里原本指向的是**更上游**基类的实现
+
+```text
+class X { virtual int f(); };       // 实现处：.globl X_f
+class P : public X {};              // primary：条目原样拷贝 ⇒ X_f ✓
+class Q : public X {};              // secondary：条目被重造成 Q_f ✗（没人定义 Q_f）
+class Diamond : public P, public Q {};
+
+修复前：Diamond 次表[0] = .quad Q_f   ⇒ [LINK ERROR] undefined reference to 'Q_f'
+修复后：Diamond 次表[0] = .quad X_f   ⇒ ✓
+```
+
+**教训**：名字是**路径**（谁提供的实现），不是**位置**（这是谁的表）。
+同一句话在本项目已经出现过三次：B13~B15（把显示名当索引）、docs/learn/23
+（`toString()` 不是单射却被当缓存键）、B20（这里）。
+**修法**：次表条目**原样透传**（`VTableEntry secEntry = baseEntry;`）；
+真正的覆写发生在后面的方法循环里 —— 那时才把槽改指本类实现并配 thunk。
+
+**现场**：这个 bug 一直藏在 `tests/mi/test_mi_04_error.cpp` 里。那个文件当时写的是
+菱形继承，期望"重复基类被拒收"，实测 clang rc=0（非虚继承的菱形在标准下**合法**，
+只有成员访问歧义才报错）——rc=1 的真原因是这条 `undefined reference to 'Q_f'`。
+修好 B20 后该文件改为真正的错误用例（私有继承），菱形正例搬到
+`tests/mi/test_mi_12_secondary_inherited_slot.cpp`。
+**又一次印证**：logdiff 基线会把**失败**也固化成契约，修完必须回头看 rc。
+
+**顺带暴露的缺口（B20 缺陷 c，未修）**：槽位匹配只比裸名 ⇒
+`virtual int f(); int f(int);` 里后者认领了前者的槽，且被误标 `virtual`。
+实测 `C c; return c.f() + c.f(2) - 3;`：clang rc=0，minicc 编译 rc=0 但**运行返回 255**
+（静默算错）。判据应是（裸名 + 形参个数），与符号名规则同源。
+
 ## 3. clang 源码对照表
 
 | clang（RecordLayoutBuilder.cpp） | minicc 对应位置 | 简化了什么 |
@@ -103,6 +151,8 @@ clang：  0 tag    4 f(占4..15)    16 tail     size=20
 | `FinishLayout` :2135（nvsize/一次成型） | `computeClassLayout` 尾部 + :891 回填 | 两段式（decl->fields 工作清单 → 整体覆盖），clang 是不可变 ASTRecordLayout |
 | ASTContext::getASTRecordLayout（complete 保证） | 字段注册处 `resolveType(field.type)` | 无递归按需构建，靠声明序（基类必须先定义） |
 | CGRecordLayoutBuilder 链式访问 GEP 折叠 | `emitMember` 逐层 leaq | 保留每一跳便于观察 |
+| `CodeGenModule::EmitVTable`（槽放刚发射的 GlobalDecl） | `processClassDecl` 的条目循环 + `codegen.cpp` 次表段发射 | 无句柄，槽里是**拼出来的字符串**（故判据必须单点，见 §2 Bug 4）|
+| `ItaniumMangleContext::mangleName` | `memberMethodSymbolName()`（semantic_analyzer.cpp:1445） | 简化规则：`类名_方法名[_<形参个数>]`，不编码形参类型 |
 
 ## 4. 可复现实验
 
@@ -113,6 +163,15 @@ clang++-18 -Xclang -fdump-record-layouts -c tests/mi/test_mi_07_nested_class_fie
 # minicc：观察 [relocate]/布局日志 + 运行验证
 ./build-linux/minicc tests/mi/test_mi_06_nonpoly_only.cpp -o /tmp/m6 && /tmp/m6; echo $?   # 60
 ./build-linux/minicc tests/mi/test_mi_07_nested_class_field.cpp -o /tmp/m7 && /tmp/m7; echo $? # 9
+
+# Bug 4（B20 缺陷 b）：次表槽该指谁 —— 看汇编里的 .quad 那一行
+#   注：-S 且不给 -o 时，汇编落在【源文件旁边的同名 .s】（tests/mi/*.s 即由此而来）
+./minicc tests/mi/test_mi_12_secondary_inherited_slot.cpp -S > /dev/null
+grep -n "secondary\[" tests/mi/test_mi_12_secondary_inherited_slot.s   # X_f / X_g_1（不是 Q_f）
+
+# Bug 4 的两个 oracle 对照（clang 全 rc=0）
+clang++-18 -std=c++20 tests/mi/test_mi_12_secondary_inherited_slot.cpp -o /tmp/c12 && /tmp/c12; echo $?
+clang++-18 -std=c++20 tests/lang/test_basics_03_virtual_with_params.cpp -o /tmp/c03 && /tmp/c03; echo $?
 
 # 回归红线
 for i in 01 02 03 04 05 06 07 08 09 10; do

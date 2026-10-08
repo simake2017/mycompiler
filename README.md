@@ -411,6 +411,8 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 | `test_tmpl_69_member_template_in_class_template.cpp` | **类模板里的成员模板**（★ 回归 [B18](docs/BUGS.md)） | 两层模板形参、**绑定时机不同**：外层 `T` 由类实例化绑定（`Box<int>` ⇒ `int`），内层 `U` 由调用点推导绑定（`b.pick('a')` ⇒ `char`）。故"类实例化"必须把成员模板**复制一份、只替换外层形参、保留内层形参**挂到实例类名下。三种错法各有症状：忘了搬 ⇒ `No member 'pick' in class 'Box_int'`；就地改蓝图 ⇒ 第二个实例串到第一个的绑定（静默算错）；把内层也替换掉 ⇒ 调用点无可推导 |
 | `test_tmpl_70_member_template_static.cpp` | 成员模板的 `static` 写在**形参表之后**（★ 回归 [B19](docs/BUGS.md)） | [temp.pre]：`template-head` 必须在声明最前 ⇒ 说明符只能写在后面（`template<class U> static U f(U)`）。此前识别写在成员模板分支**之前**，只认得到"`static` 在 `template` 前"的**非法**顺序 ⇒ 标准写法反被拒（`Expected type name`），判据与语言正好相反。同批：类模板 × 静态成员模板的交叉点 |
 | `test_tmpl_71_error_virtual_member_template.cpp` | 错误：成员函数模板不能是 `virtual` | [temp.mem]/2 末句：member function templates shall not be virtual —— 虚表要求每个动态类型一条固定条目，而模板实例是**按需产生**的，声明处根本不知道要有几条。文案与 clang 逐字相同 |
+| `tests/lang/test_basics_03_virtual_with_params.cpp` | **带参虚函数**的 vtable 槽符号（★ 回归 [B20](docs/BUGS.md) 缺陷 a） | 槽里的 `.quad <sym>` 与函数定义的 `.globl <sym>` 必须**逐字相同**（链接器只认裸字符串）。定义点按"带形参 ⇒ 追加 `_<形参个数>`"命名，槽位一度硬拼 `类名_方法名` ⇒ `undefined reference to 'A_f'`。无参虚函数两侧恰好一致，所以此前测试全绿 |
+| `tests/mi/test_mi_12_secondary_inherited_slot.cpp` | **次基类未覆写的槽该指谁**（★ 回归 [B20](docs/BUGS.md) 缺陷 b） | 槽里该放谁的名字取决于**谁提供了实现**，不是**这是谁的表**：`Diamond : P, Q` 的 Q 次表槽必须透传 `X_f`（旧实现重造成 `Q_f` ⇒ 凭空捏造符号）。另一半：本类覆写次基类虚函数时仍走 thunk（this 调整 =-16） |
 | `tests/decl/test_decl_02_adl_and_qualified_lookup.cpp` | **ADL + 限定名查找** | 三条路：限定名（只在 N 里找）/ 命名空间内非限定名 / [basic.lookup.argdep] ADL。★ ADL 不是兜底而是**补进同一候选集**：`measure(s)` 里 `N::measure(S)` 与全局 `measure(int)` 同场竞争，实现成“先到先得”会静默调错函数 |
 
 ### 推荐的学习顺序
@@ -454,6 +456,8 @@ minicc 的一大特色是**每个编译阶段都输出详细的中文日志**，
 36. test_tmpl_57_ttp_signature_match.cpp ← ★ 模板位的签名匹配：位数 + 逐位 kind（口径来自 clang 探针）
 37. test_tmpl_69_member_template_in_class_template.cpp ← ★ 两层形参：外层随类实例化、内层随调用推导
 38. test_tmpl_70_member_template_static.cpp ← ★ 说明符写在形参表【之后】：位置即语义（B19）
+39. tests/lang/test_basics_03_virtual_with_params.cpp ← ★ 虚函数带参数后，符号名的后缀规则必须两处同源（B20a）
+40. tests/mi/test_mi_12_secondary_inherited_slot.cpp ← ★ 次表槽放"谁实现的"，不是"谁的表"（B20b）
 ```
 
 ---

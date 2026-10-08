@@ -2,7 +2,9 @@
 
 > 状态快照（2026-09-09）：P0 主线（函数模板推导 S1~S6、预处理器）+ 主线 A（构造/析构）
 > + 主线 B（自研链接器）+ 主线 G（多继承布局，见 learn/17）已完成。
-> 回归红线 test_tmpl_01..10 全绿；mi_03/mi_04 为登记的既有失败（见主线 G 待办表）。
+> 回归红线 test_tmpl_01..10 全绿；mi_03 为登记的既有失败（见主线 G 待办表）；
+> **mi_04 已不再失败**（2026-10-08：B20 缺陷 b 修好后菱形 rc=0，与 clang 一致 ——
+> 非虚继承的菱形在标准下合法；该文件已改写为私有继承错误用例）。
 > 构建：`cmake -S . -B build-linux -DCMAKE_CXX_COMPILER=clang++-18 && cmake --build build-linux -j`
 
 ---
@@ -69,14 +71,18 @@ ctor 初始化列表嵌套构造调用）。
 | 项 | 现状 | 修复方向 |
 |---|---|---|
 | mi_03 | lexer 不支持 `?:` 三元运算符，COMPILE_FAIL | 主线 C 顺带做（Lexer+Parser+Sema+CodeGen 四层） |
-| mi_04 | 菱形继承 `Q_f` LINK ERROR：Sema 未拒绝重复基类，Q 继承 X 后符号未生成 | Sema 层加菱形/重复基类检测，期望报错文案见测试头注释；真正支持留给主线 F 虚继承 |
+| ~~mi_04~~ | ✅ **已消**：原本的 `Q_f` LINK ERROR 是 B20 缺陷 b（次表槽被重造名字），不是"菱形没被拒" | 菱形在标准下**合法**（clang rc=0）；正例见 tests/mi/test_mi_12 |
+| **B20 缺陷 c** | 槽位匹配只比裸名 ⇒ `virtual int f(); int f(int);` 里后者认领前者的槽且被误标 virtual。实测 `c.f()+c.f(2)-3`：clang rc=0，minicc 运行返回 **255**（静默算错） | 判据改成（裸名 + 形参个数），与符号名规则同源 —— 改的是"覆写判据"本体，影响面大于命名，单独一轮 |
+| 槽位名靠字符串拼 | vtable 槽里的目标名是**拼**出来的（B20 已把判据收口到 `memberMethodSymbolName`，但仍是字符串而非结构化引用） | 宜存"指向哪个 FuncDecl"的结构化引用；clang 是 GlobalDecl 句柄 |
 
 **P2 架构观察（只记录，暂不动手）**
 
 1. `decl->fields` 与 `classLayout.fields` 双清单 + 末尾整体回填
    （semantic_analyzer.cpp:891）；clang 是一次成型不可变 ASTRecordLayout
 2. 成员查找不穿透继承链：`obj->get()` 在 `D*` 上查不到 `P::get`
-3. vtable 覆写靠字符串剥/拼类名前缀匹配符号名，脆弱；宜存结构化符号引用
+3. ~~vtable 覆写靠字符串剥/拼类名前缀匹配符号名~~ →
+   **B20 已把"命名规则"收口到单点**（`memberMethodSymbolName`），但**槽位身份仍靠裸名比对**
+   （缺陷 c，见上表）；最终形态应是无字符串的 FuncDecl 引用
 4. **内置 bump malloc 不做对齐（待修）**：`new T` 的堆地址对齐保证在真实
    世界里由 operator new 契约提供（[new.delete.single]，x86-64 恒 16B 对齐；
    过对齐类型走 `operator new(size, align_val_t)`，clang 参照

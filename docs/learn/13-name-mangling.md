@@ -311,10 +311,10 @@ std::string vtable_name = "_ZTV" + std::to_string(name.size()) + name;
 ### 13.4.2 虚函数名（简化版）
 
 ```cpp
-// semantic_analyzer.cpp:1104-1112
-// 成员函数：类名_方法名
-decl->mangledName = decl->ownerClassName + "_" + decl->name;
-// Dog::speak → Dog_speak（而非 _ZN3Dog5speakEv）
+// semantic_analyzer.cpp 的 memberMethodSymbolName()（单点判据，见 13.4.3）
+memberMethodSymbolName(owner, name, paramCount, earlierSameNameCount)
+// Dog::speak     → Dog_speak      （而非 _ZN3Dog5speakEv）
+// Dog::speak(int)→ Dog_speak_1
 ```
 
 **为什么简化？**
@@ -323,7 +323,43 @@ decl->mangledName = decl->ownerClassName + "_" + decl->name;
 - 避免复杂性：真实 mangling 需要处理重载、参数类型、嵌套等
 - 自包含：minicc 生成的汇编用这些简化名，不需要与外部 C++ 代码链接
 
-### 13.4.3 在 dump 输出中的应用
+### 13.4.3 成员方法符号名的【单点】判据（BUGS.md B20 缺陷 a）
+
+**规则**（`semantic_analyzer.cpp` 的 `memberMethodSymbolName`）：
+
+| 情形 | 符号名 | 例 |
+|---|---|---|
+| 析构函数 | `类名_dtor` | `Dog_dtor` |
+| 无参、且同类无先注册的同名方法 | `类名_方法名` | `Dog_speak` |
+| 带形参，或同类已有先注册的同名方法 | `类名_方法名_<形参个数>` | `Dog_speak_1` |
+
+**为什么必须收口到一个函数**：这个名字会被**两个地方分别产出** ——
+
+1. **定义点** `registerFunction`（Pass 2）：写 `decl->mangledName`，决定 `.globl <sym>`
+2. **vtable 条目点** `processClassDecl`（Pass 1）：写 `entry.mangledName`，决定槽里的 `.quad <sym>`
+
+链接器只按**裸字符串**比对这两者。任何一边的规则漂一点，就是"编译期全绿、
+链接期 `undefined reference`"。对照 clang：定义与引用共用同一个
+`ItaniumMangleContext::mangleName`，结构上不可能不一致；minicc 靠"判据单点 +
+两处调用同一函数"达到同样效果。
+
+**踩过的坑（B20 缺陷 a）**：vtable 条目点原本自己硬拼 `类名_方法名`（**不带**
+`_<形参个数>` 后缀），于是
+
+```text
+struct A { virtual int f(int x); };
+定义点产出  .globl A_f_1
+vtable 槽    .quad A_f          ← 这个符号没人定义
+⇒ [LINK ERROR] undefined reference to 'A_f'
+```
+
+**为什么之前的测试全绿**：无参虚函数两侧算出的都是 `A_f`，规则恰好一致 ——
+缺口只在"带参虚函数"这条路径上，而此前没有任何用例写过带参虚函数。
+
+**留下的边界（B20 缺陷 c，未修）**：槽位匹配只比**裸名**，不比形参表 ——
+`virtual int f(); int f(int);` 里后者会"认领"前者的槽位。见 docs/BUGS.md B20。
+
+### 13.4.4 在 dump 输出中的应用
 
 **类层次图（`--dump-hierarchy`）**：
 

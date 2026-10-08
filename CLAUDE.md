@@ -326,7 +326,40 @@ test_tmpl_71（rc=1，文案逐字同 clang，位置也对上）；**突变验�
 删 virtual 报错 / 写回 isStatic）逐条实跑变红。既有 112 个集成用例**逐字节零漂移**；
 基线 112 → 114。文档 docs/learn/34 新增 §3.4（处置表）与 §3.5（只做函数模板）。
 
-**未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
+✅ **vtable 槽里的符号名与定义点不同源（bug 修复，docs/BUGS.md B20）** ——
+起点是"虚函数连续往下派生类透传、修饰名一直是原先最上层基类"这个问题，查下去是**两个**缺陷：
+① **带参虚函数链接失败**：vtable 条目点（`processClassDecl`，**Pass 1**）自己硬拼
+   `类名_方法名`，而定义点（`registerFunction`，**Pass 2**）对带形参的方法追加
+   `_<形参个数>` ⇒ 汇编里 `_ZTV` 槽写 `.quad A_f`、定义却是 `.globl A_f_1`
+   ⇒ `undefined reference to 'A_f'`，**编译期全绿**。无参虚函数两侧恰好一致
+   （此前**没有任何用例写过带参虚函数**，所以一直是绿的）。
+② **次基类未覆写的槽被重造出假符号**：收集次表条目时按 `次基类名 + "_" + 裸名`
+   重造名字（原意"这条槽属于 Q，就该叫 Q_f"），但 Q 没覆写时槽里指的是**更上游**的
+   `X_f` ⇒ 链接期 `undefined reference to 'Q_f'`。
+**修法**：① **判据单点** —— 抽 `memberMethodSymbolName(owner, name, paramCount,
+earlierSameNameCount)`（semantic_analyzer.cpp:1445），`registerFunction` 与 vtable
+三个落点（主表覆写 / 次表覆写 / 新条目）**共用同一个函数**；② **次表名字原样透传**
+（`VTableEntry secEntry = baseEntry;`），真覆写交给后面的方法循环（那时才改指本类实现 + 配 thunk）。
+★ 计数口径有坑：`earlierSameNameCount` 只数**排在当前方法之前**的同名方法
+（Pass 2 注册时扫 `m_functions` 也只看得见前者），数成"同类同名总数"会让
+`virtual int f(); virtual int f(int);` 里 f() 得 `X_f_0`、定义点却是 `X_f` —— 又是个只在链接期炸的错配。
+★ **现场就在 tests/mi/test_mi_04_error.cpp**：那个文件原先写菱形继承、把 rc=1 解释成
+"菱形本该被拒收"，实测 clang **rc=0**（非虚继承的菱形合法，只有成员访问歧义才报错）——
+真原因是 ②。修复后该文件改写为真正的错误用例（私有继承），菱形正例搬到
+tests/mi/test_mi_12_secondary_inherited_slot.cpp（**又一次印证 logdiff 基线会把失败固化成契约**）。
+测试：集成 tests/lang/test_basics_03_virtual_with_params.cpp + tests/mi/test_mi_12；
+单测 tests/unit/test_vtable_symbols.cpp（`VTableSymbols.*` 4 例，断言**不变量**
+"每条 `.quad <sym>` 都必须有 `.globl <sym>` 定义"，命名规则随便改都不会误报）；
+**突变验证 2 条**（vtable 三落点改回硬拼 ⇒ 2 例红；次表改回重造 ⇒ 恰好 1 例红）。
+既有集成用例漂移**恰好 1 个**（就是 mi_04 那个现场），其余逐字节不变；
+单测 262 → **266** / 集成 114 → **116**。文档 docs/learn/13 新增 §13.4.3（单点判据与
+"为什么必须收口"）、docs/learn/17 新增 §1.5 与 §2 Bug 4。
+
+**未做（按优先级）**：**B20 缺陷 c —— 槽位匹配只比裸名**（`virtual int f(); int f(int);`
+里后者认领前者的槽且被误标 `virtual`；实测 `c.f()+c.f(2)-3` clang rc=0、
+minicc 编译 rc=0 但**运行返回 255**，静默算错）⇒ 判据应改成（裸名 + 形参个数），
+与符号名规则同源；改的是"覆写判据"本体，影响面大于命名，单独一轮 →
+④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
 函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；

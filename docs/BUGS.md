@@ -30,6 +30,9 @@
 | [B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) | 祖辈带来的前缀被当成"本类直接基类" ⇒ 偏移算错 | 扁平化循环 + `computeClassLayout` | 中（同 B13 的性质，根因更本质） | ✅ 已修 |
 | [B16](#b16-无声明符的声明被拒收aint-int-报-parse-error) | 无声明符的声明（`A<int*,int**>;` / `int;`）被拒收 | `src/parser.cpp` `parseStatement` + `isDeclaratorlessDecl` | 小-中（拒收合法程序，且报错点离根因远） | ✅ 已修 |
 | [B17](#b17-值位实参要求形态精确相等拒收合法程序) | 值位实参要求"形态精确相等" ⇒ `Flag<1>` / `A<4L>` / `A<true>` 全被拒 | `src/semantic_analyzer.cpp` checkTemplateArguments ③-b | 中（拒收合法程序；同批还牵出实例键撞车） | ✅ 已修 |
+| [B18](#b18-类模板里的成员模板在实例类里丢失) | 类模板里的成员模板没被带进实例类 ⇒ 实例上调成员模板全线失败 | `src/template_instantiation.cpp` instantiateClassTemplate | 中（合法程序不可用；同批牵出 static/virtual 位置） | ✅ 已修 |
+| [B19](#b19-static--virtual-的识别位置写反标准写法被拒非法写法被收) | `template<class U> static U f(U)` 被拒、`static template<…>` 反被收 | `src/parser.cpp` 成员模板分支 | 小（两个方向都反了） | ✅ 已修 |
+| [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号 | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另暴露一条静默算错，缺陷 c 未修） | ✅ 缺陷 a/b 已修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -1282,6 +1285,114 @@ if (check(TokenType::KwVirtual) || isVirtual) {
 
 ---
 
+## B20. vtable 槽里的符号名与定义点不同源（带参虚函数链接失败 / 次基类假符号）
+
+一句话：**vtable 槽里的名字是"拼"出来的，定义点的名字也是"拼"出来的，两处各拼一遍。**
+
+### 缺陷 a：带参虚函数的槽少了 `_<形参个数>` 后缀
+
+**复现**
+
+```cpp
+struct A { virtual int f(int x) { return x; } };
+struct B : A { int f(int x) { return x + 1; } };
+int main() { B b; A* pa = &b; return pa->f(3) - 4; }
+```
+
+| | 结果 |
+|---|---|
+| clang++-18 `-std=c++20` | rc=0 |
+| minicc（修前） | 编译全绿，**链接期** `undefined reference to 'A_f'`（B 那侧 `B_f` 同理） |
+
+汇编证据（修前）：
+
+```text
+.globl A_f_1        ← 定义点：带形参 ⇒ 追加 _1
+_ZTV1A:
+    .quad A_f       ← 槽位：硬拼"类名_方法名"，没有 _1 ⇒ 这个符号没人定义
+```
+
+**根因**：同一条命名规则写在两处 —— 定义点 `registerFunction`（Pass 2，写
+`decl->mangledName`）与 vtable 条目点 `processClassDecl`（Pass 1，写
+`entry.mangledName`，三个落点：主表覆写 / 次表覆写 / 新条目）。后者只会
+`decl->name + "_" + methodNameInVTable`。**为什么当时能"跑"**：无参虚函数两侧
+算出的都是 `A_f`，规则恰好重合；缺口只在带参虚函数上，而此前没有任何用例写过它。
+
+### 缺陷 b：次基类里【未覆写】的槽被重造出一个假符号
+
+**复现**
+
+```cpp
+struct A { virtual int f() { return 1; } };
+struct B : A {};                       // 次基类：没覆写 f
+struct C { virtual int g() { return 2; } };
+struct D : C, B {};
+int main() { D d; B* pb = &d; return pb->f() - 1; }
+```
+
+| | 结果 |
+|---|---|
+| clang++-18 `-std=c++20` | rc=0 |
+| minicc（修前） | 编译全绿，链接期 `undefined reference to 'B_f'` |
+
+收集次基类条目时名字被按 `次基类名 + "_" + 裸名` **重造**了一遍（原意："这条槽
+属于 B，那就该叫 B_f"）。但 B 没覆写 f，槽里原本指向的是**更上游**的 A::f ——
+重造等于凭空捏造一个没人定义的符号。**名字是路径（谁提供的实现），不是位置
+（这是谁的表）** —— 承 [B13](#b13-两个次基类各有一个同名字段时显示名塌陷且第二条偏移算成-0)~[B15](#b15-祖辈前缀与直接基类撞名时偏移算到错的子对象) 与
+[docs/learn/23](learn/23-cv-position-and-type-identity.md) 的同一句教训。
+
+**现场**：这个缺陷一直藏在 `tests/mi/test_mi_04_error.cpp` 里。该文件当时写的是
+菱形继承，头注释把 rc=1 解释成"菱形本该被拒收"—— 实测 clang rc=0：非虚继承的
+菱形在标准下**合法**（两个 X 子对象，只有成员访问歧义才报错）。rc=1 的真原因就是
+这句 `undefined reference to 'Q_f'`。**又一次印证：logdiff 基线会把失败固化成契约**。
+
+**修法**（两处，方向相反）：
+
+1. **判据单点**：抽 `memberMethodSymbolName(owner, name, paramCount, earlierSameNameCount)`
+   （src/semantic_analyzer.cpp:1445），`registerFunction` 与 vtable 三个落点
+   **共用同一个函数**；
+2. **次表名字原样透传**：`VTableEntry secEntry = baseEntry;`，不再重造。
+   真覆写由后面的方法循环负责（那时才改指本类实现并配 thunk）。
+
+★ 计数口径有个坑：`earlierSameNameCount` 只数**排在当前方法之前**的同名方法
+（Pass 2 注册时扫 `m_functions` 也只看得见前者）。数成"同类同名总数"会让
+`struct X { virtual int f(); virtual int f(int); }` 里 f() 得到 `X_f_0`，而定义点是
+`X_f` —— 又是一个只在链接期炸的错配。故 vtable 侧按 `decl->methods` 的**下标顺序**数。
+
+**顺带发现（缺陷 c，未修）**：槽位匹配只比**裸名**、不比形参表 ⇒
+`class C { virtual int f(); int f(int); };` 里 `f(int)` 会认领 `f()` 的槽，且被
+**误标成 virtual**。实测 `C c; return c.f() + c.f(2) - 3;`：clang rc=0，
+minicc 编译 rc=0 但**运行返回 255**（静默算错）。判据应是（裸名 + 形参个数），
+与符号名规则同源。**本轮不修**：它改的是"覆写判据"本身，影响面比命名大，单独一轮。
+
+### 影响面与验证
+
+| 项 | 结果 |
+|---|---|
+| 既有集成用例漂移 | **恰好 1 个**：`tests/mi/test_mi_04_error.cpp`（缺陷 b 的现场，rc 1→0，已改写为私有继承错误用例）；其余 115 个逐字节不变 |
+| 单测 | 262 → 266（新增 `VTableSymbols.*` 4 例） |
+| 集成 | 114 → 116（新增 `tests/mi/test_mi_12_secondary_inherited_slot.cpp`、`tests/lang/test_basics_03_virtual_with_params.cpp`） |
+| 有意日志漂移 | 无（命名结果对无参虚函数逐字未变） |
+
+**回归用例**：
+
+- 单测 `tests/unit/test_vtable_symbols.cpp`（`VTableSymbols.*` 4 例，断言**不变量**：
+  每条 `.quad <sym>`（`.L*`/纯数字除外）都必须有 `.globl <sym>` 定义 ——
+  命名规则随便改都不会误报，但"两处各算一遍"必红）
+- 集成 `tests/mi/test_mi_12_secondary_inherited_slot.cpp`（菱形次表透传 + 次基类自身覆写走 thunk）
+- 集成 `tests/lang/test_basics_03_virtual_with_params.cpp`（带参虚函数覆写 / 未覆写 / 基类自身三条路）
+
+**突变负向验证**（逐个拆掉后实跑）：
+
+| 突变 | 红掉的用例 |
+|---|---|
+| 三个 vtable 落点改回 `decl->name + "_" + methodNameInVTable` | `VTableSymbols.ParameterizedVirtualSlotMatchesDefinition`、`...SecondaryInheritedSlotKeepsUpstreamSymbol` |
+| 次表条目改回 `baseName + "_" + 裸名` | 只有 `...SecondaryInheritedSlotKeepsUpstreamSymbol` 红（外科级定位） |
+
+**状态**：✅ 缺陷 a、b 已修；⚠ 缺陷 c 未修（见上）
+
+---
+
 ## 小结 字符串兼任 ID 与路径
 
 三条 bug 的最小复现各不相同，根因却是同一句话：**把"显示名"当成了"索引"。**
@@ -1293,7 +1404,9 @@ if (check(TokenType::KwVirtual) || isVirtual) {
 | 子对象定位 | 必须是**结构信息**（`viaBase` + 下标） | 靠裸名在基类布局里找第一个命中 ⇒ **B13 / B15** |
 
 这与踩坑史 **T1**（`Type::toString()` 不是单射、而实例缓存键吃它 —— 见
-[docs/learn/23](learn/23-cv-qualifier-position.md)）是**同一个坑的另一次现形**。
+[docs/learn/23](learn/23-cv-qualifier-position.md)）是**同一个坑的另一次现形**；
+[B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) 是**第三次**
+（vtable 槽里的函数名 = 机器用的键，而定义点与槽位**各拼一遍**）。
 可以概括成一条项目级教训：
 
 > **凡是拿"给人看的字符串"当"机器用的键"，早晚出事。**

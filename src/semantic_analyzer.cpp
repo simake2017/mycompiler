@@ -1421,6 +1421,39 @@ void SemanticAnalyzer::processTypeAliasDecl(TypeAliasDeclPtr decl) {
         decl->aliasName, decl->underlyingType ? decl->underlyingType->toString() : "?");
 }
 
+// ─── 成员方法符号名的【单点】判据（BUGS.md B20）──────────────────────────────
+// 谁在用：① 定义点 SemanticAnalyzer::registerFunction（Pass 2 给 decl->mangledName 定名）
+//         ② vtable 条目点 processClassDecl（Pass 1 写 entry.mangledName，三个落点）
+// 为什么必须单点：这两处的产物最后会被**链接器按裸字符串比对**（vtable 槽 `.quad X`
+//   必须命中某个 `.globl X`），任何一边的规则漂一点就是 undefined reference。
+//   B10 已经栽过一次（调用点硬拼 vs 定义点加后缀），B20 是同一个坑的第二次现形
+//   —— 承项目铁律「同一判据不许写两份」。
+// 规则（与 registerFunction 逐字相同，勿改）：
+//   析构            → "<类名>_dtor"（不带参数个数后缀）
+//   普通/构造/方法  → "<类名>_<方法名>"，若 (同类中已有先注册的同名方法) 或 (带形参)
+//                     再追加 "_<形参个数>"
+// ⚠ earlierSameNameCount 是**声明顺序敏感**的（registerFunction 扫 m_functions 只能看见
+//   已注册的前者），故调用方必须传"排在当前方法之前的同名方法数"，不能传"同类同名总数"
+//   —— 否则 `struct X { virtual int f(); virtual int f(int); }` 里 f() 会被定成 X_f_0，
+//   而定义点是 X_f（调用点也按 X_f 拼），又是一个链接期才炸的错配。
+// ┌─ DEMO ─────────────────────────────────────────────────────────────────────
+// │ 输入  owner="Dog", name="speak", paramCount=0, earlier=0
+// │ 输出  "Dog_speak"          （vtable 槽 .quad Dog_speak ↔ 定义点 .globl Dog_speak ✓）
+// │ 输入  owner="A", name="f", paramCount=1, earlier=0
+// │ 输出  "A_f_1"              （旧实现两处各写"类名_方法名" ⇒ 槽里是 A_f、定义是 A_f_1 ⇒ ✗）
+// └────────────────────────────────────────────────────────────────────────────
+static std::string memberMethodSymbolName(const std::string& owner,
+                                          const std::string& methodName,
+                                          size_t paramCount,
+                                          size_t earlierSameNameCount) {
+    if (methodName.starts_with("~")) return owner + "_dtor";
+    std::string sym = owner + "_" + methodName;
+    if (earlierSameNameCount > 0 || paramCount > 0) {
+        sym += "_" + std::to_string(paramCount);
+    }
+    return sym;
+}
+
 // ═══ 类声明处理（理论见 docs/learn/17、19）════════════════════════════════════
 // 做什么：建类类型 → 合并基类字段/vtable（继承）→ 收集自身字段/方法并建 vtable →
 //   计算内存布局 → 注入 _vptr/RTTI → 注册进全局符号表。
@@ -1592,14 +1625,18 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 secSub.isPrimary = false;
                 // offset 由 [relocate] 阶段统一摆放
                 // 次表条目（独立于主表，覆写时设 thunkAdjust）
+                // ★ 名字【原样透传】（BUGS.md B20 缺陷 b）：槽里原本指向谁，就还是谁。
+                //   基类若没覆写该虚函数，条目指的就是更上游基类的实现；旧实现按
+                //   `baseName + "_" + 裸名` 重造名字 ⇒ 凭空捏出一个 baseName_foo，
+                //   而那个符号**根本没人定义**（除非 baseName 自己覆写了）⇒ 链接期炸。
+                //   真覆写发生在下面第二个循环：那时才把槽改指本类实现。
                 for (auto& baseEntry : baseType->classLayout.vtableEntries) { // 次基类的vtable entry 不是放到 classLayout里面的
                     VTableEntry secEntry = baseEntry;
-                    secEntry.mangledName = baseName + "_" + (baseEntry.baseFunctionName.empty()
-                        ? std::string(baseEntry.mangledName.substr(baseEntry.mangledName.find('_') + 1))
-                        : baseEntry.baseFunctionName);
-                    secEntry.baseFunctionName = baseEntry.baseFunctionName.empty()
-                        ? baseEntry.mangledName.substr(baseEntry.mangledName.find('_') + 1)
-                        : baseEntry.baseFunctionName;
+                    // 兜底：baseFunctionName 是权威裸名，正常路径上由条目创建点写入，必非空。
+                    if (secEntry.baseFunctionName.empty()) {
+                        secEntry.baseFunctionName =
+                            secEntry.mangledName.substr(secEntry.mangledName.find('_') + 1);
+                    }
                     secSub.entries.push_back(secEntry);
                 }
                 classType->classLayout.bases.push_back(secSub);
@@ -1830,10 +1867,22 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
     }
 
     // ── 注册方法，检查虚函数 ──
-    for (auto& method : decl->methods) {
+    for (size_t mi = 0; mi < decl->methods.size(); ++mi) {
+        auto& method = decl->methods[mi];
         method->ownerClassName = decl->name;
 
         std::string methodNameInVTable = method->name.starts_with("~") ? "dtor" : method->name;
+
+        // ★ vtable 槽里的符号名与定义点（registerFunction）必须逐字相同 —— 走同一份判据。
+        //   earlierSameNameCount 只数【排在当前方法之前】的同名方法：Pass 2 按同一
+        //   decl->methods 顺序注册，那一刻扫 m_functions 也只看得见前者，两处口径由此对齐。
+        size_t earlierSameNameCount = 0;
+        for (size_t mj = 0; mj < mi; ++mj) {
+            if (decl->methods[mj]->name == method->name) ++earlierSameNameCount;
+        }
+        std::string selfSymbol = memberMethodSymbolName(decl->name, method->name,
+                                                        method->parameters.size(),
+                                                        earlierSameNameCount);
 
         // Override 检测：即使没有 virtual 关键字，也检查是否覆写基类虚函数
         // （C++ 标准：覆写虚函数不需要重新声明 virtual）
@@ -1846,7 +1895,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                 ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
                 : entry.baseFunctionName;
             if (entryFuncName == methodNameInVTable) {
-                entry.mangledName = decl->name + "_" + methodNameInVTable; // 这里会对继承的多态函数修饰
+                entry.mangledName = selfSymbol;   // 覆写 ⇒ 槽位改指本类的实现（索引不变，[class.virtual]/1）
                 entry.baseFunctionName = methodNameInVTable;
                 entry.isOverridden = true;
                 overriddenInPrimary = true;
@@ -1865,7 +1914,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
                     ? entry.mangledName.substr(entry.mangledName.find('_') + 1)
                     : entry.baseFunctionName;
                 if (entryFuncName == methodNameInVTable) {
-                    entry.mangledName = decl->name + "_" + methodNameInVTable; // 这里会覆盖掉次基类 原先的名字
+                    entry.mangledName = selfSymbol;   // 次表里的覆写：同样改指本类实现（thunk 负责 this 调整）
                     entry.baseFunctionName = methodNameInVTable;
                     entry.isOverridden = true;
                     overriddenInSecondary = true; // 覆写了，那么下面就不用在写了
@@ -1891,7 +1940,7 @@ void SemanticAnalyzer::processClassDecl(ClassDeclPtr decl) {
 
             if (!overriddenInPrimary && !overriddenInSecondary) { // 既没有覆盖主虚函数 又没有覆盖次虚函数
                 VTableEntry entry;
-                entry.mangledName = decl->name + "_" + methodNameInVTable; // 这里会修饰为当前 类名_方法名
+                entry.mangledName = selfSymbol;   // 本类新引入的虚函数：新占一个槽位
                 entry.baseFunctionName = methodNameInVTable;
                 entry.index = static_cast<uint32_t>(
                     classType->classLayout.vtableEntries.size());
@@ -2188,13 +2237,10 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
     if (decl->ownerClassName.empty()) {
         decl->mangledName = decl->name;
     } else {
-        if (decl->name.starts_with("~")) {
-            decl->mangledName = decl->ownerClassName + "_dtor";
-        } else {
-            decl->mangledName = decl->ownerClassName + "_" + decl->name;
-            // 构造函数/方法重载：同名多个时追加参数个数区分（当前方法已 push_back 进
-            // m_functions，所以计数要 -1）。
-            size_t sameNameCount = 0;
+        // 构造函数/方法重载：同名多个时追加参数个数区分（当前方法已 push_back 进
+        // m_functions，所以扫到的都是"先注册的" ⇒ 与 vtable 条目点的计数口径一致）。
+        size_t sameNameCount = 0;
+        if (!decl->name.starts_with("~")) {
             for (auto& f : m_functions) {
                 if (f.get() != decl.get()
                     && f->ownerClassName == decl->ownerClassName
@@ -2202,10 +2248,10 @@ void SemanticAnalyzer::registerFunction(FuncDeclPtr decl) {
                     ++sameNameCount;
                 }
             }
-            if (sameNameCount > 0 || decl->parameters.size() > 0) {
-                decl->mangledName += "_" + std::to_string(decl->parameters.size());
-            }
         }
+        // ★ 定名与 vtable 条目共用同一份判据（BUGS.md B20），不许在这里另写一遍。
+        decl->mangledName = memberMethodSymbolName(decl->ownerClassName, decl->name,
+                                                   decl->parameters.size(), sameNameCount);
     }
 
     // 注册到符号表
