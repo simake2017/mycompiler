@@ -181,7 +181,12 @@ class Derived : public Base {
 public:
     virtual int f() { return 100; }
 };
-int main() { Derived d; Base* p = &d; return p->f() + d.f(2); }
+// ★ 非虚重载那一半必须经 Base* 调（`p->f(2)`）—— 写成 `d.f(2)` 是**非法程序**：
+//   Derived 声明了 f ⇒ 基类整族被隐藏（[class.member.lookup]/3），clang 报
+//   "too many arguments to function call, expected 0, have 1; did you mean 'Base::f'?"。
+//   本用例此前写的正是 `d.f(2)`，能过只是因为本实现在这里**太宽**（BUGS.md B24）；
+//   B24 修好后它当场变红 —— 又一次印证"基线会把失败固化成契约"。
+int main() { Derived d; Base* p = &d; return p->f() + p->f(2); }
 )";
     const std::string asmCode = compileQuiet(src);
     auto refs = dataRefsWithPrefix(asmCode, "Derived_f");

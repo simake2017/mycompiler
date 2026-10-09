@@ -161,6 +161,14 @@ struct VarExpr : Expression {
     // foo<4>(x) 也能被解析出来（否则语法阶段就崩成 "Expected type name"），再由语义
     // 阶段给出"函数模板暂不支持非类型实参"的明确报错。
     std::vector<TemplateArg> explicitTemplateArgs;
+    // ★ Sema 回填：限定名成员 `Q::v`（[expr.prim.id.qual]）解析出的字段位置。
+    //   为什么不留给 CodeGen 自己按裸名查：**那正是写限定名的理由** —— 本类隐藏了
+    //   基类同名字段时（`struct D:S{int v;}` 里写 `S::v`），按裸名查会命中本类那一条
+    //   （findField 的"自身字段优先"），偏移就错了。与 B10/B20/B22 的回填同一形状：
+    //   名字是给人看的，位置才是机器要的。BUGS.md B21。
+    //   约定：offset < 0 表示未回填 ⇒ 两条读取路径都退回"按名字查"的旧行为。
+    int      resolvedFieldOffset = -1;
+    uint32_t resolvedFieldSize   = 0;
     explicit VarExpr(std::string n) : Expression(NodeKind::Var), name(std::move(n)) {}
 
     void accept(AstVisitor& v) override { v.visit(*this); }
@@ -267,6 +275,13 @@ struct MemberExpr : Expression {
     // 空串 = 普通成员调用，走原有硬拼路径（既有符号逐字节不变）。
     // 对照 clang：CXXMemberCallExpr 持 CXXMethodDecl*，符号由该 Decl 决定。
     std::string resolvedCalleeSymbol;
+
+    // ── 限定名成员访问 `obj.Q::m` / `this->Q::m`（[expr.ref] + [expr.prim.id.qual]）──
+    // 与 VarExpr 的那两个槽同源同理由：写限定名的唯一目的是**绕过名字隐藏**，
+    // 而按裸名查会命中派生类自己那一条 ⇒ 偏移错。故由 Sema 解析后回填权威位置，
+    // CodeGen 非负即采用。BUGS.md B21。
+    int      resolvedFieldOffset = -1;
+    uint32_t resolvedFieldSize   = 0;
 
     MemberExpr(ExprPtr obj, std::string member, bool arrow)
         : Expression(NodeKind::Member), object(std::move(obj)),

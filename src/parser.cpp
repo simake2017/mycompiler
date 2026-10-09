@@ -2518,11 +2518,23 @@ ExprPtr Parser::parsePostfixExpr() {
         }
         else if (check(TokenType::Dot) || check(TokenType::Arrow)) {
             // 成员访问
+            // 文法：('.' | '->') ( nested-name-specifier )? IDENT
+            //   ☆ 限定名形式 `obj.Q::m`（[expr.ref]/[expr.prim.id.qual]）：写限定名的
+            //     唯一目的是**绕过名字隐藏**（派生类声明了同名成员时基类那一族被隐藏）。
+            //     与 Parser 对 `A::B` 的既有处置一致 —— 拼成一整个名字串交给语义层
+            //     （见 parsePrimaryExpr 里 `while (::) name += "::" + ident`）。
             auto loc = current().location;
             bool isArrow = (current().type == TokenType::Arrow);
             advance();
             const Token& member = expect(TokenType::Identifier, "Expected member name");
-            auto memExpr = std::make_shared<MemberExpr>(expr, member.text, isArrow);
+            std::string memberName = member.text;
+            while (check(TokenType::ColonColon)) {
+                advance();
+                const Token& next = expect(TokenType::Identifier,
+                                           "Expected member name after '::'");
+                memberName += "::" + next.text;
+            }
+            auto memExpr = std::make_shared<MemberExpr>(expr, memberName, isArrow);
             memExpr->location = loc;
             expr = memExpr;
         }

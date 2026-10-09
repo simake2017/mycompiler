@@ -379,17 +379,54 @@ tests/unit/test_member_identity.cpp（`MemberIdentity.*` 6 例，**三条突变�
 文档 docs/BUGS.md B22（含修复小节）、B20 缺陷 c 转 ✅、docs/learn/13 §13.4.3 规则表、
 docs/learn/17 §2 Bug 5；单测 266 → **272** / 集成 116 → **118**。
 
-⚠ **本轮新发现（docs/BUGS.md B24，未修）**：成员方法的**名字隐藏**
-（[class.member.lookup]/3）—— `Derived::f()` 一声明，基类 `f(int)` 整族应被隐藏，
-clang 拒收 `d.f(2)`，minicc 仍能查到（**接受非法程序**）。根因在
-`findMethodInHierarchy` 按**裸名**判"本类有没有" ⇒ 与 B20c/B22 是同一个
-"身份比裸名宽"的老毛病，只是方向相反（该藏没藏）。修法：隐藏先按**名字**砍掉基类整族
-（与重载决议的按类型择优是**两个正交的筛选**）。是写 mi_13 时被 clang oracle 当场抓住的。
+✅ **实参绑定与名字可见性一批修复已完成（BUGS.md B21 / B24 / B25 / B26 / B27）** ——
+★ 这批五个缺陷是一条线上的四种错法：**"这个名字在这个位置可见吗"** 与
+**"这个实参绑得上那个形参吗"** 两个判据**都只写了一半** ⇒ 该拒的静默放行、不该拒的当场拒收。
+**判据的"缺失"比"写错"更难发现**：写错会报错，缺了什么都不发生。
+① **B26 引用绑定**：判据此前只在模板推导（S2 那一轮）里有，非模板调用那条路
+   `typeCompatible`/`stripRefConst` 把引用剥掉再比类型 ⇒ 什么都不挡。
+   ★ 而且 `const T&` 拒右值的**错因来自上一轮**：docs/learn/23 把 `const T&` 从
+   `Const(LRef(T))` 改成 `LRef(Const(T))` 后，`deducePair` 的"剥顶层 const"分支
+   **不再触发**（const 被关在引用里面），而那句注释还写着旧形态 ——
+   **cv 位置一改，所有"按旧形态看类型"的地方都要重看一遍**。
+   判据收口成 `referenceBindsValueCategory`（include/type.h + src/type.cpp，
+   **全项目单点**），两个调用点共用；★ 谓词 `argsBindTo` 与报错 `checkArgBinding`
+   **分开** —— 绑定是**可行性**的一部分（[overload.viable]），必须在**择优之前**剔候选，
+   否则 `f(int&)`/`f(const int&)` 并存时 `f(5)` 会先选中前者再被拒（clang 选后者）。
+   顺带修**值类别模型**：`*p`（[expr.unary.op]/1）与 `v[i]`（[expr.sub]/1）**也是左值** ——
+   **半份判据会造出反方向的缺陷**（漏掉它们 ⇒ `g(*p)` 被误拒）。
+② **B24/B25 名字可见性与个数**：成员查找 BFS 里补"**查到名字就下结论**" ——
+   本类为这个名字声明过东西 ⇒ 当场了结（个数区外报 `too few/too many arguments`，
+   与 clang **逐字相同**；区内报 `no matching member function`），
+   **不往基类走、也不落进普通查找**。隐藏（按名字）与可行性（按类型）是**两个正交的筛选**。
+   ★ 位置选在 `inferCall` 而不是 `findMethodInHierarchy`：「按裸名判本地有没有」本来就对，
+   错的是调用点拿到 nullptr 之后**没下结论**。
+③ **B27 无可行候选**：`pickBestByArgs` 的旧③"退回声明序首个"删掉（返回 nullptr）——
+   它把"**判不了**"（实参类型 nullptr，依赖上下文/SFINAE）与"**判出来没人行**"混成一件事，
+   是**静默算错**（`c.f(p)` 调进 `f(int)`）。保留两个例外：argTypes 含 nullptr ⇒
+   取首个；单候选不打日志（承 B22 的零漂移策略）。
+④ **B21 限定名成员**：类内 `Base::v`（[expr.prim.id.general]/3 的**隐式 this 成员访问**，
+   clang 的 AST 是 `MemberExpr ->v` + `CXXThisExpr`）+ 类外 `obj.Base::v`（Parser 收
+   `IDENT (:: IDENT)*`）。定位原语 `resolveQualifiedField` 一处，
+   ★ **核心是回填偏移**：按裸名查会命中派生类隐藏字段那条（findField "自身优先"）——
+   程序照跑、结果错。**名字是给人看的，位置才是机器要的**（第三次：B10/B13~B15/B22）。
+⑤ ★ **又一个被基线固化的非法程序**：B24 修好后 `MemberIdentity.DerivedOverrideKeepsSlotCount`
+   当场变红 —— 用例里写着 `d.f(2)`（`f(int)` 只在基类），clang 同样 rc=1。
+   已改成 `p->f(2)` 并写明缘由。**这是第三次**（前两次：test_mi_04_error / test_pp_01）。
+   **写用例前先用 clang 过一遍"这程序真的合法吗"。**
+测试 tests/lang/test_basics_05..09（2 正例 + 3 错例）+ 单测 tests/unit/test_arg_binding.cpp
+（`ArgBinding.*` 4 例，**四条分支逐条突变验证**：去掉回填 1 红 / 判据恒真 1 红 /
+去掉"查到名字就下结论" 2 红 / 退回首个 1 红）；文档 docs/learn/36（含 clang 源码对照表、
+边界表）；BUGS.md B21/B24/B25 转 ✅ + 新增 B26/B27。
+全量 272 → **276** 单测 / 118 → **123** 集成测试；既有用例**逐字节零漂移**。
 
 **未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
 函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；
+本轮新留边界（见 docs/learn/36 §7）：**限定名调用成员函数** `d.Base::f(2)`（B21 只管数据成员）、
+`using Base::f;` 把隐藏名字拉回来、`v[i]` 的值类别按 `at()` 返回类型判定
+（现按节点种类判）、派生类到基类的引用绑定 `Base& b = d;`、转换等级排序 [overload.icp]；
 别名模板偏特化 —— 见 docs/learn/27 §5 边界表；
 模板模板参数：形参包 `class...`（签名的偏序不可达）、模板位默认实参、嵌套模板模板参数
 （depth > 1 直接报错）—— 见 docs/learn/33 §5；

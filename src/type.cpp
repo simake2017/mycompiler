@@ -437,4 +437,35 @@ TypePtr Type::stripConst() const {
     return nullptr;
 }
 
+// ── 引用绑定判据（[dcl.init.ref]，全项目【单点】）─────────────────────────────
+// 声明与"为什么必须单点"写在 include/type.h 的尾注里（那里是权威表述）。
+// 判据表（形参 ⇒ 可接受的实参值类别）：
+//   T&        左值           │ 右值 ✗   （[dcl.init.ref]/5.4.1）
+//   const T&  左值 ✓ 右值 ✓  │         （/5.4.2：const 左值引用可绑右值）
+//   T&&       右值           │ 左值 ✗   （[dcl.init.ref]/5.3；模板的 T&& 是万能引用，
+//                                       由推导引擎先折叠成 T := A&，不走本判据）
+//   非引用    左右值皆可      │         （按值传参：值类别无关）
+// ★ const T& 的形态：本项目 parseType 把 `const T&` 建成 LValueRef(Const(T))
+//   （cv 落在被引用类型上，见 docs/learn/23）—— 所以"被引用类型是不是 const"要看
+//   referencedType，而不是看引用节点自己有没有被 const 包住。
+bool referenceBindsValueCategory(const TypePtr& paramType, bool argIsLValue,
+                                 std::string* why) {
+    if (!paramType || !paramType->isReference()) return true;   // 按值传参
+
+    if (paramType->isLValueReference()) {
+        bool referencedIsConst =
+            paramType->referencedType && paramType->referencedType->isConst();
+        if (argIsLValue || referencedIsConst) return true;
+        if (why) *why = std::format("cannot bind non-const lvalue reference '{}' to an rvalue",
+                                    paramType->toString());
+        return false;
+    }
+
+    // 右值引用：只收右值
+    if (!argIsLValue) return true;
+    if (why) *why = std::format("cannot bind rvalue reference '{}' to an lvalue",
+                                paramType->toString());
+    return false;
+}
+
 } // namespace minicc

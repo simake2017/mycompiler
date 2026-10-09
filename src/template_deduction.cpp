@@ -345,13 +345,15 @@ bool TemplateDeducer::deducePair(const TypePtr& P, const TypePtr& A, bool argIsL
         return deducePair(P->innerType, A, argIsLValue, paramNames, subst, out, structuralMatch);
     }
 
-    // ── P = T&：左值引用参数，实参必须左值 ──
-    // [temp.deduct.call]：P 是引用类型时以被引用类型参与推导；右值无法绑定到
-    // 非 const 左值引用，此处提前拒绝。
+    // ── P = T&：左值引用参数 ──
+    // [temp.deduct.call]：P 是引用类型时以被引用类型参与推导，但绑定要过 [dcl.init.ref]。
+    // ★ 判据不在本处写死，走 Type 的 referenceBindsValueCategory（判据单点）——
+    //   这里原先写的是"右值一律拒"，于是 `const T&` 收右值被误拒（BUGS.md B26）：
+    //   `const T&` 建成 LValueRef(Const(T))，外层不是 const ⇒ 剥 const 那支救不了它。
     if (P->isLValueReference()) {
-        if (!argIsLValue) {
-            out.failureReason = std::format(
-                "cannot bind lvalue reference '{}' to rvalue argument '{}'", pStr, aStr);
+        std::string why;
+        if (!referenceBindsValueCategory(P, argIsLValue, &why)) {
+            out.failureReason = std::format("{} (argument '{}')", why, aStr);
             out.trace.push_back({pStr, aStr, out.failureReason, false});
             std::cout << std::format("  [deduction]   ✗ {}\n", out.failureReason);
             return false;

@@ -1206,8 +1206,28 @@ void CodeGen::visit(AssignStmt& stmt) {
             bool fieldHandled = false;
             if (m_localVars.find(var->name) == m_localVars.end()
                 && !m_currentClassName.empty() && m_currentClassType) {
-                auto field = m_currentClassType->classLayout.findField(var->name);
                 auto thisIt = m_localVars.find("this");
+                // ★ 同读取路径：Sema 回填的偏移优先（限定名成员 `S::v = ...`，BUGS.md B21）。
+                //   宽度也用回填的字段宽度（与 findField 那条路的 field->size 同源）。
+                if (var->resolvedFieldOffset >= 0 && thisIt != m_localVars.end()) {
+                    emit("pushq %rax                  # 暂存右值到栈上");
+                    emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
+                    emit("movq %rax, %rcx                # this 地址存入 rcx");
+                    emit("popq %rax                    # 弹出右值回 rax");
+                    if (var->resolvedFieldSize == 1) {
+                        emit(std::format("movb %al, {}(%rcx)    # .{} = ...（偏移 {}，1 字节写入）",
+                            var->resolvedFieldOffset, var->name, var->resolvedFieldOffset));
+                    } else if (var->resolvedFieldSize <= 4) {
+                        emit(std::format("movl %eax, {}(%rcx)    # .{} = ...（偏移 {}，4 字节写入）",
+                            var->resolvedFieldOffset, var->name, var->resolvedFieldOffset));
+                    } else {
+                        emit(std::format("movq %rax, {}(%rcx)    # .{} = ...（偏移 {}，8 字节写入）",
+                            var->resolvedFieldOffset, var->name, var->resolvedFieldOffset));
+                    }
+                    fieldHandled = true;
+                }
+                auto field = fieldHandled
+                           ? nullptr : m_currentClassType->classLayout.findField(var->name);
                 if (field && thisIt != m_localVars.end()) {
                     // rax 已是右值（emitAssign 开头统一求值）：压栈暂存 →
                     // 取 this → 弹出右值 → 写入 [this + offset]
@@ -1267,6 +1287,17 @@ void CodeGen::visit(AssignStmt& stmt) {
                     objType = objType->pointeeType;
                 }
                 if (objType->isClass()) {
+                    // ★ 限定名成员 `obj.Q::m = ...`：Sema 回填的偏移优先（BUGS.md B21）。
+                    if (mem->resolvedFieldOffset >= 0) {
+                        if (mem->resolvedFieldSize <= 4) {
+                            emit(std::format("movl %eax, {}(%rcx)    # 写入限定名成员 .{}（偏移 +{}）",
+                                mem->resolvedFieldOffset, mem->memberName, mem->resolvedFieldOffset));
+                        } else {
+                            emit(std::format("movq %rax, {}(%rcx)    # 写入限定名成员 .{}（偏移 +{}，8B）",
+                                mem->resolvedFieldOffset, mem->memberName, mem->resolvedFieldOffset));
+                        }
+                        return;
+                    }
                     auto field = objType->classLayout.findField(mem->memberName);
                     if (field) {
                         // ★ 【必须】按字段宽度选指令，与读路径对称（踩坑史 C4）——
@@ -1525,10 +1556,19 @@ void CodeGen::visit(VarExpr& expr) {
 
     // 如果在类方法中，查类字段（通过 this 指针访问）
     if (!m_currentClassName.empty() && m_currentClassType) {
+        auto thisIt = m_localVars.find("this");
+        // ★ 优先吃 Sema 回填的偏移（限定名成员 `S::v`，BUGS.md B21）：那时按裸名查会
+        //   命中本类隐藏字段的那一条，偏移是错的 —— 回填值才是权威。未回填（<0）时
+        //   与旧路径逐字节相同。
+        if (expr.resolvedFieldOffset >= 0 && thisIt != m_localVars.end()) {
+            emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
+            emit(std::format("movl {}(%rax), %eax    # 读取限定名成员 .{}（偏移 +{} 字节）",
+                expr.resolvedFieldOffset, expr.name, expr.resolvedFieldOffset));
+            return;
+        }
         auto field = m_currentClassType->classLayout.findField(expr.name);
         if (field) {
             // 通过 this 指针访问字段
-            auto thisIt = m_localVars.find("this");
             if (thisIt != m_localVars.end()) {
                 emit(std::format("movq {}(%rbp), %rax    # 加载 this 指针", thisIt->second));
                 emit(std::format("movl {}(%rax), %eax    # 读取字段 .{}（偏移 +{} 字节）",
@@ -1969,6 +2009,18 @@ void CodeGen::visit(MemberExpr& expr) {
         }
 
         if (actualType && actualType->isClass()) {
+            // ★ 限定名成员 `obj.Q::m`：Sema 回填的偏移优先（BUGS.md B21）——
+            //   按裸名查会命中派生类隐藏的同名字段，偏移就错了。未回填时原样。
+            if (expr.resolvedFieldOffset >= 0) {
+                if (expr.resolvedFieldSize <= 4) {
+                    emit(std::format("movl {}(%rax), %eax    # 读取限定名成员 .{}（偏移 +{}，4B int）",
+                        expr.resolvedFieldOffset, expr.memberName, expr.resolvedFieldOffset));
+                } else {
+                    emit(std::format("movq {}(%rax), %rax    # 读取限定名成员 .{}（偏移 +{}，8B）",
+                        expr.resolvedFieldOffset, expr.memberName, expr.resolvedFieldOffset));
+                }
+                return;
+            }
             auto field = actualType->classLayout.findField(expr.memberName);
             if (field) {
                 // ── 嵌套类字段：取地址而非取值（子对象内联在父对象里）──

@@ -1105,8 +1105,10 @@ static bool typeCompatible(const TypePtr& expected, const TypePtr& got) {
 // 谁在用：成员方法调用（findMethodInClass）与构造函数选定（processVarDeclStmt）——
 //   这两处此前**各写一遍**"按参数个数选第一个"，于是 B22 的两个症状各来一次
 //   （方法撞符号 + 构造函数静默选错）。现在共用本函数。
-// 三级择优：① 逐位**精确**（Type::equals）② 逐位**可隐式转换**（typeCompatible）
-//   ③ 退回首个（兜底：实参类型未知或无一相容时，维持旧行为并说明原因）。
+// 择优：① 逐位**精确**（Type::equals）② 逐位**可隐式转换**（typeCompatible）
+//   两者皆不中 ⇒ 返回 nullptr（**没有可行候选**，[overload.match]/1 的非良构），
+//   由调用点报错。★ 旧实现在这里"退回声明序首个" —— 那是静默选错的口子：
+//   `c.f(p)`（候选 f(int)/f(S)，实参是 int*）会一声不吭地调 f(int)（BUGS.md B27）。
 // 为什么不做 [overload.icp] 的转换等级排序：本项目不做用户定义转换，而内建转换之间
 //   "哪个更优"要比较转换等级（整型提升 vs 整型转换）—— 那是主线 D 的活。
 // 对照 clang：Sema::BuildOverloadCandidateSet 收候选 → 逐个算隐式转换序列 → 比等级。
@@ -1114,7 +1116,16 @@ static FuncDeclPtr pickBestByArgs(const std::vector<FuncDeclPtr>& candidates,
                                   const std::vector<TypePtr>& argTypes,
                                   const std::string& what) {
     if (candidates.empty()) return nullptr;
-    if (candidates.size() == 1) return candidates.front();   // 无重载 ⇒ 短路（零开销）
+    // 实参类型未知（nullptr，如依赖上下文/SFINAE 探测里）⇒ 无从判断可行性，
+    //   维持"取声明序首个"的旧行为，避免把"判不了"误报成"匹配失败"。
+    for (auto& t : argTypes) {
+        if (!t) return candidates.front();
+    }
+
+    // ★ 日志只在【真做了择优】时打（候选 ≥ 2）。单候选是绝大多数调用（无重载），
+    //   打出来会把日志淹掉 —— 且那本来也不构成"决议"。判据同 B22：符号名的类型链
+    //   也只在"同类里有同名同个数的兄弟"时才挂，都是为了让既有用例零漂移。
+    const bool verbose = candidates.size() > 1;
 
     // ① 精确匹配（逐位 Type::equals；引用/const 的剥离交给 equals 自己）
     for (auto& m : candidates) {
@@ -1124,8 +1135,9 @@ static FuncDeclPtr pickBestByArgs(const std::vector<FuncDeclPtr>& candidates,
               && m->parameters[i].type->equals(argTypes[i]);
         }
         if (ok) {
-            std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 精确匹配 '{}'\n",
-                what, argTypes.size(), candidates.size(), m->mangledName);
+            if (verbose)
+                std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 精确匹配 '{}'\n",
+                    what, argTypes.size(), candidates.size(), m->mangledName);
             return m;
         }
     }
@@ -1136,15 +1148,16 @@ static FuncDeclPtr pickBestByArgs(const std::vector<FuncDeclPtr>& candidates,
             ok = typeCompatible(m->parameters[i].type, argTypes[i]);
         }
         if (ok) {
-            std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 按隐式转换选 '{}'\n",
-                what, argTypes.size(), candidates.size(), m->mangledName);
+            if (verbose)
+                std::cout << std::format("  [overload] {}({} args): {} 个候选 ⇒ 按隐式转换选 '{}'\n",
+                    what, argTypes.size(), candidates.size(), m->mangledName);
             return m;
         }
     }
-    // ③ 兜底：声明序首个（与旧实现一致），并说明为什么没得选
-    std::cout << std::format("  [overload] {}({} args): {} 个候选，无一与实参相容 ⇒ 退回首个 '{}'\n",
-        what, argTypes.size(), candidates.size(), candidates.front()->mangledName);
-    return candidates.front();
+    // ③ 无可行候选 ⇒ nullptr（调用点据此报错，不再静默选一个）
+    std::cout << std::format("  [overload] ✗ {}({} args): {} 个候选，无一可行 ⇒ 匹配失败\n",
+        what, argTypes.size(), candidates.size());
+    return nullptr;
 }
 
 SemanticAnalyzer::SemanticAnalyzer() {
@@ -3260,6 +3273,38 @@ TypePtr SemanticAnalyzer::inferNullptrLiteral(NullptrLiteralExpr&) {
 // │       偏移 / vtable 这些布局细节挂在注册表那份上，不换就会在空布局上查无此字段。
 // └────────────────────────────────────────────────────────────────────────────
 TypePtr SemanticAnalyzer::inferVar(VarExpr& expr) {
+    // 0. 【限定名】`Q::v`（[expr.prim.id.qual] / [expr.prim.id.general]/3）
+    //    Parser 把 `A::B` 拼成一个整串（parser.cpp），于是全项目都按"名字串"查表 ——
+    //    函数 / 类内类型别名 / 嵌套类型名各有通路，**数据成员一条都没有**，
+    //    `S::v` 落到下面必然报 Undefined variable（BUGS.md B21）。
+    //    clang 里它不是限定名查找，而是一个正牌 MemberExpr（base 是隐式 this）：
+    //     `-MemberExpr 'int' lvalue ->v  └─CXXThisExpr 'S *' implicit this
+    //    故判据是【限定者是不是一个类型】：是 ⇒ 退化为"字段查找 + 隐式 this"；
+    //    不是（命名空间限定名）⇒ 原样留给下面的符号表路径。
+    if (auto sep = expr.name.rfind("::"); sep != std::string::npos
+        && !m_currentClassName.empty()) {
+        const std::string qualifier = expr.name.substr(0, sep);
+        const std::string member    = expr.name.substr(sep + 2);
+        if (isClassOrBaseOf(m_currentClassName, qualifier)) {
+            const FieldInfo* hit =
+                resolveQualifiedField(m_currentClassName, qualifier, member);
+            if (!hit) {
+                error(std::format("no member named '{}' in '{}'", member, qualifier),
+                      expr.location);
+            }
+            // 回填位置 + 把名字还原成裸名：CodeGen 两条路径（读 / 写）优先吃回填值，
+            // 未回填时才按名字查（那时裸名就是原来的语义，不会更糟）。
+            expr.resolvedFieldOffset = static_cast<int>(hit->offset);
+            expr.resolvedFieldSize   = hit->size;
+            expr.name = member;
+            std::cout << std::format(
+                "{}[resolve] '{}::{}' → {}    (qualified member, offset={} 隐式 this)\n",
+                inferIndent(), qualifier, member,
+                hit->type ? hit->type->toString() : "?", hit->offset);
+            return hit->type;
+        }
+    }
+
     // 1. 查符号表（从当前作用域向外搜索）
     Symbol* sym = m_symbolTable.lookup(expr.name);
     if (sym) {
@@ -3525,15 +3570,52 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
         TypePtr t = inferType(arg);
         m_inferDepth--;
         argTypes.push_back(t);
-        // ★ 值类别（lvalue/rvalue）判定——简化模型：变量引用 / 成员访问 → 有确定内存
-        //   地址 → 左值；字面量 / 算术结果 / 调用返回值 → 右值。该标记随 argTypes 传给
+        // ★ 值类别（lvalue/rvalue）判定——简化模型：有确定内存地址的表达式 → 左值；
+        //   字面量 / 算术结果 / 调用返回值 → 右值。该标记随 argTypes 传给
         //   TemplateDeducer 执行引用绑定检查（[dcl.init.ref]）：非 const T& 拒绝绑定右值
         //   实参；T&& 为万能引用，经引用折叠后左右值皆可绑定（S2 实现）。
-        bool isLValue = arg->kind == NodeKind::Var || arg->kind == NodeKind::Member;
+        //   ★ 除变量/成员访问外还必须算上【解引用】与【下标】——[expr.unary.op]/1 与
+        //     [expr.sub]/1 都规定二者产生左值（`*p` 能绑 `int&`、`v[0]` 也是），
+        //     漏掉它们会让 `void g(int&); g(*p);` 这类合法程序被引用绑定检查误拒。
+        bool isLValue = arg->kind == NodeKind::Var || arg->kind == NodeKind::Member
+                     || arg->kind == NodeKind::Index
+                     || (arg->kind == NodeKind::Unary
+                         && std::static_pointer_cast<UnaryExpr>(arg)->op == UnaryOp::Deref);
         argIsLValue.push_back(isLValue);
         std::cout << std::format("{}  arg: {}{}\n", inferIndent(),
             t ? t->toString() : "?", isLValue ? " (lvalue)" : " (rvalue)");
     }
+
+    // ── 引用绑定检查（[dcl.init.ref]，判据单点见 include/type.h 尾注）──
+    // ★ 此前**非模板调用完全没有这项检查**：typeCompatible / stripRefConst 都把引用剥掉
+    //   再比类型，于是 `int f(int&&)` 收左值、`void g(int&)` 收右值都能过（BUGS.md B26）。
+    //   模板那条路由 deducePair 把关（同一个原语），这里把非模板路径补齐 ——
+    //   判据只有一份，两个调用点共用。
+    // ★ 判据形状是【谓词】，报错只是它的一个调用者 —— 因为这件事在重载决议里是
+    //   **可行性**的一部分（[overload.viable]：隐式转换序列不可行的候选不是候选），
+    //   必须在**择优之前**就把不可绑定的候选剔掉。否则 `f(int&)` 与 `f(const int&)`
+    //   同时存在时，`f(5)` 会先按"平手取注册顺序靠前者"选中 `f(int&)` 再被拒 ——
+    //   而 clang 的答案是选 `f(const int&)`。先剔后退，两条都对。
+    auto argsBindTo = [&](const FuncDeclPtr& f, std::string* why, size_t* badIdx) {
+        for (size_t i = 0; i < f->parameters.size() && i < argIsLValue.size(); ++i) {
+            if (!referenceBindsValueCategory(f->parameters[i].type, argIsLValue[i], why)) {
+                if (badIdx) *badIdx = i;
+                return false;
+            }
+        }
+        return true;
+    };
+    auto checkArgBinding = [&](const FuncDeclPtr& f) {
+        std::string why;
+        size_t badIdx = 0;
+        if (!argsBindTo(f, &why, &badIdx)) {
+            error(std::format("no matching function for call to '{}' — {} ('{}')",
+                              funcName, why,
+                              badIdx < argTypes.size() && argTypes[badIdx]
+                                  ? argTypes[badIdx]->toString() : "?"),
+                  expr.location);
+        }
+    };
 
     // ── 成员方法调用：按"对象类 → 方法表"查，不走全局名字表 ──
     // Box_int::get 与 Box_double::get 这类同名方法（模板实例或多类同名成员）在全局
@@ -3594,6 +3676,75 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
                                 inst->returnType ? inst->returnType->toString() : "?");
                             return inst->returnType;
                         }
+                    }
+                    // ── ★ 查到名字就停：匹配失败 = 报错，不往基类走、也不落进普通查找 ──
+                    // 两条规则在这里合成一句话：
+                    //   · [class.member.lookup]/3【名字隐藏】：本类一旦声明了某名字，基类中
+                    //     **所有**同名声明都被隐藏 —— 哪怕签名完全不同。故"本类有 f()、基类有
+                    //     f(int)"时 `d.f(2)` 是错误，而不是去找基类那个（BUGS.md B24）。
+                    //   · [overload.match]/1：候选集非空但无可行者 ⇒ 非良构（BUGS.md B25/B27）。
+                    // 此前这里只是"继续 BFS / 落进普通名字查找"，于是错个数、错类型的调用
+                    // 被静默放行（更早的写法里 b 形态甚至一路活到运行期）。
+                    //
+                    // 诊断分两类（对照 clang：Sema::CheckFunctionCall 在调用点区分）：
+                    //   个数对不上     ⇒ too few / too many arguments（[expr.call]/1）
+                    //   个数对得上但类型不可行 ⇒ no matching member function（[overload.match]/1）
+                    // 故先收齐"这个名字在本类声明了哪些参数个数"，得出区间 [lo, hi]，
+                    // 再决定说哪一句 —— 说错哪一类会把人往错的判据上引。
+                    std::vector<const std::vector<Parameter>*> sameName;
+                    if (auto declIt = m_classDecls.find(clsName); declIt != m_classDecls.end()) {
+                        for (auto& m : declIt->second->methods) {
+                            if (m->name == funcName) sameName.push_back(&m->parameters);
+                        }
+                    }
+                    if (auto mtAll = m_classMemberTemplates.find(clsName);
+                        mtAll != m_classMemberTemplates.end()) {
+                        for (auto& mt : mtAll->second) {
+                            if (mt->templateName() != funcName) continue;
+                            if (mt->isFunctionTemplate())
+                                sameName.push_back(&mt->funcTemplate->parameters);
+                        }
+                    }
+                    if (!sameName.empty()) {
+                        size_t have = argTypes.size();
+                        size_t lo = SIZE_MAX, hi = 0;
+                        const std::vector<Parameter>* narrowest = nullptr;  // 供"单个形参"文案
+                        for (auto* ps : sameName) {
+                            if (ps->size() < lo) { lo = ps->size(); narrowest = ps; }
+                            if (ps->size() > hi) hi = ps->size();
+                        }
+                        auto paramName = [](const std::vector<Parameter>* ps, size_t i) {
+                            return (ps && i < ps->size() && !(*ps)[i].name.empty())
+                                 ? (*ps)[i].name : std::string("x");
+                        };
+                        if (have < lo) {
+                            if (lo == 1) {
+                                error(std::format(
+                                    "too few arguments to function call, single argument '{}' "
+                                    "was not specified", paramName(narrowest, 0)),
+                                    expr.location);
+                            }
+                            error(std::format(
+                                "too few arguments to function call, expected {}, have {}",
+                                lo, have), expr.location);
+                        }
+                        if (have > hi) {
+                            if (hi == 1) {
+                                error(std::format(
+                                    "too many arguments to function call, expected single "
+                                    "argument '{}', have {} arguments",
+                                    paramName(narrowest, 0), have), expr.location);
+                            }
+                            error(std::format(
+                                "too many arguments to function call, expected {}, have {}",
+                                hi, have), expr.location);
+                        }
+                        // 个数在范围内但没有任何候选可行 ⇒ [overload.match]/1 的非良构
+                        error(std::format(
+                            "no matching member function for call to '{}' in class '{}' "
+                            "({} argument(s) given; 实参类型无法按 [overload.viable] 转换)",
+                            funcName, clsName, have),
+                            expr.location);
                     }
                     // 搜基类
                     for (auto& bn : classIt->second->baseClassNames)
@@ -3686,12 +3837,19 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
     }
 
     // ── ③ 裁决：精确匹配优先；无精确匹配时退回既有行为 ──
+    // ★ 可行性含**引用绑定**（[overload.viable]）：不可绑定的候选在这里就出局，
+    //   而不是等选完冠军再被 checkArgBinding 拦下 —— `f(int&)` 与 `f(const int&)`
+    //   并存时 `f(5)` 该选后者（clang 的答案），先选后退会把合法的程序拒掉。
     Candidate* winner = nullptr;
     for (auto& c : pool) {
         if (!arityOk(c.decl)) continue;
-        if (exactMatch(c.decl)) { winner = &c; break; }   // 平手取注册顺序靠前者
+        if (exactMatch(c.decl) && argsBindTo(c.decl, nullptr, nullptr)) {
+            winner = &c; break;   // 平手取注册顺序靠前者
+        }
     }
     if (winner) {
+        // 冠军必然已过引用绑定（上面的循环里 argsBindTo 是入选条件之一），
+        //   故此处不再复查 —— 判据只留一处，避免"两处判据各自演化"的老毛病。
         bool isAdl = winner->via.rfind("ADL", 0) == 0;
         std::cout << std::format(
             "{}[call] {}({} args) → {}    [{}{}：形参类型精确匹配]\n",
@@ -3709,6 +3867,7 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
     // ── ④ 退回既有路径：精确匹配一个都没有 ──
     if (it != m_functionMap.end()) {
         if (it->second->parameters.size() == argTypes.size()) {
+            checkArgBinding(it->second);   // 引用绑定（[dcl.init.ref]）
             // ★ 限定名调用（`C::f()`）必须把 callee 名改写成【发射符号】。
             //   定义端成员函数用 mangledName（C_f），调用端若留着源码名 "C::f"，
             //   asmSymbol 会把 "::" 净化成 "__" 得到 C__f ⇒ 链接期 undefined reference。
@@ -3746,6 +3905,7 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
                     "{}[call] {}({} args) → {}    [ADL: 实参关联命名空间 '{}' 命中]\n",
                     inferIndent(), funcName, argTypes.size(),
                     f->returnType ? f->returnType->toString() : "?", ns);
+                checkArgBinding(f);   // 引用绑定（[dcl.init.ref]）
                 if (calleeVar) calleeVar->name = qualified;
                 return f->returnType;
             }
@@ -4702,6 +4862,48 @@ FuncDeclPtr SemanticAnalyzer::findMethodInClass(const std::string& className,
                           std::format("member {}.{}", className, methodName));
 }
 
+// ── "是不是基类"的判据（[class.derived]）──────────────────────────────────────
+// BFS 沿 baseClassNames 上溯。★ 只此一处：inferDynamicCast 里那个 hasCommonAncestor
+// 是**另一个**关系（"存在公共祖先"，兄弟类互转也算），不要合并 —— 合并会把
+// dynamic_cast 的可达性放宽成"同一条继承链"。
+bool SemanticAnalyzer::isClassOrBaseOf(const std::string& derived,
+                                       const std::string& base) const {
+    std::vector<std::string> work = {derived};
+    std::set<std::string> visited;
+    while (!work.empty()) {
+        std::string cur = work.back(); work.pop_back();
+        if (!visited.insert(cur).second) continue;
+        if (cur == base) return true;
+        auto it = m_classDecls.find(cur);
+        if (it == m_classDecls.end()) continue;
+        for (auto& bn : it->second->baseClassNames) work.push_back(bn);
+    }
+    return false;
+}
+
+// ── 限定名数据成员 `Q::m` 的定位（判据单点：类内裸名与 obj.Q::m 两条路共用）────
+// 三条件"这条字段归不归 qualifier 管"（BUGS.md B21）：
+//   ① sourceClass == qualifier —— 继承自它的（主基类合并时 computeClassLayout 会把
+//      空的 sourceClass 补成基类名）
+//   ② sourceClass 为空且 qualifier 就是 ownerClass —— 本类自己的字段（自身字段的
+//      sourceClass 只在"与基类撞名被加前缀"时才落名）
+//   ③ sourceClass 比 qualifier 更靠下（Q 是它的祖辈）—— 字段其实声明在 Q 里，
+//      只是经过若干层才带到本类的布局
+const FieldInfo* SemanticAnalyzer::resolveQualifiedField(const std::string& ownerClass,
+                                                         const std::string& qualifier,
+                                                         const std::string& member) const {
+    auto classIt = m_classTypes.find(ownerClass);
+    if (classIt == m_classTypes.end()) return nullptr;
+    for (auto& f : classIt->second->classLayout.fields) {
+        if (f.bareName() != member) continue;          // ★ 权威裸名，不是显示名
+        bool belongs = f.sourceClass == qualifier
+            || (f.sourceClass.empty() && qualifier == ownerClass)
+            || (!f.sourceClass.empty() && isClassOrBaseOf(f.sourceClass, qualifier));
+        if (belongs) return &f;
+    }
+    return nullptr;
+}
+
 FuncDeclPtr SemanticAnalyzer::findMethodInHierarchy(const std::string& className,
                                                     const std::string& methodName,
                                                     std::string* declaringClass) const {
@@ -4770,6 +4972,30 @@ TypePtr SemanticAnalyzer::inferMember(MemberExpr& expr) {
         error(std::format("Cannot access member '{}' on non-class type '{}'",
             expr.memberName, actualType ? actualType->toString() : "?"),
             expr.location);
+    }
+
+    // ── 限定名成员 `obj.Q::m` / `this->Q::m`（[expr.ref] 的嵌套名限定形式）──
+    // 由 Parser 把 `Q::m` 拼成一整个成员名（与 `A::B` 名字串同源）。与 inferVar 的
+    // 类内裸名形式共用 resolveQualifiedField 一个判据；这里多一件事：把权威偏移
+    // 回填到 MemberExpr 上 —— 按裸名查会命中派生类隐藏字段那条，偏移是错的。
+    if (auto sep = expr.memberName.rfind("::"); sep != std::string::npos) {
+        const std::string qualifier = expr.memberName.substr(0, sep);
+        const std::string member    = expr.memberName.substr(sep + 2);
+        if (isClassOrBaseOf(actualType->name, qualifier)) {
+            const FieldInfo* hit = resolveQualifiedField(actualType->name, qualifier, member);
+            if (!hit) {
+                error(std::format("no member named '{}' in '{}'", member, qualifier),
+                      expr.location);
+            }
+            expr.resolvedFieldOffset = static_cast<int>(hit->offset);
+            expr.resolvedFieldSize   = hit->size;
+            expr.memberName = member;
+            std::cout << std::format(
+                "{}[member] {}.{}::{} → {}    (qualified member, offset={})\n",
+                inferIndent(), actualType->name, qualifier, member,
+                hit->type ? hit->type->toString() : "?", hit->offset);
+            return hit->type;
+        }
     }
 
     // 查找字段

@@ -86,6 +86,7 @@ add_executable(unit_tests
     tests/unit/test_nttp_type_domain.cpp
     tests/unit/test_declaratorless_decl.cpp
     tests/unit/test_member_template_in_class_template.cpp
+    tests/unit/test_arg_binding.cpp
     src/preprocessor.cpp
     src/sfinae.cpp
     src/lexer.cpp

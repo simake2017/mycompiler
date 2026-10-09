@@ -33,11 +33,13 @@
 | [B18](#b18-类模板里的成员模板在实例类里丢失) | 类模板里的成员模板没被带进实例类 ⇒ 实例上调成员模板全线失败 | `src/template_instantiation.cpp` instantiateClassTemplate | 中（合法程序不可用；同批牵出 static/virtual 位置） | ✅ 已修 |
 | [B19](#b19-static--virtual-的识别位置写反标准写法被拒非法写法被收) | `template<class U> static U f(U)` 被拒、`static template<…>` 反被收 | `src/parser.cpp` 成员模板分支 | 小（两个方向都反了） | ✅ 已修 |
 | [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号) | vtable 槽名与定义点名**两处各拼一遍** ⇒ 带参虚函数链接失败、次基类捏出假符号；槽位身份只比裸名 ⇒ 静默算错（缺陷 c） | `src/semantic_analyzer.cpp` processClassDecl / registerFunction | 中（合法程序链接失败；另有一条静默算错） | ✅ 缺陷 a/b/c 已修 |
-| [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'` | `src/semantic_analyzer.cpp` inferVar（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ⬜ 未修 |
+| [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'`；`obj.Q::m` 连语法都不认 | `src/semantic_analyzer.cpp` inferVar / inferMember（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ✅ 已修 |
 | [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) | 成员重载只按"名字 + 个数"选 ⇒ 同名同个数在汇编期撞符号 `C_f_1`；构造函数同病（静默选错） | `src/semantic_analyzer.cpp` 四处落点：符号定名 / 槽位身份 / 调用点选择 / 构造函数选定 | 中（拒收合法程序，报错点落在 as 的符号上） | ✅ 已修 |
 | [B23](#b23-浮点字面量缺失--运算按整数发射) | 无浮点字面量（`1.5` 切成 `1` `.` `5`）；`double` 运算发 `idivq` ⇒ 1/2 得 0 | `src/lexer.cpp`（[lex.fcon]）+ `src/codegen.cpp`（零 SSE 指令） | 中（a 响亮失败但文案误导；b **静默算错**） | ⬜ 未修 |
-| [B24](#b24-成员方法的名字隐藏派生类一声明同名方法基类整族应被隐藏) | 成员方法**名字隐藏**：`Derived::f()` 声明后，基类 `f(int)` 整族应被隐藏，minicc 仍能查到 | `src/semantic_analyzer.cpp` findMethodInHierarchy（按裸名判"本地有没有"） | 小（接受非法程序） | ⬜ 未修 |
-| [B25](#b25-成员调用实参个数不匹配无人认领一条静默接受一条只剩链接器) | 实参个数不匹配无人报错：无参方法那条**静默接受**，带参那条只剩 `undefined reference to 'C_f'` | `src/semantic_analyzer.cpp` inferCall:3562 + inferMember:4810 + `src/codegen.cpp:1819` | 中（b **静默接受非法程序**；a/c 报错点落在链接器） | ⬜ 未修 |
+| [B24](#b24-成员方法的名字隐藏派生类一声明同名方法基类整族应被隐藏) | 成员方法**名字隐藏**：`Derived::f()` 声明后，基类 `f(int)` 整族应被隐藏，minicc 仍能查到 | `src/semantic_analyzer.cpp` inferCall 成员查找 BFS + findMethodInHierarchy | 小（接受非法程序） | ✅ 已修 |
+| [B25](#b25-成员调用实参个数不匹配无人认领一条静默接受一条只剩链接器) | 实参个数不匹配无人报错：无参方法那条**静默接受**，带参那条只剩 `undefined reference to 'C_f'` | `src/semantic_analyzer.cpp` inferCall 成员查找 BFS | 中（b **静默接受非法程序**；a/c 报错点落在链接器） | ✅ 已修 |
+| [B26](#b26-引用绑定判据只写了模板那一半) | 引用绑定判据只写在模板推导里 ⇒ `const T&` 拒右值（**拒收合法程序**）、`int&&` 收左值（**接受非法程序**） | `src/template_deduction.cpp` deducePair + `src/semantic_analyzer.cpp` inferCall（非模板路径**没有**） | 中（一个判据缺一半，两个方向都错） | ✅ 已修 |
+| [B27](#b27-无可行候选时静默退回候选集首个) | 候选集非空而无一可行 ⇒ 静默选第一个（`c.f(p)` 调进了 `f(int)`），编译全绿、运行算错 | `src/semantic_analyzer.cpp` pickBestByArgs | 中（**静默算错** + 接受非法程序） | ✅ 已修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -1461,7 +1463,52 @@ inferVar 只认裸字段名（外加"当前类"的类作用域回退），查 `"
 **回归用例**：暂**不加**钉住现状的用例 —— 那会把失败固化成契约
 （正是 logdiff 教训：基线会把 rc=1 也固化成"契约"）。修完再补正例。
 
-**状态**：⬜ 未修
+**状态**：✅ 已修（2026-10 那一轮，与 B24/B25/B26/B27 同批）
+
+---
+
+### B21 修复
+
+**改动面**（两半，缺一不可）
+
+| # | 缺口 | 改动点 |
+|---|---|---|
+| a | 语义层没有通路：`inferVar` 只认裸字段名 | `inferVar` 新增步骤 0：`Q::m` 切开 ⇒限定者是当前类或基类 ⇒ 走**同一条**字段查找路径 |
+| b | 语法层压根不认 `obj.Q::m` | `Parser::parsePostfixExpr` 的 `.`/`->` 分支收 `IDENT (:: IDENT)*`，拼成成员名字串（与既有 `A::B` 处置一致） |
+| c | ★ **偏移会取错**：按裸名查命中派生类隐藏字段那条 | `resolveQualifiedField`（判据单点）+ 把权威偏移**回填**到 `VarExpr`/`MemberExpr`，CodeGen 优先采用 |
+
+c 是本次修复的**核心判据**：写限定名的唯一用途就是绕过名字隐藏，
+而 `findField` 的三级顺序里"自身字段优先"（[class.member.lookup]/3）恰好会
+挑中派生类那一条 —— 不改这一处，程序能编译、能运行、**结果错**。
+同 B10 的符号回填、B13~B15 的 `declaredName`/`viaBase`：**名字是给人看的，位置才是机器要的**。
+
+`resolveQualifiedField(ownerClass, qualifier, member)` 的"归不归 Q 管"三个条件：
+① `sourceClass == qualifier`（继承自它；主基类合并时 `sourceClass` 会被补成基类名）
+② `sourceClass` 为空且 `qualifier == ownerClass`（本类自己的字段）
+③ `qualifier` 是 `sourceClass` 的祖辈（字段声明在 Q，经若干层才带到本类布局）
+—— 三条都来自 `computeClassLayout` 扁平化的既有语义，与 B13~B15 是同一张表。
+
+**实测**（`Base::v` 与裸名 `v` 落在**不同**槽位 —— 这条不变量就是 c 的判据）
+
+```text
+  [resolve] 'Base::v' → int    (qualified member, offset=0 隐式 this)
+  [resolve] 'v' → int    (class field, offset=8)
+    [member] Derived.Base::v → int    (qualified member, offset=0)
+    [member] Derived.v → int    (offset=8, size=4)
+```
+
+```asm
+    movl 0(%rax), %eax    # 读取限定名成员 .v（偏移 +0 字节）
+    movl 8(%rax), %eax    # 读取字段 .v（偏移 +8 字节）
+```
+
+**回归用例**：`tests/lang/test_basics_09_qualified_member.cpp`（正例，类内 / 类外 /
+写目标三种形态 + 隐藏场景，运行 rc=0）+ 单测 `ArgBinding.QualifiedMemberPicksTheBaseSubobject`
+（断言"两条偏移必须不同且基类在前"，**突变验证**：去掉回填 ⇒ 该例当场变红）。
+文档：docs/learn/36 §4（clang 的 AST 对照见 §4.2）。
+
+**已知边界**（同族未做）：限定名调用**成员函数** `d.Base::f(2)` 仍报 `No member 'Base::f'`
+（B21 只管数据成员）；`using Base::f;` 不支持。见 docs/learn/36 §7。
 
 ---
 
@@ -1666,7 +1713,44 @@ error: too many arguments to function call, expected 0, have 1; did you mean 'Ba
 **回归用例**：本轮**不加**（不把失败固化成契约，同 B21/B22 的处理）。
 `tests/mi/test_mi_13_*.cpp` 的文件头已记下这条边界与"为什么用例绕开了它"。
 
-**状态**：⬜ 未修（已定位到 `findMethodInHierarchy`）
+**状态**：✅ 已修（2026-10 那一轮，与 B21/B25/B26/B27 同批）
+
+---
+
+### B24 修复
+
+**修法**：不改 `findMethodInHierarchy`（它服务的是字段/方法**访问**那条通路，不看实参），
+而是在 `inferCall` 的成员查找 BFS 里补上"**查到名字就下结论**"：
+
+```text
+对象类 BFS 每一层：
+  ① findMethodInClass(cls, name, 个数, &argTypes)  ── 命中 ⇒ 选定，回填符号，返回
+  ② 成员模板表（同名）                              ── 推导成功 ⇒ 实例化，返回
+  ③ ★ 本类是否为这个名字声明过任何东西？
+       · 是 ⇒ 在这里把话说死：个数区外 ⇒ too few/too many；区内 ⇒ no matching member function
+              **不往基类走、也不落进普通查找**（隐藏 + 可行性两条规则同时兑现）
+       · 否 ⇒ 把基类压进 BFS 队列，继续
+```
+
+★ 位置选在 `inferCall` 而不是 `findMethodInHierarchy`，正是因为**隐藏是"按名字"的筛选**：
+`findMethodInHierarchy` 按裸名判"本地有没有"本来就是对的（它只回答"有没有这个名字"），
+错的是调用点拿到 `nullptr` 之后**没下结论**、继续往别处找。两件事拆开看就通了 ——
+`findMethodInHierarchy`（B12 抽出来的原语）继续服务 `inferMember`，成员调用的
+"名字可见性 + 可行性"在 `inferCall` 里一次说清。
+
+**与 B25 的关系**：本条与 B25 的 ① 是**同一处代码**（同一个 BFS 里"落空之后去哪儿"），
+方向相反（该藏没藏 / 该报没报），故**同一批修**。B25 的修复见下。
+
+**回归用例**：`tests/lang/test_basics_07_member_call_arity_error.cpp`（rc=1）
++ 单测 `ArgBinding.NameHidingStopsBaseLookup`（含"不声明同名成员时基类的 f 照常可见"的对照组）。
+**突变验证**：把"查到名字就下结论"整块停掉 ⇒ 该例与 `NoViableOverloadIsAnError` 两条齐红。
+
+**顺带修出一个被基线固化的非法程序**：本条修好后，
+`tests/unit/test_member_identity.cpp` 的 `DerivedOverrideKeepsSlotCount` **当场变红** ——
+那个用例里写着 `d.f(2)`（`f(int)` 只在基类），clang 同样 rc=1，minicc 此前 rc=0 所以"通过"。
+已改成经基类指针的 `p->f(2)`，并在文件里写下缘由。
+★ 这是本项目**第三次**踩"基线把失败固化成契约"（前两次：`tests/mi/test_mi_04_error.cpp`、
+`tests/pp/test_pp_01_include.cpp`）。**写用例前先用 clang 过一遍"这程序真的合法吗"。**
 
 ---
 
@@ -1733,5 +1817,166 @@ struct C { int f(int x) { return x; } };   int main() { C c; return c.nope(1); }
 **影响面**：中（b 为**静默接受非法程序**；a/c 的报错点落在链接器，指向不到根因）。
 **回归用例**：暂不加（同 [B21](#b21-限定名-sv-访问成员数据被拒收)，不把失败固化成契约）。
 
-**状态**：⬜ 未修
+**状态**：✅ 已修（2026-10 那一轮，与 B21/B24/B26/B27 同批）
+
+---
+
+### B25 修复
+
+**修法**：把"个数"从**筛选器**提升为**判据** —— 与 B24 同一处代码（`inferCall` 成员查找 BFS
+的"查到名字就下结论"分支），按"本类为这个名字声明过哪些参数个数"的区间 `[lo, hi]` 决定文案：
+
+| 实参个数 | 文案 | 标准依据 |
+|---|---|---|
+| `have < lo`，`lo == 1` | `too few arguments to function call, single argument 'x' was not specified` | [expr.call]/1 |
+| `have < lo` | `too few arguments to function call, expected {lo}, have {have}` | 同上 |
+| `have > hi`，`hi == 1` | `too many arguments to function call, expected single argument 'x', have {n} arguments` | 同上 |
+| `have > hi` | `too many arguments to function call, expected {hi}, have {have}` | 同上 |
+| `lo ≤ have ≤ hi` | `no matching member function for call to 'f' in class 'C' (…)` | [overload.match]/1 |
+
+★ **两种句式不是装饰**：个数不符与类型不符是两类诊断（clang 的 `CheckFunctionCall`
+就分开报），而"个数落在区间内"恰恰说明**个数过滤这一层拦不住**、淘汰它的是类型 ——
+报错必须指向真正的判据，否则会把人往错的方向引（本项目 B10/B20/B22 的教训反复如此）。
+
+**实测**（四个形态全部与 clang **逐字相同**，见原表的 a/b/c/d 四行）
+
+```text
+e1.cpp:2:30: error: too few arguments to function call, single argument 'x' was not specified
+[ERROR] [Semantic Error] 2:29: too few arguments to function call, single argument 'x' was not specified
+
+e2.cpp:2:30: error: too many arguments to function call, expected 0, have 2
+[ERROR] [Semantic Error] 2:29: too many arguments to function call, expected 0, have 2
+```
+
+d 形态（名字不存在）仍报原有的 `No member 'nope' in class 'C'`（未受影响）。
+
+**回归用例**：`tests/lang/test_basics_07_member_call_arity_error.cpp`（个数区外，rc=1，
+文件头记下"为什么不是笼统的 no matching"）；单测 `ArgBinding.NoViableOverloadIsAnError`
+（个数**在**区内、类型不可行那一支）。
+
+**顺带**：`pickBestByArgs` 的旧③"退回声明序首个"一并删掉 —— 见 [B27](#b27-无可行候选时静默退回候选集首个)。
+
+---
+
+## B26. 引用绑定判据只写了模板那一半
+
+**来源**：查 `src/template_deduction.cpp:123` 的"参数匹配"分支时反查了一个问题 ——
+"非模板调用在哪里做同样的事？"答案：**哪里都没有**。
+
+**复现**（两条方向相反，都是同一个判据缺一半的后果）
+
+```cpp
+// a：const T& 拒右值 —— 拒收合法程序
+template<class T> int id(const T& x) { return x; }
+int main() { return id(5); }               // clang rc=0；minicc rc=1
+
+// b：int&& 收左值 —— 接受非法程序
+int take(int&& r) { return r; }
+int main() { int a = 1; return take(a); }  // clang rc=1；minicc rc=0
+```
+
+| 情形 | minicc（修前） | clang++-18 `-std=c++20` |
+|---|---|---|
+| a. `const T&` ← 右值（模板） | ❌ rc=1 `cannot bind lvalue reference 'const T&' to rvalue argument 'int'`（`template_deduction.cpp` 的 P=LRef 分支） | ✅ rc=0 |
+| a′. `const int&` ← 右值（非模板） | ⚠️ rc=0 —— 非模板路径**根本没检查过**（连 `int&` ← 右值也放行） | ✅ rc=0 |
+| b. `int&&` ← 左值（非模板） | ⚠️ **rc=0**，静默绑定 | ❌ rc=1 `cannot bind rvalue reference of type 'int&&' to lvalue of type 'int'` |
+| b′. `T&&` ← 左值（模板，转发引用） | ✅ rc=0（S2 已实现的引用折叠） | ✅ rc=0 |
+
+**根因**：**同一个判据写了两处，且只写了一处**。
+
+| 路径 | 判据 |
+|---|---|
+| 模板实参推导（S2 那一轮的产物） | `deducePair` 的 P=LRef 分支**有**引用绑定检查；P=T&& 分支经引用折叠后左右值皆可 |
+| 非模板调用（老路径） | `typeCompatible` / `stripRefConst` 都把**引用剥掉**再比类型 ⇒ `char&` 与 `char` 相等 ⇒ 什么都不挡 |
+
+★ a 的机理值得单独说 —— 它不是"检查太严"，而是**检查看错了位置**，且错因来自**上一轮的改动**：
+
+```text
+docs/learn/23 之前：const T& 建成 Const(LRef(T))     → 剥顶层 const ⇒ LRef(T) ⇒ 检查看见 T
+docs/learn/23 之后：const T& 建成 LRef(Const(T))     → 剥 const 的分支在【引用之外】不触发
+                                                       ⇒ P 就是 LRef(Const(T))，而检查只问
+                                                         "P 是左值引用吗？实参是右值吗？"
+                                                       ⇒ 拒。const 被"关"在引用【里面】，
+                                                         没人去看 referencedType->isConst()
+```
+
+`deducePair` 里那句注释（"本项目 parseType 把 `const T&` 建成 `Const(LRef(T))`"）
+在 cv 位置修正之后就**已经过时**了 —— 判据没跟着改。
+**cv 位置一改，所有"按旧形态看类型"的地方都要跟着看一遍**：这正是 B17
+（值位实参要求形态精确相等）同一轮埋下的第二颗雷。修法是让判据去问
+`referencedType->isConst()`，而不是假设 const 在外面。
+
+**修法**：判据收口到 `include/type.h` / `src/type.cpp` 的
+`referenceBindsValueCategory(paramType, argIsLValue, &why)`，两个调用点共用：
+
+| 调用点 | 位置 |
+|---|---|
+| 模板推导 | `deducePair` 的 P=LRef 分支（替换掉原有的内联检查） |
+| 非模板调用 · 择优**前** | `inferCall` 裁决循环：`exactMatch(c.decl) && argsBindTo(...)` —— 绑定是**可行性**的一部分（[overload.viable]），不可绑定的候选先出局 |
+| 非模板调用 · 兜底**后** | `checkArgBinding(f)`，三处选定点各调一次（`winner` / `m_functionMap` / 成员查找落空后的普通查找） |
+
+★ 谓词（`argsBindTo`，可空 `why`/`badIdx`）与报错（`checkArgBinding`）**分开**是有意的：
+先剔后退两条都对，先选后查会把 `f(5)`（候选 `f(int&)` 与 `f(const int&)` 并存）
+拒成"no matching function" —— 而 clang 选 `f(const int&)`。
+（这条自由函数场景眼下因 B7 在汇编期就撞符号而测不了，但判据该这么写。）
+
+顺带修**值类别模型**：`*p`（[expr.unary.op]/1）与 `v[i]`（[expr.sub]/1）**也是左值**，
+第一版只写了"变量 / 成员访问"，会让 `void g(int&); g(*p);` 被误拒 ——
+**半份判据会造出反方向的缺陷**。
+
+**回归用例**：`tests/lang/test_basics_05_reference_binding.cpp`（正例，运行 rc=0）+
+`tests/lang/test_basics_06_rvalue_ref_binds_lvalue_error.cpp`（rc=1，文案含标准推导链）
++ 单测 `ArgBinding.ReferenceBindingFollowsValueCategory`（六条：三种引用形态 × 左右值，
+外加 `f(*p)` 与 `f(5)` 两条边界）。**突变验证**：把 `referenceBindsValueCategory`
+改成恒真 ⇒ 该例当场变红。
+
+**文档**：docs/learn/36 §1~§2。
+
+---
+
+## B27. 无可行候选时静默退回候选集首个
+
+**来源**：B22 那一轮写的 `pickBestByArgs`（候选集 → 最优）里，第③档是
+"退回声明序首个"。当时只是为了不让既有调用点崩（`candidates.front()`），
+但它把"**判不了**"与"**判出来没人行**"混成了同一件事。
+
+**复现**
+
+```cpp
+struct S { public: int v; };
+class C { public: int f(int x) { return x; } int f(S s) { return s.v; } };
+int main() { C c; int a = 1; int* p = &a; return c.f(p); }
+```
+
+| | minicc（修前） | clang++-18 `-std=c++20` |
+|---|---|---|
+| `c.f(p)`（`p` 是 `int*`） | ⚠️ **rc=0**，日志写着 `2 个候选，无一与实参相容 ⇒ 退回首个 'C_f_1_int'`，运行调到 `f(int)` | ❌ rc=1 `no matching member function for call to 'f'` |
+
+**性质**：**静默算错**（能编译、能链接、能跑，只是语义错）——比"拒收合法程序"更坏的一类。
+★ 注意它**不是** B25 的个数问题：`f(int)` 与 `f(S)` 都是 1 个形参，
+个数过滤这一层**拦不住**，能拦住的只有类型可行性。
+
+**根因**：`pickBestByArgs` 三档择优 `① 精确 → ② 可隐式转换 → ③ 退回首个`，
+第三档不是"择优"而是**放弃判断**。而 [overload.best.viable] 的语义是
+"可行集为空 ⇒ 非良构" —— 没有"退回首个"这一说。
+
+**修法**：③ 改成返回 `nullptr`（+ 一条 `✗ … 无一可行 ⇒ 匹配失败` 的日志），
+由调用点报错：
+
+```text
+  [overload] ✗ member C.f(1 args): 2 个候选，无一可行 ⇒ 匹配失败
+[ERROR] [Semantic Error] 3:53: no matching member function for call to 'f' in class 'C'
+        (1 argument(s) given; 实参类型无法按 [overload.viable] 转换)
+```
+
+两个例外**必须保留**（否则会把"判不了"误报成"匹配失败"）：
+① 实参类型为 `nullptr`（依赖上下文 / SFINAE 探测里，无从判断可行性）⇒ 维持"取声明序首个"；
+② 候选只有一个时**不打日志**（绝大多数调用无重载，打出来会把日志淹掉 ——
+与 B22"符号名的类型链只在有同名同个数兄弟时才挂"同一条零漂移策略）。
+
+**回归用例**：`tests/lang/test_basics_08_member_overload_no_viable_error.cpp`（rc=1）
++ 单测 `ArgBinding.NoViableOverloadIsAnError`。**突变验证**：把 ③ 改回
+`return candidates.front();` ⇒ 该例当场变红。
+
+**文档**：docs/learn/36 §2.2。
 

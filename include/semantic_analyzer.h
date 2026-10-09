@@ -566,6 +566,19 @@ private:
     FuncDeclPtr findMethodInHierarchy(const std::string& className,
                                       const std::string& methodName,
                                       std::string* declaringClass = nullptr) const;
+    /** derived 是不是 base，或者 base 是不是 derived 的（间接）基类 —— 含"自己算自己"。
+     *  这条关系是限定名的判据：`Q::m` 只有在 Q 是【当前类或它的基类】时才是
+     *  [expr.prim.id.general]/3 的"隐式 this 成员访问"，否则是命名空间限定名
+     *  （走符号表）。BUGS.md B21。 */
+    bool isClassOrBaseOf(const std::string& derived, const std::string& base) const;
+    /** 限定名成员 `Q::m` 落到【ownerClass 对象布局】里的那一条字段。
+     *  调用前需自行确认 Q 是 ownerClass 或它的基类（isClassOrBaseOf）。
+     *  返回 nullptr = Q 的作用域里没有叫 m 的数据成员。
+     *  为什么必须走布局而不是 Q 自己的布局：同一字段在派生类布局里的偏移可能含
+     *  子对象偏移（[class.mi]），而 CodeGen 用的就是这个布局。 */
+    const FieldInfo* resolveQualifiedField(const std::string& ownerClass,
+                                           const std::string& qualifier,
+                                           const std::string& member) const;
 
     // ── auto 占位符（[dcl.spec.auto]/7）──
     // auto 可能被 cv/指针/引用包住（Const(Auto) / Pointer(Auto) / ...），

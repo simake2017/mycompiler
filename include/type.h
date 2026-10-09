@@ -561,4 +561,18 @@ struct Type {
     std::string toString() const;
 };
 
+// ── 引用绑定判据（[dcl.init.ref]，全项目【单点】）─────────────────────────────
+// 问：形参类型是 paramType、实参的值类别是 argIsLValue 时，能不能绑上去？
+//   T&        → 只收左值（[dcl.init.ref]/5.4.1）
+//   const T&  → 左右值皆可（/5.4.2："const 左值引用可绑右值"）
+//   T&&       → 只收右值（非模板；模板的 T&& 是万能引用，走 [temp.deduct.call]/3，
+//               由推导引擎先折叠成 T := A& 再替换，不经过本判据）
+//   非引用形参 → 恒可（值类别不影响按值传参）
+// ★ 为什么必须单点：这条判据此前**只写在模板推导那一条路上**（deducePair 的 P=T&
+//   分支），于是两个方向各错一次 —— `const T&` 收右值被误拒（拒收合法程序）、
+//   非模板 `int&&` 收左值被放行（接受非法程序）。承项目铁律「同一判据不许写两份」。
+// why（可空）：绑不上时填一句人话，供日志与报错文案使用。
+bool referenceBindsValueCategory(const TypePtr& paramType, bool argIsLValue,
+                                 std::string* why = nullptr);
+
 } // namespace minicc
