@@ -355,38 +355,11 @@ tests/mi/test_mi_12_secondary_inherited_slot.cpp（**又一次印证 logdiff 基
 单测 262 → **266** / 集成 114 → **116**。文档 docs/learn/13 新增 §13.4.3（单点判据与
 "为什么必须收口"）、docs/learn/17 新增 §1.5 与 §2 Bug 4。
 
-✅ **「身份 = 名字 + 形参类型」四处落点收口（B22 + B20 缺陷 c）** ——
-**症状两条**：① 同名同个数的成员重载 `f(int)` / `f(S)` 在汇编期撞符号
-``symbol `C_f_1' is already defined``（拒收合法程序，报错点还落在 as 上）；
-② `virtual int f(); int f(int);` 里非虚的后者**认领**前者的 vtable 槽并被误标 virtual
-⇒ `c.f()+c.f(2)-3` **运行返回 255**（静默算错，汇编里毫无异常）。
-**根因同一个**：**"名字 + 参数个数"被当成了身份**。它写在这份实现的**四个地方**：
-① 符号名 `memberMethodSymbolName`（后缀只编码个数）② vtable 槽位认领
-（`processClassDecl`，只比裸名）③ 成员调用选定 `findMethodInClass`（循环内首个命中即返回）
-④ **构造函数选定** `processVarDeclStmt`（只数个数，且把刚推出来的实参类型**扔掉**）。
-**修法**：判据 `paramTypeChain`（形参类型链，每段过 `sanitizeSymbolChars`）+
-**一个**共用择优原语 `pickBestByArgs`（精确 → 可隐式转换 → 退回首个）——
-③④ 都走它。★ 符号名的类型链**只在"同类里有同名同个数的兄弟"时才挂**
-（`countSameNameSameArity`）⇒ 既有 116 个集成用例**逐字节零漂移**。
-★ **突变验证的教训**（值得单独记）：第一版单测只断言"槽里只有一个符号""派生类槽数不变"，
-拆掉 `signature` 判据时**全绿** —— 认错槽位后"谁占槽、谁被直接调"会**整体互换**，
-守恒式计数照样配平。有判别力的是**不对称**那条：**经基类指针的虚调用必须退化成
-`callq *%rax` 间接调用**（认错 ⇒ CodeGen 按 `resolvedCalleeSymbol` 精确比对落空 ⇒
-退化成直接调用 ⇒ 运行期不派发）。**守恒式不变量挡不住互换型缺陷。**
-测试 tests/lang/test_basics_04 + tests/mi/test_mi_13 + 单测
-tests/unit/test_member_identity.cpp（`MemberIdentity.*` 6 例，**三条突变逐条实跑变红**：
-符号定名回退 4/6 红、槽位回退 2/6 红、构造函数按个数选 2/6 红）；
-文档 docs/BUGS.md B22（含修复小节）、B20 缺陷 c 转 ✅、docs/learn/13 §13.4.3 规则表、
-docs/learn/17 §2 Bug 5；单测 266 → **272** / 集成 116 → **118**。
-
-⚠ **本轮新发现（docs/BUGS.md B24，未修）**：成员方法的**名字隐藏**
-（[class.member.lookup]/3）—— `Derived::f()` 一声明，基类 `f(int)` 整族应被隐藏，
-clang 拒收 `d.f(2)`，minicc 仍能查到（**接受非法程序**）。根因在
-`findMethodInHierarchy` 按**裸名**判"本类有没有" ⇒ 与 B20c/B22 是同一个
-"身份比裸名宽"的老毛病，只是方向相反（该藏没藏）。修法：隐藏先按**名字**砍掉基类整族
-（与重载决议的按类型择优是**两个正交的筛选**）。是写 mi_13 时被 clang oracle 当场抓住的。
-
-**未做（按优先级）**：④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
+**未做（按优先级）**：**B20 缺陷 c —— 槽位匹配只比裸名**（`virtual int f(); int f(int);`
+里后者认领前者的槽且被误标 `virtual`；实测 `c.f()+c.f(2)-3` clang rc=0、
+minicc 编译 rc=0 但**运行返回 255**，静默算错）⇒ 判据应改成（裸名 + 形参个数），
+与符号名规则同源；改的是"覆写判据"本体，影响面大于命名，单独一轮 →
+④[stmt.ambig] 完整裁决 → ⑥后置 const 的重载区分与 const 正确性检查 →
 ⑥三元 `?:`（ROADMAP 主线 C）→ **`T[N]` 数组类型偏特化**（需新开 `TypeKind::Array`，
 属 ROADMAP 主线 E 整条，不是顺手项）→ 类外成员定义 `int C::f() const {}`、函数默认实参、
 函数形参里的 decltype 依赖表达式、`operator|`/`operator||` 那半边；

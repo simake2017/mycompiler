@@ -219,6 +219,14 @@ struct UnaryExpr : Expression {
 // demo：foo(a, b)  → CallExpr{ callee=VarExpr{foo},
 //                              arguments=[ VarExpr{a}, VarExpr{b} ] }
 // 函数模板调用 twice(21) 也是 CallExpr；实参推导（S2）用 arguments 的类型驱动。
+    /*
+    *  CallExpr                       ← NodeKind::Call，整个表达式的"顶层身份"是【调用】
+    ├── callee    : MemberExpr     ← NodeKind::Member，装在 callee 槽里
+    │                 ├── object     : VarExpr{obj}
+    │                 ├── memberName : "m"
+    │                 └── isArrow    : false
+    └── arguments : [ VarExpr{a} ]
+*/
 struct CallExpr : Expression {
     ExprPtr              callee;     // 被调用的函数（可以是 VarExpr 或 MemberExpr）
     std::vector<ExprPtr> arguments;  // 实参列表

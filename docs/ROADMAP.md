@@ -72,7 +72,7 @@ ctor 初始化列表嵌套构造调用）。
 |---|---|---|
 | mi_03 | lexer 不支持 `?:` 三元运算符，COMPILE_FAIL | 主线 C 顺带做（Lexer+Parser+Sema+CodeGen 四层） |
 | ~~mi_04~~ | ✅ **已消**：原本的 `Q_f` LINK ERROR 是 B20 缺陷 b（次表槽被重造名字），不是"菱形没被拒" | 菱形在标准下**合法**（clang rc=0）；正例见 tests/mi/test_mi_12 |
-| ~~B20 缺陷 c~~ | ✅ **已消**（2026-10-08）：槽位身份补上形参类型链（`VTableEntry::signature`） | 与 **B22** 同轮完成（"身份 = 名字 + 形参类型"四处落点收口），见 docs/BUGS.md；正例 tests/mi/test_mi_13 + 单测 `MemberIdentity.VirtualCallOnPointerStaysVirtual` |
+| **B20 缺陷 c** | 槽位匹配只比裸名 ⇒ `virtual int f(); int f(int);` 里后者认领前者的槽且被误标 virtual。实测 `c.f()+c.f(2)-3`：clang rc=0，minicc 运行返回 **255**（静默算错） | 判据改成（裸名 + 形参个数），与符号名规则同源 —— 改的是"覆写判据"本体，影响面大于命名，单独一轮 |
 | 槽位名靠字符串拼 | vtable 槽里的目标名是**拼**出来的（B20 已把判据收口到 `memberMethodSymbolName`，但仍是字符串而非结构化引用） | 宜存"指向哪个 FuncDecl"的结构化引用；clang 是 GlobalDecl 句柄 |
 
 **P2 架构观察（只记录，暂不动手）**
@@ -81,10 +81,8 @@ ctor 初始化列表嵌套构造调用）。
    （semantic_analyzer.cpp:891）；clang 是一次成型不可变 ASTRecordLayout
 2. 成员查找不穿透继承链：`obj->get()` 在 `D*` 上查不到 `P::get`
 3. ~~vtable 覆写靠字符串剥/拼类名前缀匹配符号名~~ →
-   **B20/B22 已把"命名规则"与"槽位身份"都收口到单点**
-   （`memberMethodSymbolName` + `paramTypeChain`/`VTableEntry::signature`）；
-   但**槽里仍是字符串**（`resolvedCalleeSymbol` 精确比对）——
-   最终形态应是无字符串的 FuncDecl 引用（clang 是 GlobalDecl 句柄）
+   **B20 已把"命名规则"收口到单点**（`memberMethodSymbolName`），但**槽位身份仍靠裸名比对**
+   （缺陷 c，见上表）；最终形态应是无字符串的 FuncDecl 引用
 4. **内置 bump malloc 不做对齐（待修）**：`new T` 的堆地址对齐保证在真实
    世界里由 operator new 契约提供（[new.delete.single]，x86-64 恒 16B 对齐；
    过对齐类型走 `operator new(size, align_val_t)`，clang 参照

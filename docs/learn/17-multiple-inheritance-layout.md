@@ -62,18 +62,6 @@ minicc 没有句柄、只能各自拼字符串 ⇒ 判据必须收口（见 docs
 **次表（secondary）的语义**因此要格外小心：次基类子对象在派生类里**换了位置**，
 但槽里该放谁的名字，取决于**谁提供了这个实现**，而不是**这是谁的表**。
 
-**槽位身份不只是名字（B20 缺陷 c / B22，已修）**：`vtable` 的"这是谁的槽"
-= （裸名 + **形参类型**），不是裸名 —— 这正是 [class.virtual]/2 的覆写判据。
-`class C { virtual int f(); int f(int); };` 里，非虚的 `f(int)` 会认领 `f()` 的槽
-并被误标成 `virtual`，于是 `c.f(2)` 走虚调用跳进无参的 `f()`（clang rc=0、
-minicc 编译 rc=0 但**运行返回 255** —— 静默算错，汇编里一点异常都看不出来）。
-修法是 `VTableEntry::signature` 存形参类型链，匹配时一并比对（见 §2 Bug 4）。
-
-★ 这个缺陷还留下一条**方法论**：只断言"守恒式"不变量（谁占槽 + 谁被直接调用 = 总定义数）
-**挡不住它** —— 认错槽位后两者整体互换，计数照样配平（突变验证时单测全绿）。
-有判别力的是**不对称**的那条：经基类指针的虚调用**必须**是 `callq *%rax` 间接调用。
-见 tests/unit/test_member_identity.cpp 的 `VirtualCallOnPointerStaysVirtual`。
-
 ## 2. 踩坑史（四个连环 bug，全部实测复现后修复）
 
 ### Bug 1：primary 判定两处标准打架
@@ -147,25 +135,10 @@ class Diamond : public P, public Q {};
 `tests/mi/test_mi_12_secondary_inherited_slot.cpp`。
 **又一次印证**：logdiff 基线会把**失败**也固化成契约，修完必须回头看 rc。
 
-### Bug 5：槽位身份与符号定名的同一条判据（B20 缺陷 c + B22，已修）
-
-上面 Bug 4 暴露出"槽位匹配只比裸名"⇒ 非虚的 `f(int)` 认领虚的 `f()` 的槽、并被误标
-`virtual`。实测 `C c; return c.f() + c.f(2) - 3;`：clang rc=0，minicc 编译 rc=0 但
-**运行返回 255**（静默算错）。
-
-把这条往外推一步就是 B22 的另三处现场 —— **同一句"这是哪个函数"总共写在四个地方**：
-
-| # | 落点 | 修前 | 修后 |
-|---|---|---|---|
-| ① | 汇编符号名 `memberMethodSymbolName` | 后缀只编码形参**个数** ⇒ 同签名个数的重载都叫 `C_f_1`，as 报 `symbol is already defined` | 有兄弟时再挂**形参类型链**（`C_f_1_int` / `C_f_1_S`） |
-| ② | vtable 槽位身份 `processClassDecl` | 只比裸名 | 再比 `entry.signature` |
-| ③ | 成员调用选定 `findMethodInClass` | 循环内首个同名同个数命中即返回 | 收候选集 → `pickBestByArgs` 择优 |
-| ④ | 构造函数选定 `processVarDeclStmt` | **只数个数**，且把刚推出来的实参类型扔掉 | 同走 `pickBestByArgs` |
-
-③④ 共用同一个本地静态函数 —— 承 B10/B12 那条铁律：**同一判据不许写两份**。
-回归：`tests/lang/test_basics_04_*`、`tests/mi/test_mi_13_*`、
-单测 `tests/unit/test_member_identity.cpp`（6 例，三条突变逐条实跑变红）；
-既有 116 个集成用例**逐字节零漂移**（符号名只在"有兄弟"时才挂类型链）。
+**顺带暴露的缺口（B20 缺陷 c，未修）**：槽位匹配只比裸名 ⇒
+`virtual int f(); int f(int);` 里后者认领了前者的槽，且被误标 `virtual`。
+实测 `C c; return c.f() + c.f(2) - 3;`：clang rc=0，minicc 编译 rc=0 但**运行返回 255**
+（静默算错）。判据应是（裸名 + 形参个数），与符号名规则同源。
 
 ## 3. clang 源码对照表
 
