@@ -554,9 +554,12 @@ private:
     // ★ 抽出来的理由与 BUGS.md B10 同源：同一条"成员叫什么/是不是它"的判据一旦写成
     //   两份，就会各自演化出不一致（那里是符号名后缀，这里是"查不查基类"）。
     //   两条通路共用下面两个原语，谓词只有一处。
-    /** 在【单个类】的方法表里按名字找方法；arity < 0 表示不看参数个数。 */
+    /** 在【单个类】的方法表里按名字找方法；arity < 0 表示不看参数个数。
+     *  argTypes（可空）给出调用实参类型：同名同个数有多个候选时按它择优
+     *  （精确 > 可隐式转换 > 退回首个，见 BUGS.md B22）。 */
     FuncDeclPtr findMethodInClass(const std::string& className,
-                                  const std::string& methodName, int arity) const;
+                                  const std::string& methodName, int arity,
+                                  const std::vector<TypePtr>* argTypes = nullptr) const;
     /** 沿基类链 BFS 找方法（含本类自身）；返回 nullptr 表示整条链都没有。
      *  遍历顺序与 inferCall 一致：本类 → 直接基类 → 更远的祖辈。
      *  declaringClass（可空）回填"在哪个类里命中的"，用于日志里的 via 'X'。 */

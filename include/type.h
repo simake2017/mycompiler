@@ -157,6 +157,12 @@ struct VTableEntry {
     uint32_t    index   = 0;     // 在 vtable 中的索引（0-based）
     bool        isOverridden = false;
     std::string baseFunctionName; // 原始方法名（override 检测用，不受 mangledName 更新影响）
+    // 形参类型链（逐位类型的可读名，如 "int" / "S_intP"；零参为 ""）。
+    // ★ 槽位身份 = baseFunctionName + signature（[class.virtual]/2：同签名才叫覆写）。
+    //   只比裸名会让 `virtual int f(); int f(int);` 里的第二个 f 认领第一个的槽，
+    //   并把非虚的它误标成 virtual（BUGS.md B20 缺陷 c，实测静默算错）。
+    //   与符号名/成员查找共用同一个 paramTypeChain（判据单点）。
+    std::string signature;
     // 多继承 thunk 调整量（[class.mi] + Itanium ABI 2.4）：
     // 非 0 时，本槽位不能直接填函数地址，而要填一个跳板（thunk）——
     // 跳板先把 this 加上 vptr[-2]（offset-to-top）归顶，再跳真实函数。

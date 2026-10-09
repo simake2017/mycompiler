@@ -332,6 +332,21 @@ memberMethodSymbolName(owner, name, paramCount, earlierSameNameCount)
 | 析构函数 | `类名_dtor` | `Dog_dtor` |
 | 无参、且同类无先注册的同名方法 | `类名_方法名` | `Dog_speak` |
 | 带形参，或同类已有先注册的同名方法 | `类名_方法名_<形参个数>` | `Dog_speak_1` |
+| **同类里还有同名同个数的兄弟**（B22） | 上个形态再挂 `_<形参类型链>` | `C_f_1_int` / `C_f_1_S` |
+| 同上、零参（类型链为空） | 挂 `_void` 占位 | `C_f_0_void` |
+
+**"形参类型链"**是把每位形参的类型可读名拼起来（`paramTypeChain`），
+每段过一遍全项目唯一的实例名清洗器 `sanitizeSymbolChars`
+（`*`→`P`、`&`→`R`、`-`→`N`、`:`→`C`、`< > ,`→`_`），例如
+`int` → `int`、`S*` → `S_P`、`Box<int>` → `Box_int`。
+
+**为什么只在"有兄弟"时才挂**：挂了就动了**全部**既有产物（logdiff 基线 116 个集成用例
+逐字节比对）。实测"有兄弟才挂"策略下既有用例**零漂移** —— 这条约束是硬的，
+不是审美偏好。
+
+★ 这里仍是**拿给人看的字符串当机器用的键**（`Type::toString()` 不是单射，
+见 [docs/learn/23](23-cv-qualifier-position.md)）；真按 Itanium mangling 做才是正解，
+教学版从简 —— 但**清洗器与判据必须单点**，这是 B20/B22 反复交学费换来的。
 
 **为什么必须收口到一个函数**：这个名字会被**两个地方分别产出** ——
 
@@ -356,8 +371,26 @@ vtable 槽    .quad A_f          ← 这个符号没人定义
 **为什么之前的测试全绿**：无参虚函数两侧算出的都是 `A_f`，规则恰好一致 ——
 缺口只在"带参虚函数"这条路径上，而此前没有任何用例写过带参虚函数。
 
-**留下的边界（B20 缺陷 c，未修）**：槽位匹配只比**裸名**，不比形参表 ——
-`virtual int f(); int f(int);` 里后者会"认领"前者的槽位。见 docs/BUGS.md B20。
+**槽位身份的另一半（B20 缺陷 c，已修）**：vtable 槽位匹配**不能只比裸名** ——
+`virtual int f(); int f(int);` 里后者会"认领"前者的槽位并被误标成 virtual
+（编译全绿、运行返回 255）。修法是给 `VTableEntry` 加 `signature`（同一条
+`paramTypeChain`），判据变成（裸名 + 形参类型）—— 这正是 [class.virtual]/2 的覆写判据：
+**裸名只是查找的入口，不是身份的全体**。
+
+对称地，符号定名那一侧也要跟上（否则两个同签名个数的重载在汇编期撞名 `C_f_1`，
+as 报 `symbol is already defined`）：这就是 B22，四处落点见下表。
+
+**"身份 = 名字 + 形参类型"的四个落点**（B22 修复后）：
+
+| # | 落点 | 函数 |
+|---|---|---|
+| ① | 汇编符号名 | `memberMethodSymbolName` |
+| ② | vtable 槽位身份 | `processClassDecl`（比对 `entry.signature`） |
+| ③ | 成员调用选定 | `findMethodInClass` → `pickBestByArgs` |
+| ④ | 构造函数选定 | `processVarDeclStmt` → `pickBestByArgs` |
+
+③④ 共用同一个本地静态函数 `pickBestByArgs`（精确 → 可隐式转换 → 退回首个）——
+**同一判据不许写两份**，见 docs/BUGS.md B10/B12/B20/B22。
 
 ### 13.4.4 在 dump 输出中的应用
 
