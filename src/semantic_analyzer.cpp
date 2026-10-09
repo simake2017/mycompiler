@@ -3490,7 +3490,7 @@ TypePtr SemanticAnalyzer::inferCall(CallExpr& expr) {
         // ⚠ 只对 MemberExpr 补推导 —— 普通函数/模板的 VarExpr callee 若在此推导，会因
         //   符号表查无此"变量"而误报 Undefined variable。
         m_inferDepth++;
-        inferType(mem);
+        inferType(mem); // mrd** 对于成员类型 要继续往下推导
         m_inferDepth--;
     }
 

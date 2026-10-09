@@ -36,7 +36,8 @@
 | [B21](#b21-限定名-sv-访问成员数据被拒收) | `S::v`（限定名 + 隐式 this 访问成员**数据**）报 `Undefined variable 'S::v'` | `src/semantic_analyzer.cpp` inferVar（Parser 把 `A::B` 拼成名字串） | 小（拒收合法程序，多写一个限定者而已） | ⬜ 未修 |
 | [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号) | 成员重载只按"名字 + 个数"选 ⇒ 同名同个数在汇编期撞符号 `C_f_1`；构造函数同病（静默选错） | `src/semantic_analyzer.cpp` 四处落点：符号定名 / 槽位身份 / 调用点选择 / 构造函数选定 | 中（拒收合法程序，报错点落在 as 的符号上） | ✅ 已修 |
 | [B23](#b23-浮点字面量缺失--运算按整数发射) | 无浮点字面量（`1.5` 切成 `1` `.` `5`）；`double` 运算发 `idivq` ⇒ 1/2 得 0 | `src/lexer.cpp`（[lex.fcon]）+ `src/codegen.cpp`（零 SSE 指令） | 中（a 响亮失败但文案误导；b **静默算错**） | ⬜ 未修 |
-| B24（下） | 成员方法**名字隐藏**：`Derived::f()` 声明后，基类 `f(int)` 整族应被隐藏，minicc 仍能查到 | `src/semantic_analyzer.cpp` findMethodInHierarchy（按裸名判"本地有没有"） | 小（接受非法程序） | ⬜ 未修 |
+| [B24](#b24-成员方法的名字隐藏派生类一声明同名方法基类整族应被隐藏) | 成员方法**名字隐藏**：`Derived::f()` 声明后，基类 `f(int)` 整族应被隐藏，minicc 仍能查到 | `src/semantic_analyzer.cpp` findMethodInHierarchy（按裸名判"本地有没有"） | 小（接受非法程序） | ⬜ 未修 |
+| [B25](#b25-成员调用实参个数不匹配无人认领一条静默接受一条只剩链接器) | 实参个数不匹配无人报错：无参方法那条**静默接受**，带参那条只剩 `undefined reference to 'C_f'` | `src/semantic_analyzer.cpp` inferCall:3562 + inferMember:4810 + `src/codegen.cpp:1819` | 中（b **静默接受非法程序**；a/c 报错点落在链接器） | ⬜ 未修 |
 
 > **B11~B15 是同一轮排查的产物**（起点是"多继承下基类字段要不要改名"这个问题）。
 > B13/B14/B15 三条根因相同 —— 见文末[小结](#小结-字符串兼任-id-与路径)。
@@ -1666,3 +1667,71 @@ error: too many arguments to function call, expected 0, have 1; did you mean 'Ba
 `tests/mi/test_mi_13_*.cpp` 的文件头已记下这条边界与"为什么用例绕开了它"。
 
 **状态**：⬜ 未修（已定位到 `findMethodInHierarchy`）
+
+---
+
+## B25. 成员调用实参个数不匹配无人认领：一条静默接受、一条只剩链接器
+
+**来源**：读 `inferCall` 的成员分支时问"3562 那一行到底报不报错"。不报 —— 而且
+**这条错全项目没有任何一处报**（本条的四个形态全部实测）。
+
+**复现**
+
+```cpp
+// a：少传
+struct C { int f(int x) { return x; } };   int main() { C c; return c.f(); }
+// b：多传（方法无参 —— 唯一能活到运行期的那条）
+struct C { int f() { return 1; } };        int main() { C c; return c.f(1, 2); }
+// c：多传
+struct C { int f(int x) { return x; } };   int main() { C c; return c.f(1, 2); }
+// d：名字不存在（对照组，本来就报）
+struct C { int f(int x) { return x; } };   int main() { C c; return c.nope(1); }
+```
+
+| 情形 | minicc | clang++-18 `-std=c++20` |
+|---|---|---|
+| a. 少传：`f(int)` 调 `f()` | ❌ rc=1，但错在**链接期**：`[LINK ERROR] … undefined reference to 'C_f'` | `error: too few arguments to function call, single argument 'x' was not specified` |
+| b. 多传：`f()` 调 `f(1, 2)` | ⚠️ **rc=0**，产物照跑（实测退出码 1，两个实参被静默丢弃） | `error: too many arguments to function call, expected 0, have 2` |
+| c. 多传：`f(int)` 调 `f(1, 2)` | ❌ rc=1，同 a 的 `undefined reference to 'C_f'` | `error: too many arguments to function call, expected single argument 'x', have 2 arguments` |
+| d. 名字不存在：`c.nope(1)` | ✅ rc=1，`[Semantic Error] 2:27: No member 'nope' in class 'C'` | `error: no member named 'nope' in 'C'` |
+
+**性质**：与 [B21](#b21-限定名-sv-访问成员数据被拒收) / [B22](#b22-同名同个数的成员重载sema-静默取第一个汇编期撞符号)
+（**拒收合法程序**）方向相反 —— 本条是**该报不报**：b 直接**接受非法程序**
+（编译、链接、运行全通，只是语义按"多余实参被丢弃"执行），a/c 虽终被拒，
+但报错人是**链接器**，`undefined reference to 'C_f'` 一个字都不提"实参个数不对"。
+
+**根因**：**"个数"在两条通路上分别被看 / 不看，落空之后的那条缝没人认领。**
+
+| # | 位置 | 判据 | 后果 |
+|---|---|---|---|
+| ① | `inferMember`（`src/semantic_analyzer.cpp:4810`，由 inferCall 先调一次） | 名字（`arity = -1`，**不看个数**） | 按名字命中 ⇒ 不报 `No member` |
+| ② | `findMethodInClass`（`src/semantic_analyzer.cpp:3562`，传 `argTypes.size()`） | 名字 + **个数** | 个数不符 ⇒ 候选集空 ⇒ `nullptr` |
+| ③ | 落空后继续的通路（3604 起 → 3733） | 自由函数 + ADL + 模板 | 日志自己都写着 `[call] non-template 'f' arg count mismatch (0 vs 2), keep searching` —— **"keep searching" 后面没有终点** |
+| ④ | 兜底 `inferType(expr.callee)`（3782） | **又回到 ①** | 第二次按名字通过 ⇒ `[call] f() → int (callee type)` ⇒ 全程零报错 |
+| ⑤ | CodeGen（`src/codegen.cpp:1819`） | `resolvedCalleeSymbol` 为空 ⇒ 硬拼 `类名_方法名` | 拼出 `C_f` |
+
+⑤ 就是 [B10](#b10-带参成员方法的调用符号拼不出来) / [B20](#b20-vtable-槽里的符号名与定义点不同源带参虚函数链接失败--次基类假符号)
+那个硬拼点。于是 b 与 a/c 的分界变成**某个后缀恰好是不是空串**：
+`memberMethodSymbolName`（`src/semantic_analyzer.cpp:1540`）只在 `paramCount > 0` 或前面已有同名者时
+追加后缀 ⇒ 0 参方法就叫 `C_f`，硬拼**撞对了** ⇒ 静默通过；1 参方法叫 `C_f_1` ⇒ 撞不上 ⇒
+链接期炸。**"静默"和"报错"由一条派生字符串的形状决定** —— 还是那句话：拿给人看的串当身份。
+
+**与 [B24](#b24-成员方法的名字隐藏派生类一声明同名方法基类整族应被隐藏) 的关系**：两条的 ① 是**同一处原语**（`findMethodInHierarchy` 按裸名判
+"本地有没有"），但方向相反 —— B24 是**该藏没藏**（派生类一个 `f()` 挡不住基类 `f(int)` 整族），
+本条是**该报没报**（名字在、个数不对，没人下结论）。修的时候应一并考虑：
+先按名字定"可见集"（含隐藏规则），再按**个数 + 类型**做可行性筛选与择优。
+
+**标准视角**：[expr.call]/1 要求实参个数与形参匹配；[overload.best.viable] 的**第一条**
+可行性判据就是个数。本项目把"个数"只当**筛选器**（传进 `findMethodInClass` 过滤），
+没当**判据**用 —— 筛空了也推不出"无可行候选"这个结论。对照 clang：
+`Sema::CheckFunctionCall` 在 BuildResolvedCallExpr 之前就把 too few / too many 报在**调用点**。
+
+**要修的话**：② 落空且 `objType` 确为类时收口报错，文案对齐 clang
+（`too few/too many arguments`），个数判据与 `memberMethodSymbolName` 同源；
+③ 那条 `keep searching` 在候选耗尽时也应有个收尾。
+
+**影响面**：中（b 为**静默接受非法程序**；a/c 的报错点落在链接器，指向不到根因）。
+**回归用例**：暂不加（同 [B21](#b21-限定名-sv-访问成员数据被拒收)，不把失败固化成契约）。
+
+**状态**：⬜ 未修
+
